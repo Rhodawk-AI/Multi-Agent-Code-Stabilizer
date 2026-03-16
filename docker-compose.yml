@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  openmoss:
+    build: .
+    env_file: .env
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    working_dir: /app
+    command: ["openmoss", "--help"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: ["ollama_data:/root/.ollama"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  redis_data:
+  ollama_data:
