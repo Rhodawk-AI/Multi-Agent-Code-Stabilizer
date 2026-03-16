@@ -1,0 +1,116 @@
+# OpenMOSS Default Configuration
+# All values here are overridable via environment variables or CLI flags
+
+[models]
+# Primary model — used for fixes and critical audits
+primary = "claude-sonnet-4-20250514"
+
+# Fallback models (tried in order if primary fails or rate-limits)
+fallbacks = ["gpt-4o-mini", "deepseek-chat"]
+
+# Local model for cost-free triage (requires Ollama)
+local = "ollama/qwen2.5-coder:32b"
+
+# Tier strategy:
+#   triage = cheap/fast model for initial file scan
+#   audit  = mid-tier for issue synthesis
+#   fix    = best model for critical fixes
+triage_model = "claude-haiku-4-5-20251001"
+audit_model  = "claude-sonnet-4-20250514"
+fix_model    = "claude-sonnet-4-20250514"
+critical_fix_model = "claude-opus-4-20250514"
+
+# Cross-validate CRITICAL fixes with a second model
+cross_validate_critical = true
+
+[chunking]
+# File size thresholds (lines) — determines chunking strategy
+threshold_full         = 200
+threshold_half         = 1000
+threshold_ast          = 5000
+threshold_skeleton     = 20000
+# Above threshold_skeleton: skeleton-only mode
+
+# Line overlap between adjacent chunks
+overlap_lines = 20
+
+# Max lines per chunk (hard ceiling for token safety)
+max_chunk_lines = 800
+
+# Max file size to read at all (bytes)
+max_file_size_bytes = 10_485_760  # 10MB
+
+[loop]
+# Maximum stabilization cycles before halting
+max_cycles = 50
+
+# Maximum USD to spend per run
+cost_ceiling_usd = 50.0
+
+# Number of parallel agent sessions
+concurrency = 4
+
+# Stall detection: halt after N cycles with no score improvement
+stall_threshold = 2
+
+# Regression threshold: halt if score increases by more than this fraction
+regression_threshold = 0.10
+
+# Maximum fix attempts per issue before escalating to human
+max_fix_attempts = 3
+
+[github]
+# Base branch for PRs (default: main)
+base_branch = "main"
+
+# PR branch prefix
+branch_prefix = "stabilizer"
+
+# Auto-merge PRs (requires branch protection rules to be set)
+auto_merge = false
+
+[static_analysis]
+# Run these tools before any fix is committed
+run_ruff    = true
+run_mypy    = true
+run_semgrep = true
+run_bandit  = true
+
+# Fail on warnings (stricter mode)
+fail_on_warning = false
+
+# Analysis timeout per tool (seconds)
+timeout_s = 60
+
+[api]
+# FastAPI server settings
+host = "0.0.0.0"
+port = 8000
+reload = false
+
+[logging]
+level = "INFO"
+format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+file = ".stabilizer/openmoss.log"
+
+[brain]
+# Storage backend: sqlite (default), json (small repos only)
+backend = "sqlite"
+db_path = ".stabilizer/brain.db"
+
+# Vector store for semantic cross-file search (requires chromadb)
+vector_store_enabled = false
+vector_store_path = ".stabilizer/vectors"
+
+[patrol]
+# How often the patrol agent checks system health (seconds)
+poll_interval_s = 60
+
+# Task timeout — escalate if an agent session exceeds this (minutes)
+task_timeout_min = 15
+
+# Rejection rate threshold — alert if >X% of fixes are rejected
+rejection_rate_threshold = 0.50
+
+# Cost warning threshold — warn at this % of cost ceiling
+cost_warn_pct = 0.80
