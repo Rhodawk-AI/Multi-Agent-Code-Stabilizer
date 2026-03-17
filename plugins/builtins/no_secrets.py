@@ -1,15 +1,10 @@
-"""
-plugins/builtins/no_secrets.py
-Built-in plugin: detect hardcoded secrets and credentials.
-Catches what static analysis misses — semantic credential patterns.
-"""
 from __future__ import annotations
 
 import re
-from plugins.base import AuditPlugin, PluginIssue
-from brain.schemas import Severity
 
-# Patterns that strongly suggest a hardcoded credential
+from brain.schemas import Severity
+from plugins.base import AuditPlugin, PluginIssue
+
 SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'(?i)(password|passwd|pwd)\s*=\s*["\'][^"\']{4,}["\']'), "Hardcoded password"),
     (re.compile(r'(?i)(api_key|apikey|api-key)\s*=\s*["\'][^"\']{8,}["\']'), "Hardcoded API key"),
@@ -18,10 +13,11 @@ SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'sk-[A-Za-z0-9]{32,}'), "OpenAI API key pattern"),
     (re.compile(r'ghp_[A-Za-z0-9]{36}'), "GitHub personal access token"),
     (re.compile(r'(?i)aws_access_key_id\s*=\s*["\'][A-Z0-9]{16,}["\']'), "AWS access key"),
+    (re.compile(r'(?i)aws_secret_access_key\s*=\s*["\'][^"\']{20,}["\']'), "AWS secret key"),
+    (re.compile(r'-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'), "Private key in source"),
 ]
 
-# Safe patterns — these are examples, env var lookups, not real secrets
-SAFE_PATTERNS = [
+SAFE_PATTERNS = (
     "os.environ",
     "os.getenv",
     "getenv(",
@@ -38,40 +34,47 @@ SAFE_PATTERNS = [
     "<",
     ">",
     "TODO",
-]
+    "CHANGE_ME",
+    "REPLACE_ME",
+    "test_",
+    "_test",
+)
+
+SKIP_PATH_PATTERNS = ("test", "example", ".env.example", "fixture", "mock", "fake", "stub")
 
 
 class NoSecretsPlugin(AuditPlugin):
-    name        = "no_secrets"
+    name = "no_secrets"
     description = "Detect hardcoded credentials and secrets"
-    version     = "1.0.0"
+    version = "1.1.0"
 
     async def audit_file(self, path: str, content: str, language: str) -> list[PluginIssue]:
-        # Skip test files and example files
-        if any(x in path.lower() for x in ("test", "example", ".env.example", "fixture")):
+        path_lower = path.lower()
+        if any(x in path_lower for x in SKIP_PATH_PATTERNS):
+            return []
+        if path_lower.endswith((".md", ".rst", ".txt", ".png", ".jpg")):
             return []
 
         issues: list[PluginIssue] = []
         lines = content.splitlines()
 
         for line_num, line in enumerate(lines, 1):
-            # Skip comments
             stripped = line.strip()
-            if stripped.startswith(("#", "//", "*", "<!--")):
+            if stripped.startswith(("#", "//", "*", "<!--", '"#', "'#")):
                 continue
-            # Skip if line contains a safe pattern
             if any(safe in line for safe in SAFE_PATTERNS):
                 continue
-
             for pattern, description in SECRET_PATTERNS:
                 if pattern.search(line):
                     issues.append(PluginIssue(
                         severity=Severity.CRITICAL,
-                        description=f"{description} detected at line {line_num}. "
-                                    f"Move to environment variable immediately.",
+                        description=(
+                            f"{description} detected at L{line_num} in {path}. "
+                            "Rotate credential immediately and move to environment variable."
+                        ),
                         line=line_num,
                         section="Security — No Hardcoded Secrets",
+                        fix_requires_files=[path],
                     ))
-                    break  # one issue per line
-
+                    break
         return issues
