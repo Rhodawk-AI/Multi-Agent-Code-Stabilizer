@@ -156,7 +156,7 @@ class StabilizerController:
     async def stabilize(self) -> RunStatus:
         assert self.run is not None, "Call initialise() first"
 
-        console.rule(f"[bold blue]OpenMOSS Stabilizer — {self.run.repo_name}")
+        console.rule(f"[bold blue]RHODAWK AI CODE STABILIZER Stabilizer — {self.run.repo_name}")
         console.print(f"Run ID: {self.run.id}")
         console.print(f"Model:  {self.cfg.primary_model}")
         console.print(f"Autonomy: {self.cfg.autonomy_level.value}")
@@ -535,7 +535,7 @@ class StabilizerController:
             log.info(f"Reverting last stabilizer cycle on {self.cfg.repo_root}")
             commits = list(repo.iter_commits(max_count=20))
             for commit in commits:
-                if f"fix(openmoss)" in commit.message or branch_prefix in commit.message:
+                if f"fix(rhodawk-ai-code-stabilizer)" in commit.message or branch_prefix in commit.message:
                     repo.git.revert(commit.hexsha, no_edit=True)
                     log.info(f"Reverted commit: {commit.hexsha[:8]} — {commit.message[:60]}")
                     entry = AuditTrailEntry(
@@ -582,7 +582,7 @@ class StabilizerController:
 
     def _print_final_report(self, status: RunStatus, total_cost: float) -> None:
         assert self.run is not None
-        table = Table(title=f"OpenMOSS Run Complete — {status.value}")
+        table = Table(title=f"RHODAWK AI CODE STABILIZER Run Complete — {status.value}")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="white")
         color = "green" if status == RunStatus.STABILIZED else "red"
