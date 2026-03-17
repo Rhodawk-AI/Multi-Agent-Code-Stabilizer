@@ -1,23 +1,10 @@
-"""
-brain/sqlite_storage.py
-Production SQLite brain storage using aiosqlite.
-Handles millions of lines of code via incremental indexing.
-
-PATCH LOG:
-  - append_score: replaced str(id(score)) memory-address PK with score.id (UUID)
-  - upsert_issue: added run_id to INSERT statement (was NULL for every issue, breaking
-    all list_issues(run_id=...) queries and multi-run isolation entirely)
-  - Added asyncio.Lock for write serialization — aiosqlite with a single shared
-    connection is not concurrency-safe for writes without explicit serialization
-  - _conn() context manager now uses write_lock for all mutations
-"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -26,6 +13,10 @@ import aiosqlite
 from brain.schemas import (
     AuditRun,
     AuditScore,
+    AuditTrailEntry,
+    AutonomyLevel,
+    ChunkStrategy,
+    ExecutorType,
     FileChunkRecord,
     FileRecord,
     FileStatus,
@@ -36,6 +27,9 @@ from brain.schemas import (
     IssueStatus,
     LLMSession,
     PatrolEvent,
+    PlannerRecord,
+    PlannerVerdict,
+    ReversibilityClass,
     ReviewDecision,
     ReviewResult,
     ReviewVerdict,
@@ -50,6 +44,7 @@ DDL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+PRAGMA cache_size=-32000;
 
 CREATE TABLE IF NOT EXISTS audit_runs (
     id                  TEXT PRIMARY KEY,
@@ -57,6 +52,7 @@ CREATE TABLE IF NOT EXISTS audit_runs (
     repo_name           TEXT NOT NULL,
     branch              TEXT NOT NULL DEFAULT 'main',
     master_prompt_path  TEXT,
+    autonomy_level      TEXT NOT NULL DEFAULT 'auto_fix',
     status              TEXT NOT NULL DEFAULT 'RUNNING',
     cycle_count         INTEGER DEFAULT 0,
     max_cycles          INTEGER DEFAULT 50,
@@ -75,6 +71,7 @@ CREATE TABLE IF NOT EXISTS audit_scores (
     major_count     INTEGER DEFAULT 0,
     minor_count     INTEGER DEFAULT 0,
     info_count      INTEGER DEFAULT 0,
+    escalated_count INTEGER DEFAULT 0,
     score           REAL DEFAULT 0.0,
     scored_at       TEXT NOT NULL
 );
@@ -129,6 +126,7 @@ CREATE TABLE IF NOT EXISTS issues (
     fix_attempt_count       INTEGER DEFAULT 0,
     fingerprint             TEXT DEFAULT '',
     escalated_reason        TEXT,
+    regressed_from          TEXT,
     created_at              TEXT NOT NULL,
     closed_at               TEXT
 );
@@ -137,6 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_issues_run_status  ON issues(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_issues_severity    ON issues(severity);
 CREATE INDEX IF NOT EXISTS idx_issues_file        ON issues(file_path);
 CREATE INDEX IF NOT EXISTS idx_issues_fingerprint ON issues(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_issues_run_id      ON issues(run_id);
 
 CREATE TABLE IF NOT EXISTS issue_fingerprints (
     fingerprint TEXT PRIMARY KEY,
@@ -148,11 +147,16 @@ CREATE TABLE IF NOT EXISTS issue_fingerprints (
 
 CREATE TABLE IF NOT EXISTS fix_attempts (
     id                  TEXT PRIMARY KEY,
+    run_id              TEXT DEFAULT '',
     issue_ids           TEXT NOT NULL DEFAULT '[]',
     fixed_files         TEXT NOT NULL DEFAULT '[]',
     reviewer_verdict    TEXT,
     reviewer_reason     TEXT DEFAULT '',
     reviewer_confidence REAL DEFAULT 0.0,
+    planner_approved    INTEGER,
+    planner_reason      TEXT DEFAULT '',
+    gate_passed         INTEGER,
+    gate_reason         TEXT DEFAULT '',
     commit_sha          TEXT,
     pr_url              TEXT,
     created_at          TEXT NOT NULL,
@@ -169,12 +173,28 @@ CREATE TABLE IF NOT EXISTS review_results (
     reviewed_at         TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS planner_records (
+    id              TEXT PRIMARY KEY,
+    fix_attempt_id  TEXT NOT NULL REFERENCES fix_attempts(id),
+    run_id          TEXT DEFAULT '',
+    file_path       TEXT NOT NULL,
+    verdict         TEXT NOT NULL,
+    reversibility   TEXT NOT NULL,
+    goal_coherent   INTEGER NOT NULL DEFAULT 1,
+    risk_score      REAL DEFAULT 0.0,
+    block_commit    INTEGER DEFAULT 0,
+    reason          TEXT DEFAULT '',
+    simulation_summary TEXT DEFAULT '',
+    evaluated_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS patrol_log (
     id           TEXT PRIMARY KEY,
     event_type   TEXT NOT NULL,
     detail       TEXT NOT NULL,
     action_taken TEXT NOT NULL,
     run_id       TEXT NOT NULL,
+    severity     TEXT DEFAULT 'INFO',
     timestamp    TEXT NOT NULL
 );
 
@@ -195,20 +215,48 @@ CREATE TABLE IF NOT EXISTS llm_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_sessions(run_id);
+
+CREATE TABLE IF NOT EXISTS audit_trail (
+    id           TEXT PRIMARY KEY,
+    run_id       TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    entity_id    TEXT DEFAULT '',
+    entity_type  TEXT DEFAULT '',
+    before_state TEXT DEFAULT '',
+    after_state  TEXT DEFAULT '',
+    actor        TEXT DEFAULT '',
+    hmac_signature TEXT DEFAULT '',
+    timestamp    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trail_run ON audit_trail(run_id);
 """
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _parse_dt(v: str | None) -> datetime | None:
+    if not v:
+        return None
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _require_dt(v: str) -> datetime:
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 class SQLiteBrainStorage(BrainStorage):
     def __init__(self, db_path: str | Path = ".stabilizer/brain.db") -> None:
         self._path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
-        # FIX: asyncio.Lock for write serialization.
-        # aiosqlite wraps sqlite3 in a thread but a single shared connection is
-        # not safe for concurrent async writers without explicit serialization.
         self._write_lock = asyncio.Lock()
 
     @asynccontextmanager
@@ -219,7 +267,6 @@ class SQLiteBrainStorage(BrainStorage):
 
     @asynccontextmanager
     async def _write(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Context manager for write operations — serialises concurrent writes."""
         async with self._write_lock:
             if self._db is None:
                 raise RuntimeError("Storage not initialised — call await storage.initialise() first")
@@ -239,18 +286,17 @@ class SQLiteBrainStorage(BrainStorage):
             await self._db.close()
             self._db = None
 
-    # ── Audit Run ─────────────────────────────────────────────────────────
-
     async def upsert_run(self, run: AuditRun) -> None:
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO audit_runs
                     (id, repo_url, repo_name, branch, master_prompt_path,
-                     status, cycle_count, max_cycles, files_total, files_read,
-                     metadata, started_at, completed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     autonomy_level, status, cycle_count, max_cycles,
+                     files_total, files_read, metadata, started_at, completed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
+                    autonomy_level=excluded.autonomy_level,
                     cycle_count=excluded.cycle_count,
                     files_total=excluded.files_total,
                     files_read=excluded.files_read,
@@ -258,8 +304,8 @@ class SQLiteBrainStorage(BrainStorage):
                     completed_at=excluded.completed_at
             """, (
                 run.id, run.repo_url, run.repo_name, run.branch,
-                run.master_prompt_path, run.status.value,
-                run.cycle_count, run.max_cycles,
+                run.master_prompt_path, run.autonomy_level.value,
+                run.status.value, run.cycle_count, run.max_cycles,
                 run.files_total, run.files_read,
                 json.dumps(run.metadata),
                 run.started_at.isoformat(),
@@ -269,9 +315,7 @@ class SQLiteBrainStorage(BrainStorage):
 
     async def get_run(self, run_id: str) -> AuditRun | None:
         async with self._conn() as db:
-            async with db.execute(
-                "SELECT * FROM audit_runs WHERE id=?", (run_id,)
-            ) as cur:
+            async with db.execute("SELECT * FROM audit_runs WHERE id=?", (run_id,)) as cur:
                 row = await cur.fetchone()
                 if not row:
                     return None
@@ -281,14 +325,15 @@ class SQLiteBrainStorage(BrainStorage):
                     repo_name=row["repo_name"],
                     branch=row["branch"],
                     master_prompt_path=row["master_prompt_path"] or "",
+                    autonomy_level=AutonomyLevel(row["autonomy_level"]) if row["autonomy_level"] else AutonomyLevel.AUTO_FIX,
                     status=RunStatus(row["status"]),
                     cycle_count=row["cycle_count"],
                     max_cycles=row["max_cycles"],
                     files_total=row["files_total"],
                     files_read=row["files_read"],
                     metadata=json.loads(row["metadata"] or "{}"),
-                    started_at=datetime.fromisoformat(row["started_at"]),
-                    completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+                    started_at=_require_dt(row["started_at"]),
+                    completed_at=_parse_dt(row["completed_at"]),
                 )
 
     async def update_run_status(self, run_id: str, status: RunStatus) -> None:
@@ -304,21 +349,18 @@ class SQLiteBrainStorage(BrainStorage):
             await db.commit()
 
     async def append_score(self, score: AuditScore) -> None:
-        # FIX: was using str(id(score)) — Python object memory address — as PK.
-        # This is non-deterministic and guaranteed to collide across interpreter sessions.
-        # AuditScore now has a proper UUID id field.
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO audit_scores
                     (id, run_id, total_issues, critical_count, major_count,
-                     minor_count, info_count, score, scored_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     minor_count, info_count, escalated_count, score, scored_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO NOTHING
             """, (
                 score.id, score.run_id,
                 score.total_issues, score.critical_count,
                 score.major_count, score.minor_count,
-                score.info_count, score.score,
+                score.info_count, score.escalated_count, score.score,
                 score.scored_at.isoformat(),
             ))
             await db.commit()
@@ -339,13 +381,12 @@ class SQLiteBrainStorage(BrainStorage):
                         major_count=r["major_count"],
                         minor_count=r["minor_count"],
                         info_count=r["info_count"],
+                        escalated_count=r["escalated_count"] if "escalated_count" in r.keys() else 0,
                         score=r["score"],
-                        scored_at=datetime.fromisoformat(r["scored_at"]),
+                        scored_at=_require_dt(r["scored_at"]),
                     )
                     for r in rows
                 ]
-
-    # ── Files ──────────────────────────────────────────────────────────────
 
     async def upsert_file(self, record: FileRecord) -> None:
         async with self._write() as db:
@@ -393,12 +434,20 @@ class SQLiteBrainStorage(BrainStorage):
 
     async def list_files(self, run_id: str | None = None) -> list[FileRecord]:
         async with self._conn() as db:
-            async with db.execute("SELECT * FROM files ORDER BY path") as cur:
-                rows = await cur.fetchall()
-                return [self._row_to_file(r) for r in rows]
+            if run_id:
+                async with db.execute(
+                    "SELECT f.* FROM files f "
+                    "INNER JOIN issues i ON i.file_path = f.path AND i.run_id = ? "
+                    "GROUP BY f.path ORDER BY f.path",
+                    (run_id,),
+                ) as cur:
+                    rows = await cur.fetchall()
+            else:
+                async with db.execute("SELECT * FROM files ORDER BY path") as cur:
+                    rows = await cur.fetchall()
+            return [self._row_to_file(r) for r in rows]
 
     def _row_to_file(self, row: aiosqlite.Row) -> FileRecord:
-        from brain.schemas import ChunkStrategy
         return FileRecord(
             path=row["path"],
             content_hash=row["content_hash"] or "",
@@ -411,10 +460,10 @@ class SQLiteBrainStorage(BrainStorage):
             chunks_read=row["chunks_read"],
             summary=row["summary"] or "",
             is_load_bearing=bool(row["is_load_bearing"]),
-            last_hash_check=datetime.fromisoformat(row["last_hash_check"]) if row["last_hash_check"] else None,
-            last_read_at=datetime.fromisoformat(row["last_read_at"]) if row["last_read_at"] else None,
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
+            last_hash_check=_parse_dt(row["last_hash_check"]),
+            last_read_at=_parse_dt(row["last_read_at"]),
+            created_at=_require_dt(row["created_at"]),
+            updated_at=_require_dt(row["updated_at"]),
         )
 
     async def mark_file_read(self, path: str, summary: str) -> None:
@@ -447,11 +496,10 @@ class SQLiteBrainStorage(BrainStorage):
                 chunk.token_count,
                 chunk.read_at.isoformat(),
             ))
-            # Update chunks_read counter
-            await db.execute("""
-                UPDATE files SET chunks_read=chunks_read+1, updated_at=?
-                WHERE path=?
-            """, (_now(), chunk.file_path))
+            await db.execute(
+                "UPDATE files SET chunks_read=chunks_read+1, updated_at=? WHERE path=?",
+                (_now(), chunk.file_path),
+            )
             await db.commit()
 
     async def get_chunks(self, file_path: str) -> list[FileChunkRecord]:
@@ -475,30 +523,26 @@ class SQLiteBrainStorage(BrainStorage):
                         summary=r["summary"],
                         raw_observations=json.loads(r["raw_observations"]),
                         token_count=r["token_count"],
-                        read_at=datetime.fromisoformat(r["read_at"]),
+                        read_at=_require_dt(r["read_at"]),
                     )
                     for r in rows
                 ]
 
-    # ── Issues ─────────────────────────────────────────────────────────────
-
     async def upsert_issue(self, issue: Issue) -> None:
-        # FIX: run_id was completely absent from the INSERT.
-        # The DDL column existed, but was never populated.
-        # list_issues(run_id=...) therefore always returned empty results,
-        # breaking score computation, cost ceilings, and all per-run queries.
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO issues
                     (id, run_id, severity, file_path, line_start, line_end,
                      executor_type, master_prompt_section, description,
                      fix_requires_files, status, fix_attempt_count,
-                     fingerprint, escalated_reason, created_at, closed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     fingerprint, escalated_reason, regressed_from,
+                     created_at, closed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     fix_attempt_count=excluded.fix_attempt_count,
                     escalated_reason=excluded.escalated_reason,
+                    regressed_from=excluded.regressed_from,
                     closed_at=excluded.closed_at
             """, (
                 issue.id, issue.run_id,
@@ -512,6 +556,7 @@ class SQLiteBrainStorage(BrainStorage):
                 issue.fix_attempt_count,
                 issue.fingerprint,
                 issue.escalated_reason,
+                issue.regressed_from,
                 issue.created_at.isoformat(),
                 issue.closed_at.isoformat() if issue.closed_at else None,
             ))
@@ -556,7 +601,6 @@ class SQLiteBrainStorage(BrainStorage):
                 return [self._row_to_issue(r) for r in rows]
 
     def _row_to_issue(self, row: aiosqlite.Row) -> Issue:
-        from brain.schemas import ExecutorType
         return Issue(
             id=row["id"],
             run_id=row["run_id"] or "",
@@ -572,11 +616,14 @@ class SQLiteBrainStorage(BrainStorage):
             fix_attempt_count=row["fix_attempt_count"],
             fingerprint=row["fingerprint"] or "",
             escalated_reason=row["escalated_reason"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            closed_at=datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
+            regressed_from=row["regressed_from"] if "regressed_from" in row.keys() else None,
+            created_at=_require_dt(row["created_at"]),
+            closed_at=_parse_dt(row["closed_at"]),
         )
 
-    async def update_issue_status(self, issue_id: str, status: str, reason: str = "") -> None:
+    async def update_issue_status(
+        self, issue_id: str, status: str, reason: str = ""
+    ) -> None:
         async with self._write() as db:
             closed = _now() if status in ("CLOSED", "ESCALATED") else None
             await db.execute("""
@@ -598,8 +645,6 @@ class SQLiteBrainStorage(BrainStorage):
                 row = await cur.fetchone()
                 return row["fix_attempt_count"] if row else 0
 
-    # ── Fingerprints ───────────────────────────────────────────────────────
-
     async def get_fingerprint(self, fingerprint: str) -> IssueFingerprint | None:
         async with self._conn() as db:
             async with db.execute(
@@ -612,14 +657,15 @@ class SQLiteBrainStorage(BrainStorage):
                     fingerprint=row["fingerprint"],
                     issue_id=row["issue_id"],
                     seen_count=row["seen_count"],
-                    first_seen=datetime.fromisoformat(row["first_seen"]),
-                    last_seen=datetime.fromisoformat(row["last_seen"]),
+                    first_seen=_require_dt(row["first_seen"]),
+                    last_seen=_require_dt(row["last_seen"]),
                 )
 
     async def upsert_fingerprint(self, fp: IssueFingerprint) -> None:
         async with self._write() as db:
             await db.execute("""
-                INSERT INTO issue_fingerprints (fingerprint, issue_id, seen_count, first_seen, last_seen)
+                INSERT INTO issue_fingerprints
+                    (fingerprint, issue_id, seen_count, first_seen, last_seen)
                 VALUES (?,?,?,?,?)
                 ON CONFLICT(fingerprint) DO UPDATE SET
                     seen_count=seen_count+1,
@@ -630,29 +676,39 @@ class SQLiteBrainStorage(BrainStorage):
             ))
             await db.commit()
 
-    # ── Fix Attempts ───────────────────────────────────────────────────────
-
     async def upsert_fix(self, fix: FixAttempt) -> None:
         async with self._write() as db:
+            planner_approved = None if fix.planner_approved is None else int(fix.planner_approved)
+            gate_passed = None if fix.gate_passed is None else int(fix.gate_passed)
             await db.execute("""
                 INSERT INTO fix_attempts
-                    (id, issue_ids, fixed_files, reviewer_verdict, reviewer_reason,
-                     reviewer_confidence, commit_sha, pr_url, created_at, committed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                    (id, run_id, issue_ids, fixed_files, reviewer_verdict,
+                     reviewer_reason, reviewer_confidence, planner_approved,
+                     planner_reason, gate_passed, gate_reason,
+                     commit_sha, pr_url, created_at, committed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     reviewer_verdict=excluded.reviewer_verdict,
                     reviewer_reason=excluded.reviewer_reason,
                     reviewer_confidence=excluded.reviewer_confidence,
+                    planner_approved=excluded.planner_approved,
+                    planner_reason=excluded.planner_reason,
+                    gate_passed=excluded.gate_passed,
+                    gate_reason=excluded.gate_reason,
                     commit_sha=excluded.commit_sha,
                     pr_url=excluded.pr_url,
                     committed_at=excluded.committed_at
             """, (
-                fix.id,
+                fix.id, fix.run_id,
                 json.dumps(fix.issue_ids),
                 json.dumps([f.model_dump() for f in fix.fixed_files]),
                 fix.reviewer_verdict.value if fix.reviewer_verdict else None,
                 fix.reviewer_reason,
                 fix.reviewer_confidence,
+                planner_approved,
+                fix.planner_reason,
+                gate_passed,
+                fix.gate_reason,
                 fix.commit_sha,
                 fix.pr_url,
                 fix.created_at.isoformat(),
@@ -666,49 +722,46 @@ class SQLiteBrainStorage(BrainStorage):
                 row = await cur.fetchone()
                 if not row:
                     return None
-                files_data = json.loads(row["fixed_files"] or "[]")
-                return FixAttempt(
-                    id=row["id"],
-                    issue_ids=json.loads(row["issue_ids"]),
-                    fixed_files=[FixedFile(**f) for f in files_data],
-                    reviewer_verdict=ReviewVerdict(row["reviewer_verdict"]) if row["reviewer_verdict"] else None,
-                    reviewer_reason=row["reviewer_reason"] or "",
-                    reviewer_confidence=row["reviewer_confidence"],
-                    commit_sha=row["commit_sha"],
-                    pr_url=row["pr_url"],
-                    created_at=datetime.fromisoformat(row["created_at"]),
-                    committed_at=datetime.fromisoformat(row["committed_at"]) if row["committed_at"] else None,
-                )
+                return self._row_to_fix(row)
 
     async def list_fixes(self, issue_id: str | None = None) -> list[FixAttempt]:
         async with self._conn() as db:
             if issue_id:
                 async with db.execute(
-                    "SELECT * FROM fix_attempts WHERE issue_ids LIKE ? ORDER BY created_at",
-                    (f"%{issue_id}%",),
+                    "SELECT * FROM fix_attempts ORDER BY created_at"
                 ) as cur:
                     rows = await cur.fetchall()
+                result = []
+                for row in rows:
+                    ids = json.loads(row["issue_ids"] or "[]")
+                    if issue_id in ids:
+                        result.append(self._row_to_fix(row))
+                return result
             else:
                 async with db.execute("SELECT * FROM fix_attempts ORDER BY created_at") as cur:
                     rows = await cur.fetchall()
-            result = []
-            for row in rows:
-                files_data = json.loads(row["fixed_files"] or "[]")
-                result.append(FixAttempt(
-                    id=row["id"],
-                    issue_ids=json.loads(row["issue_ids"]),
-                    fixed_files=[FixedFile(**f) for f in files_data],
-                    reviewer_verdict=ReviewVerdict(row["reviewer_verdict"]) if row["reviewer_verdict"] else None,
-                    reviewer_reason=row["reviewer_reason"] or "",
-                    reviewer_confidence=row["reviewer_confidence"],
-                    commit_sha=row["commit_sha"],
-                    pr_url=row["pr_url"],
-                    created_at=datetime.fromisoformat(row["created_at"]),
-                    committed_at=datetime.fromisoformat(row["committed_at"]) if row["committed_at"] else None,
-                ))
-            return result
+                return [self._row_to_fix(r) for r in rows]
 
-    # ── Reviews ────────────────────────────────────────────────────────────
+    def _row_to_fix(self, row: aiosqlite.Row) -> FixAttempt:
+        files_data = json.loads(row["fixed_files"] or "[]")
+        keys = row.keys()
+        return FixAttempt(
+            id=row["id"],
+            run_id=row["run_id"] or "",
+            issue_ids=json.loads(row["issue_ids"]),
+            fixed_files=[FixedFile(**f) for f in files_data],
+            reviewer_verdict=ReviewVerdict(row["reviewer_verdict"]) if row["reviewer_verdict"] else None,
+            reviewer_reason=row["reviewer_reason"] or "",
+            reviewer_confidence=row["reviewer_confidence"],
+            planner_approved=bool(row["planner_approved"]) if row["planner_approved"] is not None else None,
+            planner_reason=row["planner_reason"] or "",
+            gate_passed=bool(row["gate_passed"]) if row["gate_passed"] is not None else None,
+            gate_reason=row["gate_reason"] or "",
+            commit_sha=row["commit_sha"],
+            pr_url=row["pr_url"],
+            created_at=_require_dt(row["created_at"]),
+            committed_at=_parse_dt(row["committed_at"]),
+        )
 
     async def upsert_review(self, review: ReviewResult) -> None:
         async with self._write() as db:
@@ -749,19 +802,65 @@ class SQLiteBrainStorage(BrainStorage):
                     overall_score=row["overall_score"],
                     overall_note=row["overall_note"] or "",
                     approve_for_commit=bool(row["approve_for_commit"]),
-                    reviewed_at=datetime.fromisoformat(row["reviewed_at"]),
+                    reviewed_at=_require_dt(row["reviewed_at"]),
                 )
 
-    # ── Patrol ─────────────────────────────────────────────────────────────
+    async def upsert_planner_record(self, record: PlannerRecord) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                INSERT INTO planner_records
+                    (id, fix_attempt_id, run_id, file_path, verdict,
+                     reversibility, goal_coherent, risk_score, block_commit,
+                     reason, simulation_summary, evaluated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    verdict=excluded.verdict,
+                    block_commit=excluded.block_commit,
+                    reason=excluded.reason
+            """, (
+                record.id, record.fix_attempt_id, record.run_id,
+                record.file_path, record.verdict.value,
+                record.reversibility.value, int(record.goal_coherent),
+                record.risk_score, int(record.block_commit),
+                record.reason, record.simulation_summary,
+                record.evaluated_at.isoformat(),
+            ))
+            await db.commit()
+
+    async def get_planner_records(self, fix_attempt_id: str) -> list[PlannerRecord]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM planner_records WHERE fix_attempt_id=?", (fix_attempt_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    PlannerRecord(
+                        id=r["id"],
+                        fix_attempt_id=r["fix_attempt_id"],
+                        run_id=r["run_id"] or "",
+                        file_path=r["file_path"],
+                        verdict=PlannerVerdict(r["verdict"]),
+                        reversibility=ReversibilityClass(r["reversibility"]),
+                        goal_coherent=bool(r["goal_coherent"]),
+                        risk_score=r["risk_score"],
+                        block_commit=bool(r["block_commit"]),
+                        reason=r["reason"] or "",
+                        simulation_summary=r["simulation_summary"] or "",
+                        evaluated_at=_require_dt(r["evaluated_at"]),
+                    )
+                    for r in rows
+                ]
 
     async def log_patrol_event(self, event: PatrolEvent) -> None:
         async with self._write() as db:
             await db.execute("""
-                INSERT INTO patrol_log (id, event_type, detail, action_taken, run_id, timestamp)
-                VALUES (?,?,?,?,?,?)
+                INSERT INTO patrol_log
+                    (id, event_type, detail, action_taken, run_id, severity, timestamp)
+                VALUES (?,?,?,?,?,?,?)
             """, (
                 event.id, event.event_type, event.detail,
-                event.action_taken, event.run_id, event.timestamp.isoformat(),
+                event.action_taken, event.run_id,
+                event.severity, event.timestamp.isoformat(),
             ))
             await db.commit()
 
@@ -779,12 +878,11 @@ class SQLiteBrainStorage(BrainStorage):
                         detail=row["detail"],
                         action_taken=row["action_taken"],
                         run_id=row["run_id"],
-                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        severity=row["severity"] if "severity" in row.keys() else "INFO",
+                        timestamp=_require_dt(row["timestamp"]),
                     )
                     for row in rows
                 ]
-
-    # ── LLM sessions ───────────────────────────────────────────────────────
 
     async def log_llm_session(self, session: LLMSession) -> None:
         async with self._write() as db:
@@ -810,3 +908,42 @@ class SQLiteBrainStorage(BrainStorage):
             ) as cur:
                 row = await cur.fetchone()
                 return float(row["total"]) if row else 0.0
+
+    async def append_audit_trail(self, entry: AuditTrailEntry) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                INSERT INTO audit_trail
+                    (id, run_id, event_type, entity_id, entity_type,
+                     before_state, after_state, actor, hmac_signature, timestamp)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (
+                entry.id, entry.run_id, entry.event_type,
+                entry.entity_id, entry.entity_type,
+                entry.before_state, entry.after_state,
+                entry.actor, entry.hmac_signature,
+                entry.timestamp.isoformat(),
+            ))
+            await db.commit()
+
+    async def get_audit_trail(self, run_id: str) -> list[AuditTrailEntry]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM audit_trail WHERE run_id=? ORDER BY timestamp",
+                (run_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    AuditTrailEntry(
+                        id=r["id"],
+                        run_id=r["run_id"],
+                        event_type=r["event_type"],
+                        entity_id=r["entity_id"] or "",
+                        entity_type=r["entity_type"] or "",
+                        before_state=r["before_state"] or "",
+                        after_state=r["after_state"] or "",
+                        actor=r["actor"] or "",
+                        hmac_signature=r["hmac_signature"] or "",
+                        timestamp=_require_dt(r["timestamp"]),
+                    )
+                    for r in rows
+                ]

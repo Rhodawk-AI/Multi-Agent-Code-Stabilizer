@@ -1,8 +1,3 @@
-"""
-brain/storage.py
-Abstract base class for all brain storage backends.
-All agents read/write exclusively through this interface.
-"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,6 +5,7 @@ from abc import ABC, abstractmethod
 from brain.schemas import (
     AuditRun,
     AuditScore,
+    AuditTrailEntry,
     FileChunkRecord,
     FileRecord,
     FixAttempt,
@@ -17,6 +13,7 @@ from brain.schemas import (
     IssueFingerprint,
     LLMSession,
     PatrolEvent,
+    PlannerRecord,
     ReviewResult,
     RunStatus,
     Severity,
@@ -24,24 +21,12 @@ from brain.schemas import (
 
 
 class BrainStorage(ABC):
-    """
-    Abstract brain storage interface.
-    All implementations must be async-safe and idempotent on upserts.
-    """
-
-    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     @abstractmethod
-    async def initialise(self) -> None:
-        """Create tables / collections / indices. Idempotent."""
-        ...
+    async def initialise(self) -> None: ...
 
     @abstractmethod
-    async def close(self) -> None:
-        """Close connections gracefully."""
-        ...
-
-    # ── Audit Run ─────────────────────────────────────────────────────────
+    async def close(self) -> None: ...
 
     @abstractmethod
     async def upsert_run(self, run: AuditRun) -> None: ...
@@ -57,8 +42,6 @@ class BrainStorage(ABC):
 
     @abstractmethod
     async def get_scores(self, run_id: str) -> list[AuditScore]: ...
-
-    # ── Files ──────────────────────────────────────────────────────────────
 
     @abstractmethod
     async def upsert_file(self, record: FileRecord) -> None: ...
@@ -78,8 +61,6 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_chunks(self, file_path: str) -> list[FileChunkRecord]: ...
 
-    # ── Issues ─────────────────────────────────────────────────────────────
-
     @abstractmethod
     async def upsert_issue(self, issue: Issue) -> None: ...
 
@@ -96,22 +77,18 @@ class BrainStorage(ABC):
     ) -> list[Issue]: ...
 
     @abstractmethod
-    async def update_issue_status(self, issue_id: str, status: str, reason: str = "") -> None: ...
+    async def update_issue_status(
+        self, issue_id: str, status: str, reason: str = ""
+    ) -> None: ...
 
     @abstractmethod
-    async def increment_fix_attempts(self, issue_id: str) -> int:
-        """Returns new fix_attempt_count after increment."""
-        ...
-
-    # ── Fingerprints (loop prevention) ─────────────────────────────────────
+    async def increment_fix_attempts(self, issue_id: str) -> int: ...
 
     @abstractmethod
     async def get_fingerprint(self, fingerprint: str) -> IssueFingerprint | None: ...
 
     @abstractmethod
     async def upsert_fingerprint(self, fp: IssueFingerprint) -> None: ...
-
-    # ── Fix Attempts ───────────────────────────────────────────────────────
 
     @abstractmethod
     async def upsert_fix(self, fix: FixAttempt) -> None: ...
@@ -122,15 +99,17 @@ class BrainStorage(ABC):
     @abstractmethod
     async def list_fixes(self, issue_id: str | None = None) -> list[FixAttempt]: ...
 
-    # ── Reviews ────────────────────────────────────────────────────────────
-
     @abstractmethod
     async def upsert_review(self, review: ReviewResult) -> None: ...
 
     @abstractmethod
     async def get_review(self, fix_attempt_id: str) -> ReviewResult | None: ...
 
-    # ── Patrol Log ─────────────────────────────────────────────────────────
+    @abstractmethod
+    async def upsert_planner_record(self, record: PlannerRecord) -> None: ...
+
+    @abstractmethod
+    async def get_planner_records(self, fix_attempt_id: str) -> list[PlannerRecord]: ...
 
     @abstractmethod
     async def log_patrol_event(self, event: PatrolEvent) -> None: ...
@@ -138,25 +117,22 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_patrol_events(self, run_id: str) -> list[PatrolEvent]: ...
 
-    # ── LLM Cost Tracking ──────────────────────────────────────────────────
-
     @abstractmethod
     async def log_llm_session(self, session: LLMSession) -> None: ...
 
     @abstractmethod
     async def get_total_cost(self, run_id: str) -> float: ...
 
-    # ── Utility queries ────────────────────────────────────────────────────
+    @abstractmethod
+    async def append_audit_trail(self, entry: AuditTrailEntry) -> None: ...
+
+    @abstractmethod
+    async def get_audit_trail(self, run_id: str) -> list[AuditTrailEntry]: ...
 
     async def count_open_critical(self, run_id: str | None = None) -> int:
-        issues = await self.list_issues(
-            run_id=run_id,
-            status="OPEN",
-            severity=Severity.CRITICAL,
-        )
+        issues = await self.list_issues(run_id=run_id, status="OPEN", severity=Severity.CRITICAL)
         return len(issues)
 
     async def all_read(self) -> bool:
-        """True when every file in the brain has been fully read."""
         files = await self.list_files()
-        return all(f.fully_read for f in files)
+        return all(f.fully_read for f in files) if files else False
