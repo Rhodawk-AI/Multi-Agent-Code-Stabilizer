@@ -1,4 +1,4 @@
-# OpenMOSS Master Audit Specification
+# RHODAWK AI CODE STABILIZER Master Audit Specification
 # Version 1.0 — Architecture-Grade Audit Prompt
 # This is the ground truth for what "stabilized" means.
 # Customize per project by adding/removing sections.
