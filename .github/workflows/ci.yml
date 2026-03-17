@@ -61,6 +61,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
-        run: docker build -t openmoss:${{ github.sha }} .
+        run: docker build -t rhodawk-ai-code-stabilizer:${{ github.sha }} .
       - name: Test Docker image
-        run: docker run --rm openmoss:${{ github.sha }} --help
+        run: docker run --rm rhodawk-ai-code-stabilizer:${{ github.sha }} --help
