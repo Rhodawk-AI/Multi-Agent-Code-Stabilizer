@@ -1,11 +1,5 @@
-"""
-scripts/run_one_cycle.py
-Manually trigger a single audit + fix cycle without the full loop.
-Useful for debugging and testing a specific repo state.
+from __future__ import annotations
 
-Usage:
-    python scripts/run_one_cycle.py /path/to/repo https://github.com/owner/repo
-"""
 import asyncio
 import os
 import sys
@@ -17,31 +11,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from orchestrator.controller import StabilizerConfig, StabilizerController
+from brain.schemas import AutonomyLevel
 
 
-async def run_single_cycle(repo_path: Path, repo_url: str) -> None:
+async def main(repo_path: Path, repo_url: str) -> None:
     cfg = StabilizerConfig(
         repo_url=repo_url,
         repo_root=repo_path,
-        master_prompt_path=Path("config/prompts/base.md"),
+        master_prompt_path=repo_path / "config" / "prompts" / "base.md",
         github_token=os.getenv("GITHUB_TOKEN", ""),
+        primary_model=os.getenv("OPENMOSS_MODEL", "claude-sonnet-4-20250514"),
         max_cycles=1,
+        cost_ceiling_usd=10.0,
         auto_commit=False,
+        autonomy_level=AutonomyLevel.PROPOSE_ONLY,
     )
     ctrl = StabilizerController(cfg)
     await ctrl.initialise()
-    await ctrl._phase_read()
-    score = await ctrl._phase_audit()
-    print(f"\nAudit complete:")
-    print(f"  CRITICAL: {score.critical_count}")
-    print(f"  MAJOR:    {score.major_count}")
-    print(f"  MINOR:    {score.minor_count}")
-    print(f"  Score:    {score.score}")
-    await ctrl.storage.close()
+    status = await ctrl.stabilize()
+    print(f"Cycle complete. Status: {status.value}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python run_one_cycle.py <repo_path> <repo_url>")
+        print("Usage: python scripts/run_one_cycle.py /path/to/repo https://github.com/owner/repo")
         sys.exit(1)
-    asyncio.run(run_single_cycle(Path(sys.argv[1]), sys.argv[2]))
+    asyncio.run(main(Path(sys.argv[1]), sys.argv[2]))
