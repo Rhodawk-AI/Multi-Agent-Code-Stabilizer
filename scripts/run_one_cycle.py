@@ -20,7 +20,7 @@ async def main(repo_path: Path, repo_url: str) -> None:
         repo_root=repo_path,
         master_prompt_path=repo_path / "config" / "prompts" / "base.md",
         github_token=os.getenv("GITHUB_TOKEN", ""),
-        primary_model=os.getenv("OPENMOSS_MODEL", "claude-sonnet-4-20250514"),
+        primary_model=os.getenv("RHODAWK_AI_CODE_STABILIZER_MODEL", "claude-sonnet-4-20250514"),
         max_cycles=1,
         cost_ceiling_usd=10.0,
         auto_commit=False,

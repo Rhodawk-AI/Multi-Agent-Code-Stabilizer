@@ -14,8 +14,8 @@ from rich.console import Console
 load_dotenv()
 console = Console()
 app = typer.Typer(
-    name="openmoss",
-    help="OpenMOSS — Autonomous Multi-Agent Code Stabilizer",
+    name="rhodawk-ai-code-stabilizer",
+    help="RHODAWK AI CODE STABILIZER — Autonomous Multi-Agent Code Stabilizer",
     add_completion=False,
     rich_markup_mode="rich",
 )
@@ -200,20 +200,20 @@ def serve(
     port: int = typer.Option(8000, "--port", "-p"),
     reload: bool = typer.Option(False, "--reload"),
 ) -> None:
-    """Start the OpenMOSS dashboard API server."""
+    """Start the RHODAWK AI CODE STABILIZER dashboard API server."""
     try:
         import uvicorn
     except ImportError:
         console.print("[red]uvicorn not installed. Run: pip install uvicorn[standard][/red]")
         raise typer.Exit(1)
-    console.print(f"[green]Starting OpenMOSS API on http://{host}:{port}[/green]")
+    console.print(f"[green]Starting RHODAWK AI CODE STABILIZER API on http://{host}:{port}[/green]")
     uvicorn.run("api.app:app", host=host, port=port, reload=reload, log_level="info")
 
 
 def _write_audit_report(output: Path, run_id: str, issues: list, score: object) -> None:
     ts = datetime.now(tz=timezone.utc).isoformat()
     lines = [
-        "# OpenMOSS Audit Report\n\n",
+        "# RHODAWK AI CODE STABILIZER Audit Report\n\n",
         f"**Run ID:** `{run_id}`\n\n",
         f"**Generated:** {ts}\n\n",
         "## Score Summary\n\n| Severity | Count |\n|---|---|\n",
