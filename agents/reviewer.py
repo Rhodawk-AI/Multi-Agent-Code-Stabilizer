@@ -1,32 +1,17 @@
-"""
-agents/reviewer.py
-Reviewer Agent.
-Reviews every fix attempt before it touches the repo.
-Uses a second model for cross-validation on critical issues.
-Enforces the architectural lock — load-bearing files need human approval.
-
-PATCH LOG:
-  - _review_fix: fixed nested `for ff in fix.fixed_files` variable shadowing the
-    outer `ff` loop variable. The comprehension used the shadow variable to build
-    decisions, meaning all decisions referenced the LAST file in fixed_files
-    instead of the specific file being checked. Refactored to use a flat list.
-  - _run_review_session: ReviewResponse had `overall_note` field but ReviewResult
-    schema didn't — now correctly passes overall_note through to the result.
-  - _store_result: added fix.reviewer_verdict None-guard before calling .value.
-  - compute_approval called once — removed duplicate call in _merge_reviews.
-"""
 from __future__ import annotations
 
+import difflib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agents.base import AgentConfig, BaseAgent
+from agents.base import AgentConfig, BaseAgent, wrap_content
 from brain.schemas import (
     ExecutorType,
     FixAttempt,
+    FixedFile,
     Issue,
     IssueStatus,
     ReviewDecision,
@@ -38,31 +23,30 @@ from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
+DIFF_CONTEXT_LINES = 5
+MAX_DIFF_CHARS = 12000
+
 
 class ReviewDecisionResponse(BaseModel):
-    issue_id:   str
-    fix_path:   str
-    verdict:    ReviewVerdict
+    issue_id: str
+    fix_path: str
+    verdict: ReviewVerdict
     confidence: float = Field(ge=0.0, le=1.0)
-    reason:     str = Field(
-        description="Precise technical reason for APPROVED or REJECTED. "
-                    "If REJECTED, state exactly what is wrong."
+    reason: str = Field(
+        description="Precise technical reason. If REJECTED, state exactly what is wrong."
+    )
+    line_references: list[str] = Field(
+        default_factory=list,
+        description="Specific line numbers or ranges that informed this decision",
     )
 
 
 class ReviewResponse(BaseModel):
-    decisions:    list[ReviewDecisionResponse]
+    decisions: list[ReviewDecisionResponse]
     overall_note: str = ""
 
 
 class ReviewerAgent(BaseAgent):
-    """
-    Reviews generated fixes before commit.
-    APPROVED  → orchestrator proceeds to static gate then commit
-    REJECTED  → issues re-queued for another fix attempt
-    ESCALATE  → requires human approval
-    """
-
     agent_type = ExecutorType.REVIEWER
 
     def __init__(
@@ -72,12 +56,13 @@ class ReviewerAgent(BaseAgent):
         config: AgentConfig | None = None,
         mcp_manager: Any | None = None,
         cross_validate_critical: bool = True,
+        repo_root: Any | None = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.cross_validate_critical = cross_validate_critical
+        self.repo_root = repo_root
 
-    async def run(self, **kwargs: Any) -> list[ReviewResult]:  # type: ignore[override]
-        """Review all pending fix attempts. Returns list of ReviewResults."""
+    async def run(self, **kwargs: Any) -> list[ReviewResult]:
         pending_fixes = await self.storage.list_fixes()
         unreviewed = [f for f in pending_fixes if f.reviewer_verdict is None]
 
@@ -94,32 +79,17 @@ class ReviewerAgent(BaseAgent):
         return results
 
     async def _review_fix(self, fix: FixAttempt) -> ReviewResult:
-        """Review a single fix attempt."""
-        # Load issues for context
         issues: list[Issue] = []
         for iid in fix.issue_ids:
             issue = await self.storage.get_issue(iid)
             if issue:
                 issues.append(issue)
 
-        # FIX: nested for loop shadow bug.
-        # Original code:
-        #   for ff in fix.fixed_files:          ← outer ff
-        #     if file_record.is_load_bearing:
-        #       decisions=[
-        #         ReviewDecision(...)
-        #         for iid in fix.issue_ids
-        #         for ff in fix.fixed_files     ← SHADOWS outer ff
-        #       ]
-        # All decisions got fix_path from the last ff in fixed_files regardless
-        # of which file triggered the load-bearing check.
-        # Fix: build the escalation decision list without shadowing the outer variable.
         for checked_file in fix.fixed_files:
             file_record = await self.storage.get_file(checked_file.path)
             if file_record and file_record.is_load_bearing:
                 self.log.warning(
-                    f"Reviewer: ESCALATE — {checked_file.path} is load-bearing, "
-                    "needs human approval"
+                    f"Reviewer: ESCALATE — {checked_file.path} is load-bearing"
                 )
                 escalation_decisions: list[ReviewDecision] = [
                     ReviewDecision(
@@ -140,27 +110,69 @@ class ReviewerAgent(BaseAgent):
                     decisions=escalation_decisions,
                     overall_note="Load-bearing file detected — escalated for human review.",
                     approve_for_commit=False,
-                    reviewed_at=datetime.utcnow(),
+                    reviewed_at=datetime.now(tz=timezone.utc),
                 )
                 await self._store_result(fix, result)
                 return result
 
-        # Run primary review
         result = await self._run_review_session(fix, issues, self.config.model)
 
-        # Cross-validate critical issues with second model
         has_critical = any(i.severity == Severity.CRITICAL for i in issues)
         if self.cross_validate_critical and has_critical and self.config.fallback_models:
             second_model = self.config.fallback_models[0]
             if second_model != self.config.model:
-                second_result = await self._run_review_session(
-                    fix, issues, second_model
-                )
+                second_result = await self._run_review_session(fix, issues, second_model)
                 result = self._merge_reviews(result, second_result, fix)
 
         result.compute_approval()
         await self._store_result(fix, result)
         return result
+
+    def _build_diff_context(
+        self, ff: FixedFile, original_content: str
+    ) -> str:
+        orig_lines = original_content.splitlines(keepends=True)
+        new_lines = ff.content.splitlines(keepends=True)
+
+        diff = list(difflib.unified_diff(
+            orig_lines, new_lines,
+            fromfile=f"a/{ff.path}",
+            tofile=f"b/{ff.path}",
+            n=DIFF_CONTEXT_LINES,
+        ))
+
+        if not diff:
+            return f"[No textual changes in {ff.path}]"
+
+        diff_text = "".join(diff)
+        if len(diff_text) > MAX_DIFF_CHARS:
+            diff_text = diff_text[:MAX_DIFF_CHARS] + f"\n... [diff truncated at {MAX_DIFF_CHARS} chars]"
+
+        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        header = f"[{ff.path}: +{added}/-{removed} lines]\n"
+        return header + diff_text
+
+    async def _load_original(self, path: str) -> str:
+        if self.repo_root:
+            try:
+                from sandbox.executor import validate_path_within_root
+                from pathlib import Path
+                validate_path_within_root(path, self.repo_root)
+                abs_path = (self.repo_root / path).resolve()
+                return abs_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        if self.mcp:
+            try:
+                return await self.mcp.read_file(path)
+            except Exception:
+                pass
+        try:
+            from pathlib import Path
+            return Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
 
     async def _run_review_session(
         self,
@@ -168,7 +180,6 @@ class ReviewerAgent(BaseAgent):
         issues: list[Issue],
         model: str,
     ) -> ReviewResult:
-        """One LLM review session."""
         system = self.build_system_prompt(
             "senior code reviewer performing adversarial review of AI-generated fixes. "
             "Your job is to find problems. Be skeptical. Reject fixes that: "
@@ -186,24 +197,30 @@ class ReviewerAgent(BaseAgent):
             for i in issues
         )
 
-        files_context = "\n\n".join(
-            f"=== FIXED FILE: {ff.path} ===\n"
-            f"Changes claimed: {ff.changes_made}\n"
-            f"Issues resolved: {', '.join(ff.issues_resolved)}\n"
-            f"Content ({ff.line_count} lines):\n```\n{ff.content[:6000]}\n"
-            f"{'[...truncated for review...]' if len(ff.content) > 6000 else ''}\n```"
-            for ff in fix.fixed_files
-        )
+        diff_sections: list[str] = []
+        for ff in fix.fixed_files:
+            original = await self._load_original(ff.path)
+            diff_text = self._build_diff_context(ff, original)
+            diff_sections.append(
+                f"=== DIFF: {ff.path} ===\n"
+                f"Changes claimed: {ff.changes_made}\n"
+                f"Issues resolved: {', '.join(ff.issues_resolved)}\n"
+                f"Diff summary: {ff.diff_summary}\n"
+                f"{wrap_content(diff_text)}"
+            )
+
+        files_context = "\n\n".join(diff_sections)
 
         prompt = (
             f"## Issues Being Fixed\n{issue_context}\n\n"
-            f"## Fixed Files\n{files_context}\n\n"
+            f"## Fix Diffs (unified diff format)\n{files_context}\n\n"
             "## Your Task\n"
-            "For each issue, review the corresponding fix and return a verdict.\n"
+            "For each issue, review the corresponding diff and return a verdict.\n"
             "APPROVED: fix is correct, complete, and safe.\n"
             "REJECTED: fix is incorrect, incomplete, or introduces new problems.\n"
             "ESCALATE: fix requires human expert review.\n\n"
-            "Be precise in your reason. Cite specific line numbers."
+            "Review the DIFF carefully — check both what was added and what was removed. "
+            "Be precise in your reason. Cite specific line numbers from the diff."
         )
 
         response = await self.call_llm_structured(
@@ -220,16 +237,16 @@ class ReviewerAgent(BaseAgent):
                 verdict=d.verdict,
                 confidence=d.confidence,
                 reason=d.reason,
+                line_references=d.line_references,
             )
             for d in response.decisions
         ]
 
-        # FIX: pass overall_note from LLM response through to the ReviewResult
         result = ReviewResult(
             fix_attempt_id=fix.id,
             decisions=decisions,
             overall_note=response.overall_note,
-            reviewed_at=datetime.utcnow(),
+            reviewed_at=datetime.now(tz=timezone.utc),
         )
         result.compute_approval()
         return result
@@ -240,11 +257,7 @@ class ReviewerAgent(BaseAgent):
         secondary: ReviewResult,
         fix: FixAttempt,
     ) -> ReviewResult:
-        """
-        Merge two reviews. If models disagree on a verdict, escalate.
-        Agreement = same verdict for same issue_id.
-        """
-        primary_map   = {d.issue_id: d for d in primary.decisions}
+        primary_map = {d.issue_id: d for d in primary.decisions}
         secondary_map = {d.issue_id: d for d in secondary.decisions}
 
         merged_decisions: list[ReviewDecision] = []
@@ -258,10 +271,8 @@ class ReviewerAgent(BaseAgent):
                 merged_decisions.append(p)
             elif p is not None and s is not None:
                 if p.verdict == s.verdict:
-                    # Agreement — use higher confidence
                     merged_decisions.append(p if p.confidence >= s.confidence else s)
                 else:
-                    # Disagreement — escalate
                     merged_decisions.append(ReviewDecision(
                         issue_id=iid,
                         fix_path=p.fix_path,
@@ -270,8 +281,8 @@ class ReviewerAgent(BaseAgent):
                         reason=(
                             f"Model disagreement: primary={p.verdict.value}, "
                             f"secondary={s.verdict.value}. "
-                            f"Primary reason: {p.reason[:100]}. "
-                            f"Secondary reason: {s.reason[:100]}."
+                            f"Primary: {p.reason[:100]}. "
+                            f"Secondary: {s.reason[:100]}."
                         ),
                     ))
 
@@ -279,26 +290,22 @@ class ReviewerAgent(BaseAgent):
             fix_attempt_id=fix.id,
             decisions=merged_decisions,
             overall_note="Cross-validation merge completed.",
-            reviewed_at=datetime.utcnow(),
+            reviewed_at=datetime.now(tz=timezone.utc),
         )
-        # FIX: removed duplicate compute_approval() — caller does this once after merge
         return result
 
     async def _store_result(self, fix: FixAttempt, result: ReviewResult) -> None:
-        """Persist review and update fix + issue statuses."""
         await self.storage.upsert_review(result)
 
-        # FIX: guard against fix.reviewer_verdict being None before calling .value
         overall_verdict = (
             ReviewVerdict.APPROVED if result.approve_for_commit
             else ReviewVerdict.REJECTED
         )
-        fix.reviewer_verdict     = overall_verdict
-        fix.reviewer_reason      = result.overall_note
-        fix.reviewer_confidence  = result.overall_score
+        fix.reviewer_verdict = overall_verdict
+        fix.reviewer_reason = result.overall_note
+        fix.reviewer_confidence = result.overall_score
         await self.storage.upsert_fix(fix)
 
-        # Update individual issue statuses
         for decision in result.decisions:
             if decision.verdict == ReviewVerdict.APPROVED:
                 await self.storage.update_issue_status(
@@ -307,12 +314,12 @@ class ReviewerAgent(BaseAgent):
             elif decision.verdict == ReviewVerdict.REJECTED:
                 await self.storage.update_issue_status(
                     decision.issue_id, IssueStatus.OPEN.value,
-                    reason=f"Fix rejected: {decision.reason}"
+                    reason=f"Fix rejected: {decision.reason}",
                 )
             elif decision.verdict == ReviewVerdict.ESCALATE:
                 await self.storage.update_issue_status(
                     decision.issue_id, IssueStatus.ESCALATED.value,
-                    reason=decision.reason
+                    reason=decision.reason,
                 )
 
         self.log.info(

@@ -1,25 +1,14 @@
-"""
-agents/auditor.py
-Phase 2: Auditor Agent.
-Synthesizes the brain into a structured issue list against the master prompt.
-Runs in parallel across Security / Architecture / Standards domains.
-
-PATCH LOG:
-  - Issue construction: added run_id=self.run_id so that list_issues(run_id=...)
-    in the controller works correctly. Without this all issues had run_id="" and
-    score computation, cost checks, and phase-level filtering were broken.
-"""
 from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agents.base import AgentConfig, BaseAgent
+from agents.base import AgentConfig, BaseAgent, wrap_content
 from brain.schemas import (
     ExecutorType,
     Issue,
@@ -31,34 +20,29 @@ from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
+MAX_FIX_ATTEMPTS = 3
+AUDIT_BATCH_SIZE = 30
 
-# ─────────────────────────────────────────────────────────────
-# Structured output model for auditors
-# ─────────────────────────────────────────────────────────────
 
 class AuditIssue(BaseModel):
-    severity:              Severity
-    file_path:             str = Field(description="Relative path to the affected file")
-    line_start:            int = Field(ge=0)
-    line_end:              int = Field(ge=0)
+    severity: Severity
+    file_path: str = Field(description="Relative path to the affected file")
+    line_start: int = Field(ge=0, default=0)
+    line_end: int = Field(ge=0, default=0)
     master_prompt_section: str = Field(description="Which section of the master prompt is violated")
-    description:           str = Field(description="Precise, actionable description of the issue")
-    fix_requires_files:    list[str] = Field(
+    description: str = Field(description="Precise, actionable description of the issue")
+    fix_requires_files: list[str] = Field(
         default_factory=list,
-        description="All files needed to implement the fix (may be >1 for cross-file issues)"
+        description="All files needed to implement the fix",
     )
 
 
 class AuditOutput(BaseModel):
-    domain:     str
-    issues:     list[AuditIssue] = Field(default_factory=list)
+    domain: str
+    issues: list[AuditIssue] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.85)
-    notes:      str = ""
+    notes: str = ""
 
-
-# ─────────────────────────────────────────────────────────────
-# Domain audit prompts
-# ─────────────────────────────────────────────────────────────
 
 DOMAIN_SYSTEM_PROMPTS: dict[ExecutorType, str] = {
     ExecutorType.SECURITY: (
@@ -85,11 +69,6 @@ DOMAIN_SYSTEM_PROMPTS: dict[ExecutorType, str] = {
 
 
 class AuditorAgent(BaseAgent):
-    """
-    Synthesizes the accumulated brain into a structured issue list.
-    One instance runs per domain (Security / Architecture / Standards).
-    Can be parallelised.
-    """
 
     def __init__(
         self,
@@ -101,7 +80,7 @@ class AuditorAgent(BaseAgent):
         mcp_manager: Any | None = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
-        self.agent_type         = executor_type
+        self.agent_type = executor_type
         self.master_prompt_path = Path(master_prompt_path)
         self._master_prompt: str | None = None
 
@@ -128,25 +107,22 @@ class AuditorAgent(BaseAgent):
             "No credential exposure, no unsafe deserialization, all inputs validated.\n"
         )
 
-    async def run(self, **kwargs: Any) -> list[Issue]:  # type: ignore[override]
-        """
-        Run audit for this domain. Returns list of Issues written to the brain.
-        """
+    async def run(self, **kwargs: Any) -> list[Issue]:
         master_prompt = await self._load_master_prompt()
         brain_summary = await self._build_brain_summary()
 
         self.log.info(
-            f"Auditor [{self.agent_type.value}]: running audit on "
+            f"Auditor [{self.agent_type.value}]: running on "
             f"{brain_summary['file_count']} files"
         )
 
-        # Split brain into batches to handle large codebases
         file_batches = self._batch_files(brain_summary["file_summaries"])
         all_issues: list[Issue] = []
 
         for batch_idx, batch in enumerate(file_batches):
             self.log.info(
-                f"Auditor [{self.agent_type.value}]: batch {batch_idx + 1}/{len(file_batches)}"
+                f"Auditor [{self.agent_type.value}]: batch "
+                f"{batch_idx + 1}/{len(file_batches)}"
             )
             batch_issues = await self._audit_batch(
                 batch, master_prompt, brain_summary["global_context"]
@@ -154,7 +130,6 @@ class AuditorAgent(BaseAgent):
             all_issues.extend(batch_issues)
             await self.check_cost_ceiling()
 
-        # Dedup by fingerprint and write to brain
         new_issues = await self._dedup_and_store(all_issues)
         self.log.info(
             f"Auditor [{self.agent_type.value}]: found {len(new_issues)} new issues"
@@ -162,26 +137,23 @@ class AuditorAgent(BaseAgent):
         return new_issues
 
     async def _build_brain_summary(self) -> dict[str, Any]:
-        """Compile the brain into a compact, LLM-consumable summary."""
         files = await self.storage.list_files()
         read_files = [f for f in files if f.status.value == "READ"]
 
         file_summaries: list[str] = []
         for f in read_files:
             chunks = await self.storage.get_chunks(f.path)
-            observations = []
+            observations: list[str] = []
+            deps: list[str] = []
             for c in chunks:
                 observations.extend(c.raw_observations)
-
-            deps = []
-            for c in chunks:
                 deps.extend(c.dependencies)
 
             summary_text = (
                 f"FILE: {f.path}\n"
                 f"Language: {f.language} | Lines: {f.size_lines}\n"
                 f"Summary: {f.summary}\n"
-                f"Dependencies: {', '.join(set(deps))[:200]}\n"
+                f"Dependencies: {', '.join(set(deps))[:300]}\n"
                 f"Observations: {chr(10).join(observations[:20])}\n"
             )
             file_summaries.append(summary_text)
@@ -198,8 +170,9 @@ class AuditorAgent(BaseAgent):
             "global_context": global_context,
         }
 
-    def _batch_files(self, summaries: list[str], batch_size: int = 30) -> list[list[str]]:
-        """Split file summaries into batches for audit."""
+    def _batch_files(
+        self, summaries: list[str], batch_size: int = AUDIT_BATCH_SIZE
+    ) -> list[list[str]]:
         batches = []
         for i in range(0, len(summaries), batch_size):
             batches.append(summaries[i:i + batch_size])
@@ -215,17 +188,18 @@ class AuditorAgent(BaseAgent):
             DOMAIN_SYSTEM_PROMPTS.get(self.agent_type, "code auditor")
         )
 
-        files_text = "\n---\n".join(file_summaries)
+        files_text = wrap_content("\n---\n".join(file_summaries))
 
         prompt = (
             f"# AUDIT DOMAIN: {self.agent_type.value}\n\n"
             f"## Global Repository Context\n{global_context}\n\n"
-            f"## Master Audit Specification\n{master_prompt}\n\n"
+            f"## Master Audit Specification\n{wrap_content(master_prompt)}\n\n"
             f"## File Summaries and Observations\n{files_text}\n\n"
             "## Your Task\n"
             "Audit every file against the master specification. "
-            "Report EVERY issue — do not skip minor issues, do not consolidate issues that are in different files. "
-            "For each issue, provide exact file path and line numbers from the observations above. "
+            "Report EVERY issue — do not skip minor issues, do not consolidate "
+            "issues that are in different files. "
+            "For each issue, provide exact file path and line numbers. "
             f"Focus only on {self.agent_type.value} domain issues. "
             "Be exhaustive. Missing a CRITICAL issue is worse than a false positive."
         )
@@ -236,10 +210,6 @@ class AuditorAgent(BaseAgent):
             system=system,
         )
 
-        # FIX: run_id=self.run_id added to every Issue.
-        # Without this, all issues had run_id="" and list_issues(run_id=...)
-        # always returned an empty list, breaking score computation and
-        # multi-run isolation entirely.
         return [
             Issue(
                 run_id=self.run_id,
@@ -253,7 +223,7 @@ class AuditorAgent(BaseAgent):
                 fix_requires_files=ai.fix_requires_files or [ai.file_path],
                 status=IssueStatus.OPEN,
                 fingerprint=self._fingerprint_issue(ai),
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(tz=timezone.utc),
             )
             for ai in output.issues
         ]
@@ -263,11 +233,6 @@ class AuditorAgent(BaseAgent):
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     async def _dedup_and_store(self, issues: list[Issue]) -> list[Issue]:
-        """
-        Dedup against existing fingerprints.
-        Issues seen > MAX_FIX_ATTEMPTS times are escalated, not queued.
-        """
-        MAX_FIX_ATTEMPTS = 3
         new_issues: list[Issue] = []
 
         for issue in issues:
@@ -278,11 +243,9 @@ class AuditorAgent(BaseAgent):
                     issue.escalated_reason = (
                         f"Issue seen {fp.seen_count} times without convergence"
                     )
-                    self.log.warning(
-                        f"Escalating persistent issue: {issue.id} in {issue.file_path}"
-                    )
+                    self.log.warning(f"Escalating persistent issue: {issue.id}")
                 fp.seen_count += 1
-                fp.last_seen = datetime.utcnow()
+                fp.last_seen = datetime.now(tz=timezone.utc)
                 await self.storage.upsert_fingerprint(fp)
             else:
                 await self.storage.upsert_fingerprint(IssueFingerprint(

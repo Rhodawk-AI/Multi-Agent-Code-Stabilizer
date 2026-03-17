@@ -1,195 +1,87 @@
-"""
-agents/planner.py
-Consequence-Grounded Planner — the core GII differentiator.
-
-This module is NEW and closes the most critical architectural gap identified
-in the GII audit: the system lacked any form of consequence reasoning.
-Without this, OpenMOSS was a sophisticated pattern-matcher, not a GII system.
-
-WHAT GII REQUIRES (from the audit standard):
-  Condition 2: Consequence-grounded reasoning
-    "Actions evaluated by predicted outcome, not regex/allowlist"
-  Condition 3: Outcome-based safety
-    "Safety checks predict what will happen, not what the action looks like"
-
-WHAT THIS MODULE PROVIDES:
-  1. ConsequenceReasoner — LLM-powered prediction of what a fix will do
-     before it is applied. Not regex. Not allowlists. Actual causal reasoning.
-
-  2. ReversibilityClassifier — Tier-1 safety: deterministically classifies
-     every file modification as REVERSIBLE or IRREVERSIBLE with justification.
-
-  3. GoalCoherenceChecker — Tier-2 safety: verifies that a proposed fix
-     actually serves the stated objective and doesn't silently introduce
-     goal-drifting changes (e.g. a "fix" that also removes logging).
-
-  4. ConsequenceSimulator — Tier-3 safety: for IRREVERSIBLE or CRITICAL
-     changes, generates a detailed simulation of expected outcomes, side
-     effects, and failure modes before any approval is granted.
-
-  5. PlannerAgent — orchestrates all three tiers and gates fix approval.
-     Integrated into the controller's _phase_gate() pipeline.
-
-ARCHITECTURE NOTE:
-  The PlannerAgent does NOT replace the Reviewer. It runs BEFORE the
-  Reviewer on CRITICAL/IRREVERSIBLE fixes. The Reviewer validates
-  correctness. The Planner validates consequence and safety.
-  Both must approve before commit.
-"""
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from enum import Enum
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agents.base import AgentConfig, BaseAgent
+from agents.base import AgentConfig, BaseAgent, wrap_content
 from brain.schemas import (
     ExecutorType,
     FixAttempt,
     FixedFile,
     Issue,
     IssueStatus,
+    PlannerRecord,
+    PlannerVerdict,
+    ReversibilityClass,
     Severity,
 )
 from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
+RISK_SCORE_BLOCK = 0.85
+IRREVERSIBLE_INDICATORS = [
+    "os.remove", "os.unlink", "shutil.rmtree", "pathlib.Path.unlink",
+    "DROP TABLE", "DROP DATABASE", "TRUNCATE",
+    "requests.delete", "requests.post",
+    "boto3", "s3.delete", "dynamodb.delete",
+    "subprocess", "os.system",
+    "os.environ", "os.putenv",
+    "git.push", "repo.push",
+    "send_email", "send_message", "notify",
+]
 
-# ─────────────────────────────────────────────────────────────
-# Safety tiers (mirrors the audit standard)
-# ─────────────────────────────────────────────────────────────
-
-class ReversibilityClass(str, Enum):
-    REVERSIBLE    = "REVERSIBLE"    # can be undone by revert
-    IRREVERSIBLE  = "IRREVERSIBLE"  # data loss, schema migration, external API call
-    CONDITIONAL   = "CONDITIONAL"   # reversible under specific conditions
-
-
-class ConsequenceVerdict(str, Enum):
-    SAFE              = "SAFE"           # proceed
-    SAFE_WITH_WARNING = "SAFE_WITH_WARNING"  # proceed but log
-    UNSAFE            = "UNSAFE"         # block
-    NEEDS_SIMULATION  = "NEEDS_SIMULATION"   # escalate to tier 3
-
-
-# ─────────────────────────────────────────────────────────────
-# LLM-structured output models
-# ─────────────────────────────────────────────────────────────
 
 class ReversibilityAnalysis(BaseModel):
-    file_path:         str
-    reversibility:     ReversibilityClass
-    justification:     str = Field(
-        description=(
-            "Precise technical reason. For IRREVERSIBLE: cite the exact operation "
-            "(e.g. 'DROP TABLE', 'os.remove', 'permanent API mutation') and why "
-            "git revert cannot fully undo it."
-        )
-    )
-    affected_resources: list[str] = Field(
-        default_factory=list,
-        description=(
-            "External resources that will be affected: database tables, "
-            "S3 buckets, API endpoints, filesystem paths, environment variables"
-        )
-    )
+    file_path: str
+    reversibility: ReversibilityClass
+    justification: str
+    affected_resources: list[str] = Field(default_factory=list)
 
 
 class GoalCoherenceAnalysis(BaseModel):
     aligns_with_objective: bool
-    drift_detected:        bool
-    drift_description:     str = Field(
-        default="",
-        description=(
-            "If drift_detected=True: describe exactly what the fix changes beyond "
-            "the stated objective. E.g. 'removes audit logging while fixing the SQL issue'"
-        )
-    )
-    confidence:            float = Field(ge=0.0, le=1.0)
-    recommendation:        str
+    drift_detected: bool
+    drift_description: str = ""
+    confidence: float = Field(ge=0.0, le=1.0)
+    recommendation: str
 
 
 class ConsequenceSimulation(BaseModel):
-    primary_effect:      str = Field(
-        description="What the change will actually do, stated as a causal chain"
-    )
-    side_effects:        list[str] = Field(
-        default_factory=list,
-        description="All secondary effects, including benign ones"
-    )
-    failure_modes:       list[str] = Field(
-        default_factory=list,
-        description="How this change could go wrong and what the blast radius is"
-    )
-    irreversible_actions: list[str] = Field(
-        default_factory=list,
-        description="Specific irreversible actions within this change"
-    )
-    risk_score:          float = Field(
-        ge=0.0, le=1.0,
-        description="0=trivially safe, 1=extremely dangerous"
-    )
-    approve:             bool
-    approval_conditions: list[str] = Field(
-        default_factory=list,
-        description="Conditions that must be met before approval (e.g. 'backup required')"
-    )
+    primary_effect: str
+    side_effects: list[str] = Field(default_factory=list)
+    failure_modes: list[str] = Field(default_factory=list)
+    irreversible_actions: list[str] = Field(default_factory=list)
+    risk_score: float = Field(ge=0.0, le=1.0)
+    approve: bool
+    approval_conditions: list[str] = Field(default_factory=list)
 
 
 class PlannerDecision(BaseModel):
-    fix_attempt_id:  str
-    file_path:       str
-    verdict:         ConsequenceVerdict
-    reversibility:   ReversibilityClass
-    goal_coherent:   bool
-    risk_score:      float
-    simulation:      ConsequenceSimulation | None = None
-    reason:          str
-    block_commit:    bool
-    reviewed_at:     datetime = Field(default_factory=datetime.utcnow)
+    fix_attempt_id: str
+    file_path: str
+    verdict: PlannerVerdict
+    reversibility: ReversibilityClass
+    goal_coherent: bool
+    risk_score: float
+    simulation: ConsequenceSimulation | None = None
+    reason: str
+    block_commit: bool
+    evaluated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
-
-# ─────────────────────────────────────────────────────────────
-# Tier 1: Reversibility Classifier
-# ─────────────────────────────────────────────────────────────
 
 class ReversibilityClassifier:
-    """
-    Tier 1 safety: Deterministically classifies every proposed change
-    as REVERSIBLE or IRREVERSIBLE before execution.
-
-    This is NOT regex-based. The LLM reasons about the causal chain of
-    the code change. It is adversarially prompted to look for hidden
-    irreversibility (e.g. a 'harmless refactor' that calls os.remove).
-    """
-
-    IRREVERSIBLE_INDICATORS = [
-        "os.remove", "os.unlink", "shutil.rmtree", "pathlib.Path.unlink",
-        "DROP TABLE", "DROP DATABASE", "TRUNCATE",
-        "requests.delete", "requests.post",  # external mutations
-        "boto3", "s3.delete", "dynamodb.delete",
-        "subprocess", "os.system",  # external process execution
-        ".write(", "open(.*['\"]w['\"]", "open(.*['\"]a['\"]",  # writes
-        "os.environ", "os.putenv",  # environment mutation
-        "git.push", "repo.push",  # VCS mutations
-        "send_email", "send_message", "notify",  # external communication
-    ]
 
     def classify_deterministic(self, content: str) -> ReversibilityClass:
-        """
-        Fast deterministic pre-screen before LLM analysis.
-        If any hardcoded irreversible indicator is present, immediately
-        returns IRREVERSIBLE without an LLM call.
-        """
         lower = content.lower()
-        for indicator in self.IRREVERSIBLE_INDICATORS:
+        for indicator in IRREVERSIBLE_INDICATORS:
             if indicator.lower() in lower:
                 return ReversibilityClass.IRREVERSIBLE
-        return ReversibilityClass.REVERSIBLE  # tentative — LLM confirms
+        return ReversibilityClass.REVERSIBLE
 
     async def classify_with_llm(
         self,
@@ -198,16 +90,14 @@ class ReversibilityClassifier:
         original_content: str,
         fixed_content: str,
     ) -> ReversibilityAnalysis:
-        """LLM-powered deep reversibility analysis."""
-        # Fast-path: deterministic pre-screen
         fast_class = self.classify_deterministic(fixed_content)
 
         prompt = (
             f"## File: {file_path}\n\n"
-            "## Original Content (what it was):\n"
-            f"```\n{original_content[:3000]}\n```\n\n"
-            "## Proposed Fix (what it will become):\n"
-            f"```\n{fixed_content[:3000]}\n```\n\n"
+            "## Original Content:\n"
+            f"{wrap_content(original_content[:3000])}\n\n"
+            "## Proposed Fix:\n"
+            f"{wrap_content(fixed_content[:3000])}\n\n"
             "## Analysis Required\n"
             "Classify this change as REVERSIBLE, IRREVERSIBLE, or CONDITIONAL.\n\n"
             "IRREVERSIBLE means: git revert cannot fully undo the real-world effects.\n"
@@ -223,27 +113,12 @@ class ReversibilityClassifier:
             response_model=ReversibilityAnalysis,
             system=(
                 "You are an adversarial safety auditor classifying code changes "
-                "by their reversibility. Err on the side of IRREVERSIBLE when uncertain. "
-                "A false negative (calling IRREVERSIBLE something that is actually "
-                "reversible) is safe. A false positive (calling REVERSIBLE something "
-                "that is actually irreversible) is dangerous."
+                "by their reversibility. Err on the side of IRREVERSIBLE when uncertain."
             ),
         )
 
 
-# ─────────────────────────────────────────────────────────────
-# Tier 2: Goal Coherence Checker
-# ─────────────────────────────────────────────────────────────
-
 class GoalCoherenceChecker:
-    """
-    Tier 2 safety: Verifies that the proposed fix actually serves its
-    stated objective and hasn't drifted to do something else.
-
-    Classic LLM failure mode: fix a SQL injection but also accidentally
-    remove the surrounding error handling, or 'clean up' imports in a way
-    that deletes a safety-critical dependency.
-    """
 
     async def check(
         self,
@@ -259,9 +134,9 @@ class GoalCoherenceChecker:
             f"## Claimed Changes\n{changes_claimed}\n\n"
             f"## File: {file_path}\n\n"
             "## Original:\n"
-            f"```\n{original_content[:2000]}\n```\n\n"
+            f"{wrap_content(original_content[:2000])}\n\n"
             "## Proposed:\n"
-            f"```\n{fixed_content[:2000]}\n```\n\n"
+            f"{wrap_content(fixed_content[:2000])}\n\n"
             "## Task\n"
             "Answer two questions:\n"
             "1. Does this fix actually achieve the stated objective?\n"
@@ -285,19 +160,7 @@ class GoalCoherenceChecker:
         )
 
 
-# ─────────────────────────────────────────────────────────────
-# Tier 3: Consequence Simulator
-# ─────────────────────────────────────────────────────────────
-
 class ConsequenceSimulator:
-    """
-    Tier 3 safety: For CRITICAL or IRREVERSIBLE changes, generates a
-    detailed simulation of the complete causal chain before commit approval.
-
-    This is what separates GII from scripted automation:
-    the system doesn't just check what the code looks like,
-    it reasons about what the code will DO.
-    """
 
     async def simulate(
         self,
@@ -313,9 +176,9 @@ class ConsequenceSimulator:
             f"## Reversibility: {reversibility.value}\n"
             f"## Issues Being Fixed: {', '.join(issues_being_fixed)}\n\n"
             "## Original:\n"
-            f"```\n{original_content[:3000]}\n```\n\n"
+            f"{wrap_content(original_content[:3000])}\n\n"
             "## Proposed Fix:\n"
-            f"```\n{fixed_content[:3000]}\n```\n\n"
+            f"{wrap_content(fixed_content[:3000])}\n\n"
             "## Simulation Required\n"
             "Trace the complete causal chain of this change:\n"
             "1. Primary effect: what does this change directly cause?\n"
@@ -323,7 +186,7 @@ class ConsequenceSimulator:
             "3. Failure modes: under what conditions can this go wrong?\n"
             "4. If IRREVERSIBLE: what are the exact irreversible actions?\n"
             "5. Risk score 0.0-1.0: how dangerous is this change?\n"
-            "6. Should this be approved? If conditional, what conditions must hold?\n\n"
+            "6. Should this be approved?\n\n"
             "Think step-by-step. Be conservative. A risk score of 0.9+ means block."
         )
 
@@ -339,48 +202,28 @@ class ConsequenceSimulator:
         )
 
 
-# ─────────────────────────────────────────────────────────────
-# PlannerAgent: orchestrates all three tiers
-# ─────────────────────────────────────────────────────────────
-
 class PlannerAgent(BaseAgent):
-    """
-    Consequence-Grounded Planner — runs the three-tier safety pipeline on
-    every fix attempt before commit.
-
-    Tier 1: Reversibility classification (always)
-    Tier 2: Goal coherence check (always)
-    Tier 3: Consequence simulation (CRITICAL or IRREVERSIBLE only)
-
-    The Planner gates the commit path. A fix rejected by the Planner
-    is never written to disk, regardless of Reviewer approval.
-    """
-
     agent_type = ExecutorType.PLANNER
-
-    RISK_SCORE_BLOCK_THRESHOLD = 0.85  # block if simulation risk >= this
 
     def __init__(
         self,
         storage: BrainStorage,
         run_id: str,
+        repo_root: Path | None = None,
         config: AgentConfig | None = None,
         mcp_manager: Any | None = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
+        self.repo_root = repo_root
         self._reversibility = ReversibilityClassifier()
-        self._coherence      = GoalCoherenceChecker()
-        self._simulator      = ConsequenceSimulator()
+        self._coherence = GoalCoherenceChecker()
+        self._simulator = ConsequenceSimulator()
 
-    async def run(self, **kwargs: Any) -> list[PlannerDecision]:  # type: ignore[override]
-        """
-        Evaluate all pending fix attempts that have not yet been planner-gated.
-        Returns list of PlannerDecisions.
-        """
+    async def run(self, **kwargs: Any) -> list[PlannerDecision]:
         fixes = await self.storage.list_fixes()
         pending = [
             f for f in fixes
-            if f.reviewer_verdict is not None  # reviewed
+            if f.reviewer_verdict is not None and f.planner_approved is None
         ]
 
         decisions: list[PlannerDecision] = []
@@ -391,15 +234,7 @@ class PlannerAgent(BaseAgent):
 
         return decisions
 
-    async def evaluate_fix(
-        self,
-        fix: FixAttempt,
-    ) -> list[PlannerDecision]:
-        """
-        Run the three-tier safety pipeline on one fix attempt.
-        Returns one PlannerDecision per file in the fix.
-        """
-        # Load issues for objective context
+    async def evaluate_fix(self, fix: FixAttempt) -> list[PlannerDecision]:
         issues: list[Issue] = []
         for iid in fix.issue_ids:
             issue = await self.storage.get_issue(iid)
@@ -410,6 +245,7 @@ class PlannerAgent(BaseAgent):
         has_critical = any(i.severity == Severity.CRITICAL for i in issues)
         decisions: list[PlannerDecision] = []
 
+        all_blocked = True
         for ff in fix.fixed_files:
             decision = await self._evaluate_file(
                 fix=fix,
@@ -420,22 +256,39 @@ class PlannerAgent(BaseAgent):
             )
             decisions.append(decision)
 
-            if decision.block_commit:
-                self.log.warning(
-                    f"Planner BLOCKED commit: {ff.path} — {decision.reason}"
-                )
-                # Re-open issues so they re-enter the fix queue
+            record = PlannerRecord(
+                fix_attempt_id=fix.id,
+                run_id=self.run_id,
+                file_path=ff.path,
+                verdict=decision.verdict,
+                reversibility=decision.reversibility,
+                goal_coherent=decision.goal_coherent,
+                risk_score=decision.risk_score,
+                block_commit=decision.block_commit,
+                reason=decision.reason,
+                simulation_summary=(
+                    decision.simulation.primary_effect
+                    if decision.simulation else ""
+                ),
+                evaluated_at=datetime.now(tz=timezone.utc),
+            )
+            await self.storage.upsert_planner_record(record)
+
+            if not decision.block_commit:
+                all_blocked = False
+            else:
+                self.log.warning(f"Planner BLOCKED: {ff.path} — {decision.reason}")
                 for issue in issues:
                     await self.storage.update_issue_status(
                         issue.id, IssueStatus.OPEN.value,
-                        reason=f"Planner blocked: {decision.reason[:200]}"
+                        reason=f"Planner blocked: {decision.reason[:200]}",
                     )
-            else:
-                self.log.info(
-                    f"Planner APPROVED: {ff.path} "
-                    f"(reversibility={decision.reversibility.value}, "
-                    f"risk={decision.risk_score:.2f})"
-                )
+
+        fix.planner_approved = not all_blocked
+        fix.planner_reason = "; ".join(
+            d.reason for d in decisions if d.block_commit
+        ) or "All tiers passed"
+        await self.storage.upsert_fix(fix)
 
         return decisions
 
@@ -447,12 +300,8 @@ class PlannerAgent(BaseAgent):
         issues: list[Issue],
         force_simulation: bool,
     ) -> PlannerDecision:
-        """Three-tier evaluation of a single file change."""
-
-        # Load original content for comparison
         original_content = await self._load_original(ff.path)
 
-        # ── Tier 1: Reversibility ─────────────────────────────
         try:
             rev_analysis = await self._reversibility.classify_with_llm(
                 agent=self,
@@ -463,11 +312,9 @@ class PlannerAgent(BaseAgent):
             reversibility = rev_analysis.reversibility
         except Exception as exc:
             self.log.warning(f"Reversibility analysis failed for {ff.path}: {exc}")
-            # On failure, assume IRREVERSIBLE (conservative)
             reversibility = ReversibilityClass.IRREVERSIBLE
             rev_analysis = None
 
-        # ── Tier 2: Goal Coherence ────────────────────────────
         coherent = True
         goal_analysis = None
         try:
@@ -482,10 +329,8 @@ class PlannerAgent(BaseAgent):
             coherent = goal_analysis.aligns_with_objective and not goal_analysis.drift_detected
         except Exception as exc:
             self.log.warning(f"Goal coherence check failed for {ff.path}: {exc}")
-            coherent = True  # Don't block on analysis failure
+            coherent = True
 
-        # ── Tier 3: Consequence Simulation ───────────────────
-        # Triggered for: IRREVERSIBLE changes, CRITICAL issues, explicit request
         simulation = None
         needs_simulation = (
             reversibility == ReversibilityClass.IRREVERSIBLE
@@ -504,14 +349,11 @@ class PlannerAgent(BaseAgent):
                     reversibility=reversibility,
                 )
             except Exception as exc:
-                self.log.warning(
-                    f"Consequence simulation failed for {ff.path}: {exc}. "
-                    "Blocking as a precaution."
-                )
+                self.log.warning(f"Consequence simulation failed for {ff.path}: {exc}. Blocking.")
                 return PlannerDecision(
                     fix_attempt_id=fix.id,
                     file_path=ff.path,
-                    verdict=ConsequenceVerdict.UNSAFE,
+                    verdict=PlannerVerdict.UNSAFE,
                     reversibility=reversibility,
                     goal_coherent=coherent,
                     risk_score=1.0,
@@ -519,7 +361,6 @@ class PlannerAgent(BaseAgent):
                     block_commit=True,
                 )
 
-        # ── Final verdict ─────────────────────────────────────
         return self._compute_verdict(
             fix_id=fix.id,
             file_path=ff.path,
@@ -538,61 +379,42 @@ class PlannerAgent(BaseAgent):
         goal_analysis: GoalCoherenceAnalysis | None,
         simulation: ConsequenceSimulation | None,
     ) -> PlannerDecision:
-        """Synthesize tier results into a single PlannerDecision."""
         risk_score = 0.0
         block_commit = False
         reasons: list[str] = []
-        verdict = ConsequenceVerdict.SAFE
+        verdict = PlannerVerdict.SAFE
 
-        # Goal drift always blocks
         if not coherent:
             block_commit = True
             risk_score = max(risk_score, 0.8)
-            drift = (
-                goal_analysis.drift_description
-                if goal_analysis
-                else "Unknown drift"
-            )
+            drift = goal_analysis.drift_description if goal_analysis else "Unknown drift"
             reasons.append(f"Goal drift detected: {drift}")
-            verdict = ConsequenceVerdict.UNSAFE
+            verdict = PlannerVerdict.UNSAFE
 
-        # Simulation verdict
         if simulation is not None:
             risk_score = max(risk_score, simulation.risk_score)
             if not simulation.approve:
                 block_commit = True
-                verdict = ConsequenceVerdict.UNSAFE
+                verdict = PlannerVerdict.UNSAFE
                 if simulation.failure_modes:
-                    reasons.append(
-                        f"Simulation rejected: {simulation.failure_modes[0]}"
-                    )
-            elif simulation.risk_score >= self.RISK_SCORE_BLOCK_THRESHOLD:
+                    reasons.append(f"Simulation rejected: {simulation.failure_modes[0]}")
+            elif simulation.risk_score >= RISK_SCORE_BLOCK:
                 block_commit = True
-                verdict = ConsequenceVerdict.UNSAFE
+                verdict = PlannerVerdict.UNSAFE
                 reasons.append(
-                    f"Risk score {simulation.risk_score:.2f} exceeds "
-                    f"threshold {self.RISK_SCORE_BLOCK_THRESHOLD}"
+                    f"Risk score {simulation.risk_score:.2f} exceeds threshold {RISK_SCORE_BLOCK}"
                 )
             elif simulation.risk_score >= 0.5:
-                verdict = ConsequenceVerdict.SAFE_WITH_WARNING
-                reasons.append(
-                    f"Moderate risk ({simulation.risk_score:.2f}) — "
-                    f"proceed with caution"
-                )
+                verdict = PlannerVerdict.SAFE_WITH_WARNING
+                reasons.append(f"Moderate risk ({simulation.risk_score:.2f}) — proceed with caution")
 
-        # Irreversible without simulation gets a warning
         if (
             reversibility == ReversibilityClass.IRREVERSIBLE
             and simulation is None
             and not block_commit
         ):
-            verdict = ConsequenceVerdict.SAFE_WITH_WARNING
-            reasons.append(
-                "IRREVERSIBLE change approved without full simulation — "
-                "manual review recommended"
-            )
-
-        reason = "; ".join(reasons) if reasons else "All tiers passed"
+            verdict = PlannerVerdict.SAFE_WITH_WARNING
+            reasons.append("IRREVERSIBLE change approved without full simulation")
 
         return PlannerDecision(
             fix_attempt_id=fix_id,
@@ -602,31 +424,32 @@ class PlannerAgent(BaseAgent):
             goal_coherent=coherent,
             risk_score=risk_score,
             simulation=simulation,
-            reason=reason,
+            reason="; ".join(reasons) if reasons else "All tiers passed",
             block_commit=block_commit,
         )
 
     async def _load_original(self, file_path: str) -> str:
-        """Load the original file content for before/after comparison."""
+        if self.repo_root:
+            try:
+                from sandbox.executor import validate_path_within_root
+                validate_path_within_root(file_path, self.repo_root)
+                abs_path = (self.repo_root / file_path).resolve()
+                return abs_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
         if self.mcp:
             try:
                 return await self.mcp.read_file(file_path)
             except Exception:
                 pass
-        # Direct read fallback
-        from pathlib import Path
-        try:
-            return Path(file_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""  # new file — no original to compare
+        return ""
 
     def _build_objective_statement(self, issues: list[Issue]) -> str:
-        """Build a clear objective statement from the issue list."""
         if not issues:
             return "Fix all identified issues in the codebase."
         parts = [
             f"[{i.severity.value}] {i.description} (in {i.file_path}:{i.line_start})"
-            for i in issues[:5]  # cap to avoid prompt explosion
+            for i in issues[:5]
         ]
         return (
             f"Fix the following {len(issues)} issue(s):\n"
