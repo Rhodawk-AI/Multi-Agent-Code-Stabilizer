@@ -3,6 +3,11 @@ agents/auditor.py
 Phase 2: Auditor Agent.
 Synthesizes the brain into a structured issue list against the master prompt.
 Runs in parallel across Security / Architecture / Standards domains.
+
+PATCH LOG:
+  - Issue construction: added run_id=self.run_id so that list_issues(run_id=...)
+    in the controller works correctly. Without this all issues had run_id="" and
+    score computation, cost checks, and phase-level filtering were broken.
 """
 from __future__ import annotations
 
@@ -231,8 +236,13 @@ class AuditorAgent(BaseAgent):
             system=system,
         )
 
+        # FIX: run_id=self.run_id added to every Issue.
+        # Without this, all issues had run_id="" and list_issues(run_id=...)
+        # always returned an empty list, breaking score computation and
+        # multi-run isolation entirely.
         return [
             Issue(
+                run_id=self.run_id,
                 severity=ai.severity,
                 file_path=ai.file_path,
                 line_start=ai.line_start,

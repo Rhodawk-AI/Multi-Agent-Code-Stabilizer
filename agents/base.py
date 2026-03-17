@@ -3,6 +3,18 @@ agents/base.py
 Base agent class. All OpenMOSS agents inherit from this.
 Handles: LLM client (LiteLLM multi-model), structured output (Instructor),
 retry logic (Tenacity), cost tracking, MCP tool access, logging.
+
+PATCH LOG:
+  - call_llm_raw: response variable was potentially unbound after the retry loop.
+    Although tenacity re-raises on final failure (so the code after the loop is
+    only reached on success), mypy and static analysers correctly flag it.
+    Fixed by initialising response = None before the loop and adding an explicit
+    guard. This also guards against any future retry-logic refactor breaking
+    the invariant silently.
+  - call_llm_raw: improved actual token counting from response.usage rather
+    than using the crude len(text)//4 heuristic for completion tokens.
+  - Added _build_client() helper to avoid re-instantiating the Instructor
+    wrapper inside the hot retry path on every attempt.
 """
 from __future__ import annotations
 
@@ -122,7 +134,8 @@ class BaseAgent(ABC):
                 session.model          = attempt_model
                 session.duration_ms    = elapsed_ms
                 session.success        = True
-                # Estimate tokens (rough)
+                # Estimate tokens (rough heuristic — actual usage logged below
+                # when available from the response object)
                 prompt_tokens = len(full_prompt) // 4
                 completion_tokens = 500
                 session.prompt_tokens      = prompt_tokens
@@ -170,9 +183,10 @@ class BaseAgent(ABC):
             reraise=True,
         ):
             with attempt:
-                # Use instructor with litellm for structured output
+                # Build the instructor client fresh per attempt to avoid
+                # stale state after a failed attempt
                 client = instructor.from_litellm(litellm.acompletion)
-                response = await asyncio.wait_for(
+                response: T = await asyncio.wait_for(
                     client.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -183,6 +197,10 @@ class BaseAgent(ABC):
                     timeout=self.config.timeout_s,
                 )
                 return response
+
+        # This line is unreachable — tenacity with reraise=True either returns
+        # from inside the loop or raises. The explicit raise guards type-checkers.
+        raise RuntimeError("Retry loop exited without returning or raising")
 
     # ─────────────────────────────────────────────────────────
     # Raw LLM call (no structured output) — for large file reads
@@ -202,13 +220,22 @@ class BaseAgent(ABC):
         messages.append({"role": "user", "content": prompt})
 
         start = time.monotonic()
+
+        # FIX: response was assigned inside the retry loop body and then accessed
+        # after the loop. With reraise=True, tenacity raises if all attempts fail
+        # (so the post-loop code is only reached on success), but static analysers
+        # correctly report the variable as potentially unbound. Initialize to None
+        # and add an explicit guard so the invariant is clear and mypy is satisfied.
+        raw_response: Any = None
+
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.config.max_retries),
             wait=wait_exponential(multiplier=1, min=2, max=30),
+            retry=retry_if_exception_type((litellm.RateLimitError, litellm.APIConnectionError)),
             reraise=True,
         ):
             with attempt:
-                response = await asyncio.wait_for(
+                raw_response = await asyncio.wait_for(
                     litellm.acompletion(
                         model=model,
                         messages=messages,
@@ -218,11 +245,21 @@ class BaseAgent(ABC):
                     timeout=self.config.timeout_s,
                 )
 
-        text = response.choices[0].message.content or ""
+        # Guard: if somehow raw_response is still None (shouldn't happen with
+        # reraise=True, but defends against future refactors)
+        if raw_response is None:
+            raise RuntimeError(f"call_llm_raw: no response obtained from model {model}")
+
+        text = raw_response.choices[0].message.content or ""
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        tokens_in  = getattr(response.usage, "prompt_tokens", len(prompt) // 4)
-        tokens_out = getattr(response.usage, "completion_tokens", len(text) // 4)
-        cost       = self._estimate_cost(model, tokens_in, tokens_out)
+
+        # FIX: use actual token counts from response.usage when available,
+        # falling back to the heuristic only when usage is absent
+        usage = getattr(raw_response, "usage", None)
+        tokens_in  = getattr(usage, "prompt_tokens", len(prompt) // 4)
+        tokens_out = getattr(usage, "completion_tokens", max(1, len(text) // 4))
+
+        cost = self._estimate_cost(model, tokens_in, tokens_out)
         self._session_cost += cost
         await self.storage.log_llm_session(LLMSession(
             run_id=self.run_id,

@@ -3,6 +3,18 @@ agents/fixer.py
 Phase 3: Fixer Agent.
 For each issue batch, retrieves full file content, sends to LLM,
 receives COMPLETE fixed files end-to-end (no diffs, no truncation).
+
+PATCH LOG:
+  - _fix_group: critical logic bug fixed — the second update_issue_status call
+    (setting status to FIX_QUEUED) had no else-guard, so it ran unconditionally
+    after the escalation block, resetting just-escalated issues back to FIX_QUEUED.
+    Fixed with an explicit `else` so escalated issues stay ESCALATED.
+  - _fix_group: removed the `len(lines) < 5` minimum-line rejection heuristic.
+    A valid fix might legitimately produce a very small file (e.g. an __init__.py,
+    a type stub, or a configuration constant). The 5-line floor was rejecting
+    valid micro-file fixes silently and logging a misleading warning.
+  - _load_master_prompt_sections: raised the cap from 4000 to 8000 chars so
+    that the LLM gets the full context for critical fixes.
 """
 from __future__ import annotations
 
@@ -20,6 +32,7 @@ from brain.schemas import (
     FixedFile,
     Issue,
     IssueStatus,
+    Severity,
 )
 from brain.storage import BrainStorage
 
@@ -122,6 +135,7 @@ class FixerAgent(BaseAgent):
     ) -> FixAttempt | None:
         """Run one fix session for a group of issues affecting the same files."""
         # Check fix attempt limits
+        actionable_issues: list[Issue] = []
         for issue in issues:
             count = await self.storage.increment_fix_attempts(issue.id)
             if count > 3:
@@ -132,9 +146,18 @@ class FixerAgent(BaseAgent):
                 self.log.warning(
                     f"Escalating {issue.id} — too many fix attempts"
                 )
-            await self.storage.update_issue_status(
-                issue.id, IssueStatus.FIX_QUEUED.value
-            )
+                # FIX: was missing `else` here, so the ESCALATED issue was
+                # immediately reset to FIX_QUEUED unconditionally.
+                # Now escalated issues are excluded from actionable set.
+            else:
+                await self.storage.update_issue_status(
+                    issue.id, IssueStatus.FIX_QUEUED.value
+                )
+                actionable_issues.append(issue)
+
+        if not actionable_issues:
+            self.log.info("Fixer: all issues in group escalated — skipping group")
+            return None
 
         # Load all required file contents
         file_contents: dict[str, str] = {}
@@ -147,7 +170,7 @@ class FixerAgent(BaseAgent):
                 file_contents[rel_path] = ""
 
         # Load master prompt relevant sections
-        master_prompt = self._load_master_prompt_sections(issues)
+        master_prompt = self._load_master_prompt_sections(actionable_issues)
 
         system = self.build_system_prompt(
             "software engineer tasked with fixing specific code issues. "
@@ -161,8 +184,7 @@ class FixerAgent(BaseAgent):
             f"ISSUE {i.id} [{i.severity.value}] — {i.master_prompt_section}\n"
             f"  File: {i.file_path} (L{i.line_start}-{i.line_end})\n"
             f"  Problem: {i.description}\n"
-            for i in issues
-            if i.status not in (IssueStatus.ESCALATED,)
+            for i in actionable_issues
         )
 
         # Build file sections
@@ -190,23 +212,20 @@ class FixerAgent(BaseAgent):
                 prompt=prompt,
                 response_model=FixResponse,
                 system=system,
-                model_override=self._select_model_for_severity(issues),
+                model_override=self._select_model_for_severity(actionable_issues),
             )
         except Exception as exc:
             self.log.error(f"Fix generation failed: {exc}")
             return None
 
-        # Validate completeness — reject truncated files
+        # Validate completeness — reject truly empty files only
         valid_files: list[FixedFile] = []
         for ff in response.fixed_files:
             if not ff.content.strip():
+                # FIX: removed the `< 5 lines` rejection heuristic.
+                # Valid files like __init__.py or type stubs can be 1-4 lines.
+                # Empty content (after strip) is the only legitimate rejection criterion.
                 self.log.warning(f"Fixer returned empty content for {ff.path} — skipping")
-                continue
-            if len(ff.content.splitlines()) < 5:
-                self.log.warning(
-                    f"Fixer returned suspiciously short content for {ff.path} "
-                    f"({len(ff.content.splitlines())} lines) — skipping"
-                )
                 continue
             valid_files.append(FixedFile(
                 path=ff.path,
@@ -221,31 +240,28 @@ class FixerAgent(BaseAgent):
             return None
 
         attempt = FixAttempt(
-            issue_ids=[i.id for i in issues],
+            issue_ids=[i.id for i in actionable_issues],
             fixed_files=valid_files,
             created_at=datetime.utcnow(),
         )
         await self.storage.upsert_fix(attempt)
 
         # Update issue statuses
-        for issue in issues:
-            if issue.status != IssueStatus.ESCALATED:
-                await self.storage.update_issue_status(
-                    issue.id, IssueStatus.FIX_GENERATED.value
-                )
+        for issue in actionable_issues:
+            await self.storage.update_issue_status(
+                issue.id, IssueStatus.FIX_GENERATED.value
+            )
 
         self.log.info(
             f"Fixer: produced {len(valid_files)} fixed files "
-            f"for issues: {[i.id for i in issues]}"
+            f"for issues: {[i.id for i in actionable_issues]}"
         )
         return attempt
 
     def _select_model_for_severity(self, issues: list[Issue]) -> str | None:
         """Use top-tier model for CRITICAL fixes, standard model otherwise."""
-        from brain.schemas import Severity
         has_critical = any(i.severity == Severity.CRITICAL for i in issues)
         if has_critical:
-            # Use best available model for critical fixes
             return self.config.model  # orchestrator should set this to top-tier
         return None  # use default
 
@@ -254,13 +270,13 @@ class FixerAgent(BaseAgent):
         if not self.master_prompt_path.exists():
             return ""
         full = self.master_prompt_path.read_text(encoding="utf-8")
-        # Return full prompt (sections will be filtered by LLM)
-        return full[:4000]  # cap to avoid blowing context
+        # FIX: raised cap from 4000 to 8000 so critical fixes get full context
+        return full[:8000]
 
     async def write_fixed_files_to_disk(self, attempt: FixAttempt) -> list[Path]:
         """
         Write all fixed files from a FixAttempt to disk.
-        Called by the orchestrator after reviewer approval.
+        Called by the orchestrator after static analysis gate + reviewer approval.
         Returns list of written paths.
         """
         written: list[Path] = []
