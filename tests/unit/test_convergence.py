@@ -1,10 +1,12 @@
-"""Unit tests for convergence detection."""
+from __future__ import annotations
+
 import pytest
+
 from brain.schemas import AuditScore, RunStatus
 from orchestrator.convergence import ConvergenceDetector
 
 
-def make_score(run_id="run1", critical=0, major=0, minor=0) -> AuditScore:
+def make_score(run_id: str = "run1", critical: int = 0, major: int = 0, minor: int = 0) -> AuditScore:
     s = AuditScore(run_id=run_id, critical_count=critical, major_count=major, minor_count=minor)
     s.compute_score()
     return s
@@ -16,11 +18,11 @@ class TestConvergenceDetector:
         result = det.check(make_score(critical=0, major=0, minor=5))
         assert result == RunStatus.STABILIZED
 
-    def test_continue_while_improving(self):
+    def test_no_result_while_improving(self):
         det = ConvergenceDetector(stall_threshold=2)
         det.check(make_score(critical=5, major=10))
         result = det.check(make_score(critical=3, major=8))
-        assert result is None  # improving, continue
+        assert result is None
 
     def test_halt_on_stall(self):
         det = ConvergenceDetector(stall_threshold=2)
@@ -37,19 +39,38 @@ class TestConvergenceDetector:
         result = det.check(make_score(critical=3))
         assert result == RunStatus.HALTED
 
-    def test_stall_resets_on_improvement(self):
-        det = ConvergenceDetector(stall_threshold=3)
-        det.check(make_score(critical=10))
-        det.check(make_score(critical=10))  # stall 1
-        det.check(make_score(critical=5))   # improvement — resets stall
-        result = det.check(make_score(critical=5))  # stall 1 again
-        assert result is None  # only 1 stall, threshold=3
-
-    def test_regression_halts(self):
+    def test_halt_on_regression(self):
         det = ConvergenceDetector(regression_threshold=0.1)
-        det.check(make_score(critical=2, major=2))  # score = 26
-        result = det.check(make_score(critical=5, major=10))  # worse
+        det.check(make_score(critical=2))
+        result = det.check(make_score(critical=10, major=5))
         assert result == RunStatus.HALTED
+
+    def test_prev_score_zero_then_regression_no_false_halt(self):
+        det = ConvergenceDetector()
+        det.check(make_score(critical=0, major=0))
+        result = det.check(make_score(critical=1))
+        assert result is None
+
+    def test_stall_count_resets_after_improvement(self):
+        det = ConvergenceDetector(stall_threshold=2)
+        det.check(make_score(critical=10))
+        det.check(make_score(critical=10))
+        det.check(make_score(critical=5))
+        result = det.check(make_score(critical=5))
+        assert det._stall_count == 1
+
+    def test_is_improving(self):
+        det = ConvergenceDetector()
+        det.check(make_score(critical=5))
+        det.check(make_score(critical=3))
+        assert det.is_improving() is True
+
+    def test_is_not_improving_on_stall(self):
+        det = ConvergenceDetector(stall_threshold=5)
+        s = make_score(critical=5)
+        det.check(s)
+        det.check(s)
+        assert det.is_improving() is False
 
     def test_trend_improving(self):
         det = ConvergenceDetector()
@@ -57,9 +78,24 @@ class TestConvergenceDetector:
         det.check(make_score(critical=3))
         assert det.trend == "improving"
 
+    def test_trend_regressing(self):
+        det = ConvergenceDetector(stall_threshold=99, regression_threshold=99.0)
+        det.check(make_score(critical=3))
+        det.check(make_score(critical=5))
+        assert det.trend == "regressing"
+
     def test_trend_stalled(self):
-        det = ConvergenceDetector()
+        det = ConvergenceDetector(stall_threshold=99)
         s = make_score(critical=5)
         det.check(s)
         det.check(s)
         assert det.trend == "stalled"
+
+    def test_summary_structure(self):
+        det = ConvergenceDetector()
+        det.check(make_score(critical=5))
+        summary = det.summary()
+        assert "cycle_count" in summary
+        assert "trend" in summary
+        assert "history" in summary
+        assert summary["cycle_count"] == 1

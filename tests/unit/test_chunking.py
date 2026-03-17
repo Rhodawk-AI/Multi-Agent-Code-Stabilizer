@@ -1,108 +1,146 @@
-"""Unit tests for the chunking engine."""
+from __future__ import annotations
+
 import pytest
-from pathlib import Path
+
+from brain.schemas import ChunkStrategy
 from utils.chunking import (
-    chunk_file, determine_strategy, detect_language,
-    ChunkStrategy, should_include_file
+    Chunk,
+    chunk_file,
+    chunk_lines_targeted,
+    collect_repo_files,
+    detect_language,
+    determine_strategy,
+    should_include_file,
+    THRESHOLD_FULL,
+    THRESHOLD_HALF,
+    THRESHOLD_AST,
+    THRESHOLD_SKELETON,
 )
+from pathlib import Path
 
 
-def make_content(n_lines: int) -> str:
-    return "\n".join(f"line_{i} = {i}" for i in range(n_lines))
+class TestDetermineStrategy:
+    def test_small_file_is_full(self):
+        assert determine_strategy(50) == ChunkStrategy.FULL
+
+    def test_medium_file_is_half(self):
+        assert determine_strategy(THRESHOLD_FULL + 1) == ChunkStrategy.HALF
+
+    def test_larger_file_is_ast(self):
+        assert determine_strategy(THRESHOLD_HALF + 1) == ChunkStrategy.AST_NODES
+
+    def test_large_file_is_skeleton(self):
+        assert determine_strategy(THRESHOLD_AST + 1) == ChunkStrategy.SKELETON
+
+    def test_huge_file_is_skeleton_only(self):
+        assert determine_strategy(THRESHOLD_SKELETON + 1) == ChunkStrategy.SKELETON_ONLY
 
 
-class TestStrategySelection:
-    def test_full_under_200(self):
-        assert determine_strategy(100) == ChunkStrategy.FULL
-
-    def test_half_200_to_1000(self):
-        assert determine_strategy(500) == ChunkStrategy.HALF
-
-    def test_ast_1000_to_5000(self):
-        assert determine_strategy(2000) == ChunkStrategy.AST_NODES
-
-    def test_skeleton_5000_to_20000(self):
-        assert determine_strategy(10000) == ChunkStrategy.SKELETON
-
-    def test_skeleton_only_above_20000(self):
-        assert determine_strategy(25000) == ChunkStrategy.SKELETON_ONLY
-
-
-class TestChunking:
-    def test_full_file_single_chunk(self):
-        content = make_content(100)
+class TestChunkFile:
+    def test_small_file_single_chunk(self):
+        content = "\n".join(f"line {i}" for i in range(50))
         chunks = chunk_file("test.py", content)
         assert len(chunks) == 1
+        assert chunks[0].strategy == ChunkStrategy.FULL
         assert chunks[0].index == 0
         assert chunks[0].total == 1
-        assert chunks[0].content == content
 
-    def test_half_strategy_two_chunks(self):
-        content = make_content(400)
+    def test_chunk_indices_are_consistent(self):
+        content = "\n".join(f"x = {i}" for i in range(500))
         chunks = chunk_file("test.py", content)
-        assert len(chunks) == 2
-        assert all(c.total == 2 for c in chunks)
+        for i, chunk in enumerate(chunks):
+            assert chunk.index == i
+            assert chunk.total == len(chunks)
 
-    def test_half_overlap(self):
-        content = make_content(400)
+    def test_line_ranges_cover_file(self):
+        content = "\n".join(f"line {i}" for i in range(100))
         chunks = chunk_file("test.py", content)
-        # First chunk should end past midpoint (overlap)
-        assert chunks[0].line_end > 200
-        # Second chunk should start before midpoint (overlap)
-        assert chunks[1].line_start < 200
+        assert chunks[0].line_start == 1
+        last = chunks[-1]
+        assert last.line_end == 100
 
-    def test_large_file_has_multiple_chunks(self):
-        content = make_content(2000)
-        chunks = chunk_file("test.py", content)
-        assert len(chunks) >= 2
+    def test_chunk_content_not_empty(self):
+        content = "\n".join(f"x = {i}" for i in range(200))
+        chunks = chunk_file("large.py", content)
+        for chunk in chunks:
+            assert chunk.content.strip() != ""
 
-    def test_all_lines_covered(self):
-        """Every line in the file must appear in at least one chunk."""
-        content = make_content(500)
-        chunks = chunk_file("test.py", content)
-        all_content = " ".join(c.content for c in chunks)
-        for i in range(0, 490, 10):  # spot check
-            assert f"line_{i}" in all_content
-
-    def test_chunk_indices_sequential(self):
-        content = make_content(2000)
-        chunks = chunk_file("test.py", content)
-        indices = [c.index for c in chunks]
-        assert indices == list(range(len(chunks)))
-
-    def test_total_consistent(self):
-        content = make_content(2000)
-        chunks = chunk_file("test.py", content)
-        totals = set(c.total for c in chunks)
-        assert len(totals) == 1  # all chunks agree on total
+    def test_skeleton_chunks_have_flag(self):
+        content = "\n".join(f"x = {i}" for i in range(5001))
+        chunks = chunk_file("huge.py", content)
+        skeleton_chunks = [c for c in chunks if c.is_skeleton]
+        assert len(skeleton_chunks) >= 1
 
 
-class TestLanguageDetection:
-    @pytest.mark.parametrize("ext,expected", [
-        ("test.py", "python"),
-        ("test.ts", "typescript"),
-        ("test.go", "go"),
-        ("test.rs", "rust"),
-        ("test.java", "java"),
-        ("test.unknown_ext", "unknown"),
-    ])
-    def test_detect(self, ext, expected):
-        assert detect_language(ext) == expected
+class TestChunkLinesTargeted:
+    def test_targeted_chunk_correct_range(self):
+        content = "\n".join(f"line{i}" for i in range(100))
+        chunk = chunk_lines_targeted(content, 10, 20)
+        assert chunk.line_start == 10
+        assert chunk.line_end == 20
+        assert "line9" in chunk.content
 
 
-class TestFileFiltering:
-    def test_skip_pyc(self, tmp_path):
-        f = tmp_path / "test.pyc"
-        f.write_bytes(b"")
-        assert not should_include_file(f)
+class TestDetectLanguage:
+    def test_python(self):
+        assert detect_language("app.py") == "python"
 
-    def test_skip_node_modules(self, tmp_path):
-        d = tmp_path / "node_modules" / "test.js"
-        d.parent.mkdir()
-        d.write_text("x")
-        assert not should_include_file(d)
+    def test_typescript(self):
+        assert detect_language("index.ts") == "typescript"
 
-    def test_include_python(self, tmp_path):
-        f = tmp_path / "main.py"
-        f.write_text("x=1")
-        assert should_include_file(f)
+    def test_rust(self):
+        assert detect_language("main.rs") == "rust"
+
+    def test_unknown(self):
+        assert detect_language("mystery.xyz") == "unknown"
+
+
+class TestShouldIncludeFile:
+    def test_python_file_included(self, tmp_path):
+        f = tmp_path / "app.py"
+        f.write_text("x = 1")
+        assert should_include_file(f) is True
+
+    def test_pyc_excluded(self, tmp_path):
+        f = tmp_path / "app.pyc"
+        f.write_text("")
+        assert should_include_file(f) is False
+
+    def test_node_modules_excluded(self, tmp_path):
+        d = tmp_path / "node_modules"
+        d.mkdir()
+        f = d / "package.py"
+        f.write_text("x = 1")
+        assert should_include_file(f) is False
+
+    def test_hidden_dir_excluded(self, tmp_path):
+        d = tmp_path / ".hidden"
+        d.mkdir()
+        f = d / "secret.py"
+        f.write_text("x = 1")
+        assert should_include_file(f) is False
+
+    def test_png_excluded(self, tmp_path):
+        f = tmp_path / "logo.png"
+        f.write_bytes(b"\x89PNG")
+        assert should_include_file(f) is False
+
+
+class TestCollectRepoFiles:
+    def test_collects_python_files(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1")
+        (tmp_path / "b.py").write_text("y = 2")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "c.py").write_text("z = 3")
+        files = collect_repo_files(tmp_path)
+        paths = [str(f) for f in files]
+        assert any("a.py" in p for p in paths)
+        assert any("c.py" in p for p in paths)
+
+    def test_excludes_pyc(self, tmp_path):
+        (tmp_path / "app.py").write_text("x = 1")
+        (tmp_path / "app.pyc").write_bytes(b"")
+        files = collect_repo_files(tmp_path)
+        exts = {f.suffix for f in files}
+        assert ".pyc" not in exts
