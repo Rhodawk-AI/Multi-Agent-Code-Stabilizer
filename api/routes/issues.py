@@ -1,14 +1,11 @@
-"""
-api/routes/issues.py
-REST API routes for issues.
-NEW FILE — was missing entirely.
-"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
 from pathlib import Path
 
-from brain.schemas import Severity
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+from brain.schemas import IssueStatus, Severity
 from brain.sqlite_storage import SQLiteBrainStorage
 
 router = APIRouter()
@@ -18,51 +15,114 @@ def _storage(repo_path: str) -> SQLiteBrainStorage:
     return SQLiteBrainStorage(Path(repo_path) / ".stabilizer" / "brain.db")
 
 
-@router.get("/", summary="List issues with optional filters")
+class IssueOut(BaseModel):
+    id: str
+    run_id: str
+    severity: str
+    file_path: str
+    line_start: int
+    line_end: int
+    executor_type: str
+    description: str
+    status: str
+    fix_attempt_count: int
+    created_at: str
+    escalated_reason: str | None = None
+
+
+@router.get("/", response_model=list[IssueOut])
 async def list_issues(
-    repo_path: str = ".",
-    run_id:    str | None = Query(default=None),
-    status:    str | None = Query(default=None),
-    severity:  str | None = Query(default=None),
-    file_path: str | None = Query(default=None),
-) -> list[dict]:
-    sev = Severity(severity) if severity else None
+    run_id: str = Query(default="", description="Filter by run ID"),
+    status: str = Query(default="", description="Filter by status"),
+    severity: str = Query(default="", description="Filter by severity"),
+    file_path: str = Query(default="", description="Filter by file path"),
+    repo_path: str = Query(default="."),
+) -> list[IssueOut]:
     storage = _storage(repo_path)
-    await storage.initialise()
     try:
+        await storage.initialise()
+        sev = Severity(severity) if severity else None
         issues = await storage.list_issues(
-            run_id=run_id, status=status, severity=sev, file_path=file_path
+            run_id=run_id or None,
+            status=status or None,
+            severity=sev,
+            file_path=file_path or None,
         )
-        return [i.model_dump() for i in issues]
+        return [_to_out(i) for i in issues]
     finally:
         await storage.close()
 
 
-@router.get("/{issue_id}", summary="Get a specific issue")
-async def get_issue(issue_id: str, repo_path: str = ".") -> dict:
+@router.get("/{issue_id}", response_model=IssueOut)
+async def get_issue(
+    issue_id: str,
+    repo_path: str = Query(default="."),
+) -> IssueOut:
     storage = _storage(repo_path)
-    await storage.initialise()
     try:
+        await storage.initialise()
         issue = await storage.get_issue(issue_id)
         if not issue:
             raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
-        return issue.model_dump()
+        return _to_out(issue)
     finally:
         await storage.close()
 
 
-@router.get("/summary/by-severity", summary="Count issues grouped by severity")
+@router.patch("/{issue_id}/status")
+async def update_issue_status(
+    issue_id: str,
+    status: str,
+    reason: str = "",
+    repo_path: str = Query(default="."),
+) -> dict:
+    valid = {s.value for s in IssueStatus}
+    if status not in valid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid status '{status}'. Valid: {sorted(valid)}",
+        )
+    storage = _storage(repo_path)
+    try:
+        await storage.initialise()
+        issue = await storage.get_issue(issue_id)
+        if not issue:
+            raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
+        await storage.update_issue_status(issue_id, status, reason)
+        return {"id": issue_id, "status": status, "updated": True}
+    finally:
+        await storage.close()
+
+
+@router.get("/summary/by-severity")
 async def issues_by_severity(
-    repo_path: str = ".",
-    run_id:    str | None = Query(default=None),
+    run_id: str = Query(..., description="Run ID"),
+    repo_path: str = Query(default="."),
 ) -> dict:
     storage = _storage(repo_path)
-    await storage.initialise()
     try:
-        issues = await storage.list_issues(run_id=run_id)
-        counts: dict[str, int] = {"CRITICAL": 0, "MAJOR": 0, "MINOR": 0, "INFO": 0}
-        for i in issues:
-            counts[i.severity.value] = counts.get(i.severity.value, 0) + 1
-        return counts
+        await storage.initialise()
+        counts: dict[str, int] = {}
+        for sev in Severity:
+            issues = await storage.list_issues(run_id=run_id, severity=sev)
+            counts[sev.value] = len(issues)
+        return {"run_id": run_id, "by_severity": counts}
     finally:
         await storage.close()
+
+
+def _to_out(issue) -> IssueOut:
+    return IssueOut(
+        id=issue.id,
+        run_id=issue.run_id,
+        severity=issue.severity.value,
+        file_path=issue.file_path,
+        line_start=issue.line_start,
+        line_end=issue.line_end,
+        executor_type=issue.executor_type.value,
+        description=issue.description,
+        status=issue.status.value,
+        fix_attempt_count=issue.fix_attempt_count,
+        created_at=issue.created_at.isoformat(),
+        escalated_reason=issue.escalated_reason,
+    )
