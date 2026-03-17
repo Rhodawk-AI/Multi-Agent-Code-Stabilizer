@@ -1,4 +1,4 @@
-# OpenMOSS Default Configuration
+# RHODAWK AI CODE STABILIZER Default Configuration
 # All values here are overridable via environment variables or CLI flags
 
 [models]
@@ -91,7 +91,7 @@ reload = false
 [logging]
 level = "INFO"
 format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-file = ".stabilizer/openmoss.log"
+file = ".stabilizer/rhodawk-ai-code-stabilizer.log"
 
 [brain]
 # Storage backend: sqlite (default), json (small repos only)

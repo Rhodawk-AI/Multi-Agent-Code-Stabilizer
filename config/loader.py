@@ -72,7 +72,7 @@ class PatrolConfig:
 
 
 @dataclass
-class OpenMOSSConfig:
+class RHODAWK AI CODE STABILIZERConfig:
     models: ModelsConfig = field(default_factory=ModelsConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     static_analysis: StaticAnalysisConfig = field(default_factory=StaticAnalysisConfig)
@@ -82,7 +82,7 @@ class OpenMOSSConfig:
     patrol: PatrolConfig = field(default_factory=PatrolConfig)
 
 
-def load_config(config_path: Path | None = None) -> OpenMOSSConfig:
+def load_config(config_path: Path | None = None) -> RHODAWK AI CODE STABILIZERConfig:
     path = config_path or _DEFAULT_CONFIG_PATH
     raw: dict[str, Any] = {}
 
@@ -97,7 +97,7 @@ def load_config(config_path: Path | None = None) -> OpenMOSSConfig:
                     "tomllib/tomli not available — using default config. "
                     "Install tomli for Python <3.11: pip install tomli"
                 )
-                return _apply_env_overrides(OpenMOSSConfig())
+                return _apply_env_overrides(RHODAWK AI CODE STABILIZERConfig())
 
         try:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -107,7 +107,7 @@ def load_config(config_path: Path | None = None) -> OpenMOSSConfig:
     else:
         log.info(f"Config file not found at {path}. Using defaults.")
 
-    cfg = OpenMOSSConfig()
+    cfg = RHODAWK AI CODE STABILIZERConfig()
     _apply_section(cfg.models, raw.get("models", {}))
     _apply_section(cfg.loop, raw.get("loop", {}))
     _apply_section(cfg.static_analysis, raw.get("static_analysis", {}))
@@ -124,17 +124,17 @@ def _apply_section(obj: Any, data: dict) -> None:
             setattr(obj, key, val)
 
 
-def _apply_env_overrides(cfg: OpenMOSSConfig) -> OpenMOSSConfig:
-    _env_str(cfg.models, "primary", "OPENMOSS_PRIMARY_MODEL")
-    _env_str(cfg.models, "triage_model", "OPENMOSS_TRIAGE_MODEL")
-    _env_str(cfg.models, "critical_fix_model", "OPENMOSS_CRITICAL_MODEL")
-    _env_float(cfg.loop, "cost_ceiling_usd", "OPENMOSS_COST_CEILING")
-    _env_int(cfg.loop, "max_cycles", "OPENMOSS_MAX_CYCLES")
-    _env_int(cfg.loop, "concurrency", "OPENMOSS_CONCURRENCY")
-    _env_bool(cfg.static_analysis, "run_mypy", "OPENMOSS_RUN_MYPY")
-    _env_bool(cfg.static_analysis, "run_semgrep", "OPENMOSS_RUN_SEMGREP")
-    _env_str(cfg.github, "base_branch", "OPENMOSS_BASE_BRANCH")
-    _env_int(cfg.api, "port", "OPENMOSS_API_PORT")
+def _apply_env_overrides(cfg: RHODAWK AI CODE STABILIZERConfig) -> RHODAWK AI CODE STABILIZERConfig:
+    _env_str(cfg.models, "primary", "RHODAWK_AI_CODE_STABILIZER_PRIMARY_MODEL")
+    _env_str(cfg.models, "triage_model", "RHODAWK_AI_CODE_STABILIZER_TRIAGE_MODEL")
+    _env_str(cfg.models, "critical_fix_model", "RHODAWK_AI_CODE_STABILIZER_CRITICAL_MODEL")
+    _env_float(cfg.loop, "cost_ceiling_usd", "RHODAWK_AI_CODE_STABILIZER_COST_CEILING")
+    _env_int(cfg.loop, "max_cycles", "RHODAWK_AI_CODE_STABILIZER_MAX_CYCLES")
+    _env_int(cfg.loop, "concurrency", "RHODAWK_AI_CODE_STABILIZER_CONCURRENCY")
+    _env_bool(cfg.static_analysis, "run_mypy", "RHODAWK_AI_CODE_STABILIZER_RUN_MYPY")
+    _env_bool(cfg.static_analysis, "run_semgrep", "RHODAWK_AI_CODE_STABILIZER_RUN_SEMGREP")
+    _env_str(cfg.github, "base_branch", "RHODAWK_AI_CODE_STABILIZER_BASE_BRANCH")
+    _env_int(cfg.api, "port", "RHODAWK_AI_CODE_STABILIZER_API_PORT")
     return cfg
 
 
