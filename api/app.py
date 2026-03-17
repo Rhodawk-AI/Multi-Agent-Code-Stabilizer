@@ -1,6 +1,6 @@
 """
 api/app.py
-FastAPI backend for OpenMOSS.
+FastAPI backend for RHODAWK AI CODE STABILIZER.
 Provides REST API + WebSocket live event streaming for the dashboard.
 
 PATCH LOG:
@@ -42,15 +42,15 @@ ws_manager = ConnectionManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    log.info("OpenMOSS API starting")
+    log.info("RHODAWK AI CODE STABILIZER API starting")
     app.state.ws_manager = ws_manager
     yield
-    log.info("OpenMOSS API shutting down")
+    log.info("RHODAWK AI CODE STABILIZER API shutting down")
     await ws_manager.disconnect_all()
 
 
 app = FastAPI(
-    title="OpenMOSS",
+    title="RHODAWK AI CODE STABILIZER",
     description="Autonomous Multi-Agent Code Stabilizer API",
     version="1.0.0",
     lifespan=lifespan,
@@ -113,7 +113,7 @@ async def websocket_endpoint(websocket: WebSocket, run_id: str) -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
-    """Serve the OpenMOSS live dashboard."""
+    """Serve the RHODAWK AI CODE STABILIZER live dashboard."""
     ui_path = Path(__file__).parent.parent / "ui" / "index.html"
     if ui_path.exists():
         return HTMLResponse(content=ui_path.read_text(encoding="utf-8"))
@@ -151,7 +151,7 @@ def _fallback_dashboard() -> str:
     return """<!DOCTYPE html>
 <html>
 <head>
-  <title>OpenMOSS Dashboard</title>
+  <title>RHODAWK AI CODE STABILIZER Dashboard</title>
   <meta charset="UTF-8">
   <style>
     body { background: #0a0a0a; color: #e0e0e0; font-family: 'JetBrains Mono', monospace; padding: 2rem; }
@@ -161,7 +161,7 @@ def _fallback_dashboard() -> str:
   </style>
 </head>
 <body>
-  <h1>⚡ OpenMOSS</h1>
+  <h1>⚡ RHODAWK AI CODE STABILIZER</h1>
   <div class="status">
     <p>API is running. Connect to <code>/api/docs</code> for the full REST API.</p>
     <p>WebSocket stream: <code>ws://localhost:8000/ws/{run_id}</code></p>
