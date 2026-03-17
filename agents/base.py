@@ -81,7 +81,7 @@ class BaseAgent(ABC):
         self.mcp = mcp_manager
         self._session_cost = 0.0
         self._rate_limiter: RateLimiter | None = None
-        self.log = logging.getLogger(f"openmoss.{self.agent_type.value.lower()}")
+        self.log = logging.getLogger(f"rhodawk-ai-code-stabilizer.{self.agent_type.value.lower()}")
 
     async def call_llm_structured(
         self,
@@ -249,7 +249,7 @@ class BaseAgent(ABC):
 
     def build_system_prompt(self, role_description: str) -> str:
         return (
-            f"You are an expert {role_description} operating as part of the OpenMOSS "
+            f"You are an expert {role_description} operating as part of the RHODAWK AI CODE STABILIZER "
             "autonomous code stabilization system. Your outputs must be precise, "
             "complete, and strictly conformant to the requested JSON schema. "
             "Never truncate, summarise, or omit required fields. "
