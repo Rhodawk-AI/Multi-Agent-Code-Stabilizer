@@ -9,7 +9,7 @@ from brain.schemas import AuditTrailEntry
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_SECRET = "openmoss-default-insecure-key-change-in-production"
+_DEFAULT_SECRET = "rhodawk-ai-code-stabilizer-default-insecure-key-change-in-production"
 
 
 class AuditTrailSigner:
