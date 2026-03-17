@@ -1,35 +1,3 @@
-"""
-sandbox/executor.py
-STATIC ANALYSIS GATE — runs before any LLM-generated fix touches the repo.
-
-This is the most important trust layer in OpenMOSS.
-Every fixed file passes through here before it is written to disk.
-A file that fails static analysis is REJECTED, no matter what the LLM said.
-
-Tools run (in order):
-  1. Syntax check     — ast.parse() / language-specific parser
-  2. ruff             — fast Python linter (errors only)
-  3. mypy             — type checker (strict mode)
-  4. semgrep          — security pattern matching
-  5. bandit           — Python security issues
-  6. Custom invariants — project-specific validators
-
-All tools run in isolated subprocess with timeout.
-No generated code is ever exec()'d or eval()'d on the host.
-
-PATCH LOG:
-  - _run_mypy: method was completely absent despite being advertised in the
-    docstring, class init, and config.toml. Added full implementation.
-  - _run_cmd: fixed double asyncio.wait_for wrapping. The outer wait_for
-    covered the subprocess creation but not the communicate() call, meaning
-    a hung subprocess could block forever. Now a single wait_for covers the
-    entire create + communicate sequence via asyncio.create_task.
-  - _run_semgrep: added concrete implementation (was absent).
-  - validate: mypy and semgrep now correctly conditional on self.run_mypy /
-    self.run_semgrep flags.
-  - Added _check_dangerous_patterns: detects eval/exec/pickle/os.system on
-    content before any subprocess is spawned (fast, no disk I/O).
-"""
 from __future__ import annotations
 
 import ast
@@ -43,15 +11,15 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-ANALYSIS_TIMEOUT_S = 60  # hard timeout per tool
+ANALYSIS_TIMEOUT_S = 60
 
 
 @dataclass
 class AnalysisResult:
-    passed:   bool = True
-    errors:   list[str] = field(default_factory=list)
+    passed: bool = True
+    errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    tool:     str = ""
+    tool: str = ""
 
     def add_error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -63,54 +31,67 @@ class AnalysisResult:
 
 @dataclass
 class GateResult:
-    file_path:        str
-    approved:         bool = True
-    results:          list[AnalysisResult] = field(default_factory=list)
+    file_path: str
+    approved: bool = False
+    results: list[AnalysisResult] = field(default_factory=list)
     rejection_reason: str = ""
+
+    def approve(self) -> None:
+        self.approved = True
 
     def reject(self, reason: str) -> None:
         self.approved = False
         self.rejection_reason = reason
 
 
-class StaticAnalysisGate:
-    """
-    Pre-commit gate. Runs all static analysis tools on LLM-generated code
-    before it is written to the repository.
+def validate_path_within_root(file_path: str, repo_root: Path) -> None:
+    resolved_root = repo_root.resolve()
+    candidate = (repo_root / file_path).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        raise ValueError(
+            f"Path traversal rejected: '{file_path}' resolves to '{candidate}' "
+            f"which is outside repo root '{resolved_root}'"
+        )
 
-    Security guarantee: no generated code is ever executed, eval'd, or imported.
-    """
+
+class StaticAnalysisGate:
 
     def __init__(
         self,
-        run_ruff:    bool = True,
-        run_mypy:    bool = True,
+        run_ruff: bool = True,
+        run_mypy: bool = True,
         run_semgrep: bool = True,
-        run_bandit:  bool = True,
+        run_bandit: bool = True,
         fail_on_warning: bool = False,
+        repo_root: Path | None = None,
     ) -> None:
-        self.run_ruff        = run_ruff
-        self.run_mypy        = run_mypy
-        self.run_semgrep     = run_semgrep
-        self.run_bandit      = run_bandit
+        self.run_ruff = run_ruff
+        self.run_mypy = run_mypy
+        self.run_semgrep = run_semgrep
+        self.run_bandit = run_bandit
         self.fail_on_warning = fail_on_warning
+        self.repo_root = repo_root
 
     async def validate(self, file_path: str, content: str) -> GateResult:
-        """
-        Validate a single file's content.
-        Returns GateResult with approved=True only if ALL checks pass.
-        """
         result = GateResult(file_path=file_path)
+
+        if self.repo_root:
+            try:
+                validate_path_within_root(file_path, self.repo_root)
+            except ValueError as exc:
+                result.reject(str(exc))
+                return result
+
         ext = Path(file_path).suffix.lower()
 
-        # Fast in-memory dangerous pattern check before touching disk
         danger = self._check_dangerous_patterns(content, ext)
         result.results.append(danger)
         if not danger.passed:
             result.reject(f"Dangerous pattern: {danger.errors[0]}")
             return result
 
-        # Write to a temp file for tool analysis
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=ext or ".py",
@@ -121,15 +102,13 @@ class StaticAnalysisGate:
             tmp_path = tmp.name
 
         try:
-            # 1. Syntax check (always — fast and essential)
             syntax_result = await self._check_syntax(tmp_path, content, ext)
             result.results.append(syntax_result)
             if not syntax_result.passed:
                 result.reject(f"Syntax error: {syntax_result.errors[0]}")
-                return result  # No point running other tools
+                return result
 
             if ext == ".py":
-                # 2. ruff — fast linting
                 if self.run_ruff:
                     ruff = await self._run_ruff(tmp_path)
                     result.results.append(ruff)
@@ -137,46 +116,37 @@ class StaticAnalysisGate:
                         result.reject(f"Ruff errors: {'; '.join(ruff.errors[:3])}")
                         return result
 
-                # 3. mypy — type checking
                 if self.run_mypy:
                     mypy = await self._run_mypy(tmp_path)
                     result.results.append(mypy)
                     if not mypy.passed:
-                        # mypy errors are warnings unless fail_on_warning
                         if self.fail_on_warning:
                             result.reject(f"mypy errors: {'; '.join(mypy.errors[:3])}")
                             return result
-                        # Otherwise log as warnings, don't block
                         for w in mypy.errors:
                             result.results[-1].add_warning(w)
                         result.results[-1].errors.clear()
                         result.results[-1].passed = True
 
-                # 4. bandit — Python security
                 if self.run_bandit:
                     bandit = await self._run_bandit(tmp_path)
                     result.results.append(bandit)
                     if not bandit.passed:
-                        result.reject(
-                            f"Security issue (bandit): {'; '.join(bandit.errors[:2])}"
-                        )
+                        result.reject(f"Security issue (bandit): {'; '.join(bandit.errors[:2])}")
                         return result
 
-            # 5. semgrep — cross-language security patterns
             if self.run_semgrep:
                 semgrep = await self._run_semgrep(tmp_path, ext)
                 result.results.append(semgrep)
                 if not semgrep.passed:
-                    result.reject(
-                        f"Security issue (semgrep): {'; '.join(semgrep.errors[:2])}"
-                    )
+                    result.reject(f"Security issue (semgrep): {'; '.join(semgrep.errors[:2])}")
                     return result
 
-            # 6. Custom project-level invariants
             invariant = self._check_invariants(content, ext)
             result.results.append(invariant)
             if not invariant.passed:
                 result.reject(f"Invariant violation: {invariant.errors[0]}")
+                return result
 
         finally:
             try:
@@ -184,12 +154,12 @@ class StaticAnalysisGate:
             except OSError:
                 pass
 
+        result.approve()
         return result
 
     async def validate_batch(
         self, files: list[tuple[str, str]]
     ) -> dict[str, GateResult]:
-        """Validate multiple files concurrently."""
         tasks = [self.validate(path, content) for path, content in files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return {
@@ -202,15 +172,7 @@ class StaticAnalysisGate:
             for i, r in enumerate(results)
         }
 
-    # ─────────────────────────────────────────────────────────
-    # Individual checks
-    # ─────────────────────────────────────────────────────────
-
     def _check_dangerous_patterns(self, content: str, ext: str) -> AnalysisResult:
-        """
-        In-memory fast scan for unconditionally dangerous patterns.
-        Runs before any disk I/O — catches the worst offenders immediately.
-        """
         result = AnalysisResult(tool="dangerous_patterns")
         lines = content.splitlines()
 
@@ -270,11 +232,6 @@ class StaticAnalysisGate:
         return result
 
     async def _run_mypy(self, tmp_path: str) -> AnalysisResult:
-        """
-        FIX: _run_mypy was completely absent. Advertised in docstring, init,
-        config.toml, but never implemented. Added full implementation.
-        Uses --ignore-missing-imports so it doesn't fail on third-party stubs.
-        """
         result = AnalysisResult(tool="mypy")
         r = await self._run_cmd(
             [
@@ -292,7 +249,6 @@ class StaticAnalysisGate:
             return result
         if r.returncode != 0:
             for line in r.stdout.splitlines():
-                # Only report error: and note: lines, skip summary lines
                 if ": error:" in line or ": note:" in line:
                     result.add_error(line.strip())
         return result
@@ -306,7 +262,7 @@ class StaticAnalysisGate:
         if r.returncode == 127:
             result.add_warning("bandit not installed — security scan skipped")
             return result
-        if r.returncode == 1:  # issues found
+        if r.returncode == 1:
             for line in r.stdout.splitlines():
                 if "HIGH" in line:
                     result.add_error(line.strip())
@@ -315,110 +271,72 @@ class StaticAnalysisGate:
         return result
 
     async def _run_semgrep(self, tmp_path: str, ext: str) -> AnalysisResult:
-        """
-        FIX: semgrep was advertised but never implemented.
-        Runs the auto ruleset which covers common security anti-patterns
-        across Python, JS/TS, Go, Java, and Ruby.
-        """
         result = AnalysisResult(tool="semgrep")
+        configs = ["p/python-security-audit", "p/secrets"]
+        if ext in (".js", ".ts", ".jsx", ".tsx"):
+            configs.append("p/javascript")
         r = await self._run_cmd(
-            [
-                "semgrep",
-                "--config", "p/python-security-audit",
-                "--config", "p/secrets",
-                "--json",
-                "--quiet",
-                tmp_path,
-            ],
+            ["semgrep", "--config", configs[0], "--config", "p/secrets", "--json", "--quiet", tmp_path],
             timeout=45,
         )
         if r.returncode == 127:
             result.add_warning("semgrep not installed — semgrep scan skipped")
             return result
-        # semgrep exit code 1 = findings, 2 = error
         if r.returncode == 1:
             import json as _json
             try:
                 data = _json.loads(r.stdout)
                 for finding in data.get("results", []):
                     severity = finding.get("extra", {}).get("severity", "WARNING")
-                    message  = finding.get("extra", {}).get("message", "semgrep finding")
-                    line     = finding.get("start", {}).get("line", 0)
+                    message = finding.get("extra", {}).get("message", "semgrep finding")
+                    line = finding.get("start", {}).get("line", 0)
                     msg = f"L{line}: [{severity}] {message}"
                     if severity in ("ERROR", "HIGH"):
                         result.add_error(msg)
                     else:
                         result.add_warning(msg)
             except Exception:
-                # Semgrep output unparseable — log as warning, don't block
                 result.add_warning(f"semgrep: unparseable output ({r.stdout[:100]})")
         elif r.returncode == 2:
             result.add_warning(f"semgrep error: {r.stderr[:200]}")
         return result
 
     def _check_invariants(self, content: str, ext: str) -> AnalysisResult:
-        """
-        Project-level invariants that must always hold.
-        These catch the class of LLM mistakes that static analysis misses.
-        """
         result = AnalysisResult(tool="invariants")
         lines = content.splitlines()
 
-        # Invariant 1: No bare except
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
             if stripped in ("except:", "except :"):
-                result.add_error(
-                    f"L{i}: Bare `except:` forbidden — must specify exception type"
-                )
+                result.add_error(f"L{i}: Bare `except:` forbidden — must specify exception type")
 
-        # Invariant 2: File must not be empty
         if not content.strip():
             result.add_error("File is empty after fix — this would delete the module")
 
-        # Invariant 3: Detect silent exception swallowing (except: pass)
         in_except = False
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
             if stripped.startswith("except"):
                 in_except = True
             elif in_except and stripped == "pass":
-                result.add_warning(
-                    f"L{i}: Silent exception `pass` — add logging or re-raise"
-                )
+                result.add_warning(f"L{i}: Silent exception `pass` — add logging or re-raise")
                 in_except = False
             elif in_except and stripped:
                 in_except = False
 
-        # Invariant 4: No TODO/FIXME/HACK left in safety-critical paths
         safety_keywords = ("safety", "security", "auth", "policy", "consequence")
         for i, line in enumerate(lines, 1):
             lower = line.lower()
             if any(k in lower for k in safety_keywords):
                 if any(t in lower for t in ("todo", "fixme", "hack", "xxx")):
-                    result.add_warning(
-                        f"L{i}: TODO/FIXME in safety-critical code path"
-                    )
+                    result.add_warning(f"L{i}: TODO/FIXME in safety-critical code path")
 
         return result
-
-    # ─────────────────────────────────────────────────────────
-    # Subprocess runner
-    # ─────────────────────────────────────────────────────────
 
     @staticmethod
     async def _run_cmd(
         cmd: list[str], timeout: int = ANALYSIS_TIMEOUT_S
     ) -> subprocess.CompletedProcess:
-        """
-        FIX: original had double asyncio.wait_for — one for process creation
-        and one (implicitly missing) for communicate(). A hung subprocess
-        could block forever on communicate().
-
-        New implementation uses a single asyncio.wait_for covering a coroutine
-        that creates the process AND awaits communicate(), so the timeout is
-        correctly applied to the full operation.
-        """
         async def _run() -> tuple[int, str, str]:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -443,7 +361,7 @@ class StaticAnalysisGate:
         except asyncio.TimeoutError:
             return subprocess.CompletedProcess(
                 args=cmd,
-                returncode=124,  # standard timeout exit code
+                returncode=124,
                 stdout="",
                 stderr=f"Timed out after {timeout}s",
             )
