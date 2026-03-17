@@ -1,10 +1,19 @@
 """
 brain/sqlite_storage.py
-Production SQLite brain storage using aiosqlite + SQLAlchemy core.
+Production SQLite brain storage using aiosqlite.
 Handles millions of lines of code via incremental indexing.
+
+PATCH LOG:
+  - append_score: replaced str(id(score)) memory-address PK with score.id (UUID)
+  - upsert_issue: added run_id to INSERT statement (was NULL for every issue, breaking
+    all list_issues(run_id=...) queries and multi-run isolation entirely)
+  - Added asyncio.Lock for write serialization — aiosqlite with a single shared
+    connection is not concurrency-safe for writes without explicit serialization
+  - _conn() context manager now uses write_lock for all mutations
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -155,6 +164,7 @@ CREATE TABLE IF NOT EXISTS review_results (
     fix_attempt_id      TEXT NOT NULL REFERENCES fix_attempts(id),
     decisions           TEXT NOT NULL DEFAULT '[]',
     overall_score       REAL DEFAULT 0.0,
+    overall_note        TEXT DEFAULT '',
     approve_for_commit  INTEGER DEFAULT 0,
     reviewed_at         TEXT NOT NULL
 );
@@ -196,12 +206,24 @@ class SQLiteBrainStorage(BrainStorage):
     def __init__(self, db_path: str | Path = ".stabilizer/brain.db") -> None:
         self._path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
+        # FIX: asyncio.Lock for write serialization.
+        # aiosqlite wraps sqlite3 in a thread but a single shared connection is
+        # not safe for concurrent async writers without explicit serialization.
+        self._write_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _conn(self) -> AsyncIterator[aiosqlite.Connection]:
         if self._db is None:
             raise RuntimeError("Storage not initialised — call await storage.initialise() first")
         yield self._db
+
+    @asynccontextmanager
+    async def _write(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Context manager for write operations — serialises concurrent writes."""
+        async with self._write_lock:
+            if self._db is None:
+                raise RuntimeError("Storage not initialised — call await storage.initialise() first")
+            yield self._db
 
     async def initialise(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +242,7 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Audit Run ─────────────────────────────────────────────────────────
 
     async def upsert_run(self, run: AuditRun) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO audit_runs
                     (id, repo_url, repo_name, branch, master_prompt_path,
@@ -270,7 +292,7 @@ class SQLiteBrainStorage(BrainStorage):
                 )
 
     async def update_run_status(self, run_id: str, status: RunStatus) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             completed = _now() if status in (
                 RunStatus.STABILIZED, RunStatus.HALTED,
                 RunStatus.FAILED, RunStatus.ESCALATED,
@@ -282,14 +304,18 @@ class SQLiteBrainStorage(BrainStorage):
             await db.commit()
 
     async def append_score(self, score: AuditScore) -> None:
-        async with self._conn() as db:
+        # FIX: was using str(id(score)) — Python object memory address — as PK.
+        # This is non-deterministic and guaranteed to collide across interpreter sessions.
+        # AuditScore now has a proper UUID id field.
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO audit_scores
                     (id, run_id, total_issues, critical_count, major_count,
                      minor_count, info_count, score, scored_at)
                 VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO NOTHING
             """, (
-                str(id(score)), score.run_id,
+                score.id, score.run_id,
                 score.total_issues, score.critical_count,
                 score.major_count, score.minor_count,
                 score.info_count, score.score,
@@ -306,6 +332,7 @@ class SQLiteBrainStorage(BrainStorage):
                 rows = await cur.fetchall()
                 return [
                     AuditScore(
+                        id=r["id"],
                         run_id=r["run_id"],
                         total_issues=r["total_issues"],
                         critical_count=r["critical_count"],
@@ -321,7 +348,7 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Files ──────────────────────────────────────────────────────────────
 
     async def upsert_file(self, record: FileRecord) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO files
                     (path, content_hash, size_lines, size_bytes, language,
@@ -391,7 +418,7 @@ class SQLiteBrainStorage(BrainStorage):
         )
 
     async def mark_file_read(self, path: str, summary: str) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 UPDATE files
                 SET status='READ', summary=?, last_read_at=?, updated_at=?,
@@ -401,7 +428,7 @@ class SQLiteBrainStorage(BrainStorage):
             await db.commit()
 
     async def append_chunk(self, chunk: FileChunkRecord) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO file_chunks
                     (chunk_id, file_path, chunk_index, total_chunks,
@@ -456,21 +483,26 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Issues ─────────────────────────────────────────────────────────────
 
     async def upsert_issue(self, issue: Issue) -> None:
-        async with self._conn() as db:
+        # FIX: run_id was completely absent from the INSERT.
+        # The DDL column existed, but was never populated.
+        # list_issues(run_id=...) therefore always returned empty results,
+        # breaking score computation, cost ceilings, and all per-run queries.
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO issues
-                    (id, severity, file_path, line_start, line_end,
+                    (id, run_id, severity, file_path, line_start, line_end,
                      executor_type, master_prompt_section, description,
                      fix_requires_files, status, fix_attempt_count,
                      fingerprint, escalated_reason, created_at, closed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     fix_attempt_count=excluded.fix_attempt_count,
                     escalated_reason=excluded.escalated_reason,
                     closed_at=excluded.closed_at
             """, (
-                issue.id, issue.severity.value,
+                issue.id, issue.run_id,
+                issue.severity.value,
                 issue.file_path, issue.line_start, issue.line_end,
                 issue.executor_type.value,
                 issue.master_prompt_section,
@@ -514,7 +546,10 @@ class SQLiteBrainStorage(BrainStorage):
         if file_path:
             query += " AND file_path=?"
             params.append(file_path)
-        query += " ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'MAJOR' THEN 1 WHEN 'MINOR' THEN 2 ELSE 3 END, created_at"
+        query += (
+            " ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'MAJOR' THEN 1"
+            " WHEN 'MINOR' THEN 2 ELSE 3 END, created_at"
+        )
         async with self._conn() as db:
             async with db.execute(query, params) as cur:
                 rows = await cur.fetchall()
@@ -524,6 +559,7 @@ class SQLiteBrainStorage(BrainStorage):
         from brain.schemas import ExecutorType
         return Issue(
             id=row["id"],
+            run_id=row["run_id"] or "",
             severity=Severity(row["severity"]),
             file_path=row["file_path"],
             line_start=row["line_start"],
@@ -541,7 +577,7 @@ class SQLiteBrainStorage(BrainStorage):
         )
 
     async def update_issue_status(self, issue_id: str, status: str, reason: str = "") -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             closed = _now() if status in ("CLOSED", "ESCALATED") else None
             await db.execute("""
                 UPDATE issues SET status=?, escalated_reason=?, closed_at=?
@@ -550,7 +586,7 @@ class SQLiteBrainStorage(BrainStorage):
             await db.commit()
 
     async def increment_fix_attempts(self, issue_id: str) -> int:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute(
                 "UPDATE issues SET fix_attempt_count=fix_attempt_count+1 WHERE id=?",
                 (issue_id,),
@@ -581,7 +617,7 @@ class SQLiteBrainStorage(BrainStorage):
                 )
 
     async def upsert_fingerprint(self, fp: IssueFingerprint) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO issue_fingerprints (fingerprint, issue_id, seen_count, first_seen, last_seen)
                 VALUES (?,?,?,?,?)
@@ -597,7 +633,7 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Fix Attempts ───────────────────────────────────────────────────────
 
     async def upsert_fix(self, fix: FixAttempt) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO fix_attempts
                     (id, issue_ids, fixed_files, reviewer_verdict, reviewer_reason,
@@ -675,21 +711,23 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Reviews ────────────────────────────────────────────────────────────
 
     async def upsert_review(self, review: ReviewResult) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO review_results
                     (review_id, fix_attempt_id, decisions, overall_score,
-                     approve_for_commit, reviewed_at)
-                VALUES (?,?,?,?,?,?)
+                     overall_note, approve_for_commit, reviewed_at)
+                VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(review_id) DO UPDATE SET
                     decisions=excluded.decisions,
                     overall_score=excluded.overall_score,
+                    overall_note=excluded.overall_note,
                     approve_for_commit=excluded.approve_for_commit
             """, (
                 review.review_id,
                 review.fix_attempt_id,
                 json.dumps([d.model_dump() for d in review.decisions]),
                 review.overall_score,
+                review.overall_note,
                 int(review.approve_for_commit),
                 review.reviewed_at.isoformat(),
             ))
@@ -709,6 +747,7 @@ class SQLiteBrainStorage(BrainStorage):
                     fix_attempt_id=row["fix_attempt_id"],
                     decisions=[ReviewDecision(**d) for d in decisions_data],
                     overall_score=row["overall_score"],
+                    overall_note=row["overall_note"] or "",
                     approve_for_commit=bool(row["approve_for_commit"]),
                     reviewed_at=datetime.fromisoformat(row["reviewed_at"]),
                 )
@@ -716,7 +755,7 @@ class SQLiteBrainStorage(BrainStorage):
     # ── Patrol ─────────────────────────────────────────────────────────────
 
     async def log_patrol_event(self, event: PatrolEvent) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO patrol_log (id, event_type, detail, action_taken, run_id, timestamp)
                 VALUES (?,?,?,?,?,?)
@@ -748,7 +787,7 @@ class SQLiteBrainStorage(BrainStorage):
     # ── LLM sessions ───────────────────────────────────────────────────────
 
     async def log_llm_session(self, session: LLMSession) -> None:
-        async with self._conn() as db:
+        async with self._write() as db:
             await db.execute("""
                 INSERT INTO llm_sessions
                     (id, run_id, agent_type, model, prompt_tokens,

@@ -2,6 +2,11 @@
 brain/schemas.py
 Pydantic v2 data models for the entire OpenMOSS agent brain.
 These are the canonical data structures shared by all agents.
+
+PATCH LOG:
+  - Issue: added run_id field (fixes multi-run isolation — upsert_issue was inserting NULL run_id)
+  - AuditScore: added id field with UUID factory (fixes sqlite_storage using id(score) as PK)
+  - ReviewResult: added overall_note field (fixes AttributeError in reviewer._store_result)
 """
 from __future__ import annotations
 
@@ -129,6 +134,9 @@ class FileRecord(BaseModel):
 class Issue(BaseModel):
     """A single discovered problem in the codebase."""
     id:                    str = Field(default_factory=lambda: f"ISS-{str(uuid.uuid4())[:8].upper()}")
+    # FIX: run_id added — without this, list_issues(run_id=...) always returns empty set
+    # because the DB column was never populated. Critical for multi-run isolation.
+    run_id:                str = ""
     severity:              Severity
     file_path:             str
     line_start:            int = 0
@@ -203,7 +211,10 @@ class ReviewResult(BaseModel):
     review_id:         str = Field(default_factory=lambda: str(uuid.uuid4()))
     fix_attempt_id:    str
     decisions:         list[ReviewDecision]
-    overall_score:     float = Field(ge=0.0, le=1.0)
+    overall_score:     float = Field(default=0.0, ge=0.0, le=1.0)
+    # FIX: overall_note was accessed in reviewer._store_result but this field was missing.
+    # AttributeError: 'ReviewResult' object has no attribute 'overall_note'
+    overall_note:      str = ""
     approve_for_commit: bool = False
     reviewed_at:       datetime = Field(default_factory=datetime.utcnow)
 
@@ -213,9 +224,10 @@ class ReviewResult(BaseModel):
             d.verdict == ReviewVerdict.APPROVED for d in self.decisions
         )
         if self.decisions:
-            self.overall_score = sum(
-                d.confidence for d in self.decisions if d.verdict == ReviewVerdict.APPROVED
-            ) / len(self.decisions)
+            approved = [d for d in self.decisions if d.verdict == ReviewVerdict.APPROVED]
+            self.overall_score = sum(d.confidence for d in approved) / len(self.decisions)
+        else:
+            self.overall_score = 0.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -224,6 +236,9 @@ class ReviewResult(BaseModel):
 
 class AuditScore(BaseModel):
     """Snapshot of audit health at a point in time."""
+    # FIX: id field added — sqlite_storage was using str(id(score)) (Python object memory
+    # address) as the primary key, which is non-deterministic and collides across sessions.
+    id:             str = Field(default_factory=lambda: str(uuid.uuid4()))
     run_id:         str
     total_issues:   int = 0
     critical_count: int = 0
