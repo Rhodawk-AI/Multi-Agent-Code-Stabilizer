@@ -11,16 +11,16 @@ lint:
 	pdm run mypy .
 
 bootstrap:
-	pdm run openmoss bootstrap $(REPO_PATH)
+	pdm run rhodawk-ai-code-stabilizer bootstrap $(REPO_PATH)
 
 audit:
-	pdm run openmoss audit $(REPO_URL) --path $(REPO_PATH) --output audit_report.md
+	pdm run rhodawk-ai-code-stabilizer audit $(REPO_URL) --path $(REPO_PATH) --output audit_report.md
 
 stabilize:
-	pdm run openmoss stabilize $(REPO_URL) --path $(REPO_PATH)
+	pdm run rhodawk-ai-code-stabilizer stabilize $(REPO_URL) --path $(REPO_PATH)
 
 status:
-	pdm run openmoss status $(REPO_PATH)
+	pdm run rhodawk-ai-code-stabilizer status $(REPO_PATH)
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

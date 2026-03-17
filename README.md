@@ -14,32 +14,32 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
-[![CI](https://github.com/openmoss/openmoss/actions/workflows/ci.yml/badge.svg)](https://github.com/openmoss/openmoss/actions)
+[![CI](https://github.com/rhodawk-ai-code-stabilizer/rhodawk-ai-code-stabilizer/actions/workflows/ci.yml/badge.svg)](https://github.com/rhodawk-ai-code-stabilizer/rhodawk-ai-code-stabilizer/actions)
 [![Coverage](https://img.shields.io/badge/coverage-85%25-green.svg)](tests/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
-[![Discord](https://img.shields.io/discord/000000000?label=Discord&logo=discord)](https://discord.gg/openmoss)
+[![Discord](https://img.shields.io/discord/000000000?label=Discord&logo=discord)](https://discord.gg/rhodawk-ai-code-stabilizer)
 
 </div>
 
 ---
 
-> **Give OpenMOSS a GitHub repo. It reads every single line, finds every bug, fixes them all, commits the fixes, and loops — until your codebase meets your exact quality bar. Then it stops.**
+> **Give RHODAWK AI CODE STABILIZER a GitHub repo. It reads every single line, finds every bug, fixes them all, commits the fixes, and loops — until your codebase meets your exact quality bar. Then it stops.**
 
 ---
 
 ## What This Is
 
-OpenMOSS is an open-source autonomous agent system that:
+RHODAWK AI CODE STABILIZER is an open-source autonomous agent system that:
 
 1. **Reads your entire codebase** — 100 files or 100,000 files. Every line. Across multiple LLM sessions with a persistent brain that accumulates everything.
-2. **Audits against your master prompt** — you define what "correct" means. Security? Architecture? DO-178C? MISRA? You write the spec, OpenMOSS enforces it.
+2. **Audits against your master prompt** — you define what "correct" means. Security? Architecture? DO-178C? MISRA? You write the spec, RHODAWK AI CODE STABILIZER enforces it.
 3. **Fixes everything** — returns complete, production-ready fixed files. Not diffs. Not suggestions. The actual fixed files.
 4. **Commits to GitHub** — creates branches and PRs with full audit trails.
 5. **Loops until done** — re-audits after every fix. Never stops until zero critical issues remain.
 
 ## Why It Beats Code Review Tools
 
-| | CodeRabbit / Copilot | OpenMOSS |
+| | CodeRabbit / Copilot | RHODAWK AI CODE STABILIZER |
 |---|---|---|
 | **Mode** | Reactive (reviews your PRs) | Autonomous (creates its own) |
 | **Memory** | Per-PR only | Full codebase brain |
@@ -54,14 +54,14 @@ OpenMOSS is an open-source autonomous agent system that:
 
 ```bash
 # 1. Install
-pip install openmoss
+pip install rhodawk-ai-code-stabilizer
 
 # 2. Set keys
 export ANTHROPIC_API_KEY=your_key
 export GITHUB_TOKEN=your_token
 
 # 3. Stabilize any repo
-openmoss stabilize https://github.com/your/repo --path /path/to/local/clone
+rhodawk-ai-code-stabilizer stabilize https://github.com/your/repo --path /path/to/local/clone
 ```
 
 That's it. Watch it work.
@@ -69,8 +69,8 @@ That's it. Watch it work.
 ## Docker (Zero Setup)
 
 ```bash
-git clone https://github.com/openmoss/openmoss
-cd openmoss
+git clone https://github.com/rhodawk-ai-code-stabilizer/rhodawk-ai-code-stabilizer
+cd rhodawk-ai-code-stabilizer
 cp .env.example .env   # add your API keys
 docker compose up
 
@@ -79,11 +79,11 @@ docker compose up
 
 ## Web Dashboard
 
-OpenMOSS ships with a real-time dashboard. Watch agents work live:
+RHODAWK AI CODE STABILIZER ships with a real-time dashboard. Watch agents work live:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  OpenMOSS Dashboard              Run: abc123        │
+│  RHODAWK AI CODE STABILIZER Dashboard              Run: abc123        │
 ├──────────────┬──────────────────────────────────────┤
 │ CYCLE 3/50   │  ████████████░░░░  Score: 47 → 12   │
 ├──────────────┴──────────────────────────────────────┤
@@ -113,10 +113,10 @@ Between sessions, everything is stored in a SQLite brain: every symbol, every de
 
 ## Plugin System
 
-Extend OpenMOSS with custom audit rules:
+Extend RHODAWK AI CODE STABILIZER with custom audit rules:
 
 ```python
-from openmoss.plugins import AuditPlugin, Issue, Severity
+from rhodawk-ai-code-stabilizer.plugins import AuditPlugin, Issue, Severity
 
 class NASACodingStandards(AuditPlugin):
     name = "nasa_standards"
@@ -134,7 +134,7 @@ class NASACodingStandards(AuditPlugin):
 ```
 
 ```bash
-openmoss stabilize --plugin ./nasa_standards.py https://github.com/your/repo
+rhodawk-ai-code-stabilizer stabilize --plugin ./nasa_standards.py https://github.com/your/repo
 ```
 
 ## Multi-Model Support
@@ -185,7 +185,7 @@ The system is stabilized when your spec passes. Nothing more, nothing less.
 ## Architecture
 
 ```
-openmoss stabilize repo
+rhodawk-ai-code-stabilizer stabilize repo
         │
         ▼
 ┌───────────────────────────────────────────────┐
@@ -229,24 +229,24 @@ openmoss stabilize repo
 
 ```bash
 # Full stabilization loop
-openmoss stabilize <repo_url> --path <local_path>
+rhodawk-ai-code-stabilizer stabilize <repo_url> --path <local_path>
 
 # Audit only (no commits)
-openmoss audit <repo_url> --path <local_path> --output report.md
+rhodawk-ai-code-stabilizer audit <repo_url> --path <local_path> --output report.md
 
 # Pre-index a large repo cheaply before auditing
-openmoss bootstrap <local_path>
+rhodawk-ai-code-stabilizer bootstrap <local_path>
 
 # Check current run status
-openmoss status <local_path>
+rhodawk-ai-code-stabilizer status <local_path>
 
 # View live dashboard
-openmoss dashboard <local_path>
+rhodawk-ai-code-stabilizer dashboard <local_path>
 ```
 
 ## Safety
 
-OpenMOSS is designed to be safe to run on production codebases:
+RHODAWK AI CODE STABILIZER is designed to be safe to run on production codebases:
 
 - **Never executes LLM-generated code** on your host
 - **Architectural lock** — safety-critical files require human approval before any fix is committed
@@ -257,7 +257,7 @@ OpenMOSS is designed to be safe to run on production codebases:
 
 ## Contributing
 
-OpenMOSS is fully open source. We welcome:
+RHODAWK AI CODE STABILIZER is fully open source. We welcome:
 - New audit plugins (security standards, language-specific rules)
 - New LLM adapters
 - Dashboard improvements

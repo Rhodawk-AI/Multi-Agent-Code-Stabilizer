@@ -24,5 +24,5 @@ RUN npm install -g @modelcontextprotocol/server-filesystem \
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["pdm", "run", "openmoss"]
+ENTRYPOINT ["pdm", "run", "rhodawk-ai-code-stabilizer"]
 CMD ["--help"]

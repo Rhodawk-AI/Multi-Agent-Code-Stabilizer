@@ -1,14 +1,14 @@
 version: "3.9"
 
 services:
-  openmoss:
+  rhodawk-ai-code-stabilizer:
     build: .
     env_file: .env
     volumes:
       - .:/app
       - ./data:/app/data
     working_dir: /app
-    command: ["openmoss", "--help"]
+    command: ["rhodawk-ai-code-stabilizer", "--help"]
 
   redis:
     image: redis:7-alpine

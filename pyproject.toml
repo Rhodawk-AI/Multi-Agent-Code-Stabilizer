@@ -3,13 +3,13 @@ requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
 [project]
-name = "openmoss"
+name = "rhodawk-ai-code-stabilizer"
 version = "1.0.0"
 description = "Autonomous Multi-Agent Code Stabilizer"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "OpenMOSS Contributors" }]
+authors = [{ name = "RHODAWK AI CODE STABILIZER Contributors" }]
 keywords = ["ai", "agents", "code-review", "autonomous", "llm", "stabilizer"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -69,7 +69,7 @@ dev = [
 ]
 
 [project.scripts]
-openmoss = "scripts.cli:app"
+rhodawk-ai-code-stabilizer = "scripts.cli:app"
 
 [tool.ruff]
 line-length = 100
