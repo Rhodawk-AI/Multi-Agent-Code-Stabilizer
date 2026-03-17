@@ -1,4 +1,4 @@
-# OpenMOSS Architecture
+# RHODAWK AI CODE STABILIZER Architecture
 
 ## The Core Loop
 
@@ -81,7 +81,7 @@ At least one condition always triggers.
 
 ## Trust Architecture
 
-What makes OpenMOSS safe to run on production code:
+What makes RHODAWK AI CODE STABILIZER safe to run on production code:
 
 1. **Never executes generated code** on the host machine
 2. **Never pushes to main** — PRs only

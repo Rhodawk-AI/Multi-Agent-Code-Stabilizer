@@ -1,6 +1,6 @@
-# Contributing to OpenMOSS
+# Contributing to RHODAWK AI CODE STABILIZER
 
-OpenMOSS is fully open source. We welcome contributions of all kinds.
+RHODAWK AI CODE STABILIZER is fully open source. We welcome contributions of all kinds.
 
 ## Ways to Contribute
 
@@ -31,8 +31,8 @@ Add integration tests against real (small) open-source repos with known issues.
 ## Development Setup
 
 ```bash
-git clone https://github.com/openmoss/openmoss
-cd openmoss
+git clone https://github.com/rhodawk-ai-code-stabilizer/rhodawk-ai-code-stabilizer
+cd rhodawk-ai-code-stabilizer
 pip install pdm
 pdm install --dev
 cp .env.example .env
