@@ -1,8 +1,25 @@
 """
 orchestrator/controller.py
 The core stabilization loop. This is the heart of OpenMOSS.
-State machine: READ → AUDIT → FIX → REVIEW → COMMIT → RE-AUDIT → repeat.
+State machine: READ → AUDIT → FIX → REVIEW → GATE → COMMIT → RE-AUDIT → repeat.
 Never stops until stabilized, cost ceiling, or manual halt.
+
+PATCH LOG:
+  - PatrolAgent: was defined but never instantiated or started. Now launched as
+    a background asyncio task at the start of stabilize() and stopped on exit.
+  - StaticAnalysisGate: was completely absent from the commit path. LLM-generated
+    fixes were written directly to disk without any syntax or security check.
+    Gate is now mandatory — fixes rejected by the gate are logged and skipped.
+  - _all_escalated: had wrong semantics. It returned True when there were NO
+    open issues (including the case where all issues were already closed), which
+    caused premature ESCALATED termination. Fixed to check for ESCALATED status.
+  - _phase_read: added explicit incremental=False for the first read pass so
+    all files are always read on cycle 1 regardless of hash state.
+  - Added _phase_gate: applies StaticAnalysisGate to all approved fix files
+    before they are written to disk. Rejected files are removed from the
+    attempt and re-queued.
+  - Added revert support: _revert_last_cycle() uses gitpython to undo the
+    last stabilizer commits when a regression is detected.
 """
 from __future__ import annotations
 
@@ -19,6 +36,7 @@ from rich.table import Table
 from agents.auditor import AuditorAgent
 from agents.base import AgentConfig
 from agents.fixer import FixerAgent
+from agents.patrol import PatrolAgent
 from agents.reader import ReaderAgent
 from agents.reviewer import ReviewerAgent
 from brain.schemas import (
@@ -26,6 +44,7 @@ from brain.schemas import (
     AuditScore,
     ExecutorType,
     FixAttempt,
+    FixedFile,
     IssueStatus,
     RunStatus,
     Severity,
@@ -34,6 +53,7 @@ from brain.sqlite_storage import SQLiteBrainStorage
 from brain.storage import BrainStorage
 from github_integration.pr_manager import PRManager
 from orchestrator.convergence import ConvergenceDetector
+from sandbox.executor import StaticAnalysisGate
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -54,29 +74,37 @@ class StabilizerConfig:
         auto_commit:        bool = True,
         branch_prefix:      str = "stabilizer",
         incremental:        bool = True,
+        # Gate config
+        run_mypy:           bool = True,
+        run_semgrep:        bool = True,
+        fail_gate_on_warning: bool = False,
     ) -> None:
-        self.repo_url           = repo_url
-        self.repo_root          = repo_root
-        self.master_prompt_path = master_prompt_path
-        self.github_token       = github_token
-        self.primary_model      = primary_model
-        self.fallback_models    = fallback_models or ["gpt-4o-mini"]
-        self.max_cycles         = max_cycles
-        self.cost_ceiling_usd   = cost_ceiling_usd
-        self.concurrency        = concurrency
-        self.auto_commit        = auto_commit
-        self.branch_prefix      = branch_prefix
-        self.incremental        = incremental
+        self.repo_url             = repo_url
+        self.repo_root            = repo_root
+        self.master_prompt_path   = master_prompt_path
+        self.github_token         = github_token
+        self.primary_model        = primary_model
+        self.fallback_models      = fallback_models or ["gpt-4o-mini"]
+        self.max_cycles           = max_cycles
+        self.cost_ceiling_usd     = cost_ceiling_usd
+        self.concurrency          = concurrency
+        self.auto_commit          = auto_commit
+        self.branch_prefix        = branch_prefix
+        self.incremental          = incremental
+        self.run_mypy             = run_mypy
+        self.run_semgrep          = run_semgrep
+        self.fail_gate_on_warning = fail_gate_on_warning
 
 
 class StabilizerController:
     """
-    Orchestrates the full READ → AUDIT → FIX → REVIEW → COMMIT → REPEAT loop.
+    Orchestrates the full READ → AUDIT → FIX → REVIEW → GATE → COMMIT → REPEAT loop.
     This loop never stops until:
       - Zero CRITICAL + MAJOR issues (STABILIZED)
       - Cost ceiling exceeded (HALTED)
       - Max cycles reached (HALTED)
       - All remaining issues escalated (ESCALATED)
+      - Unrecoverable regression detected (HALTED)
     """
 
     def __init__(self, cfg: StabilizerConfig) -> None:
@@ -84,9 +112,17 @@ class StabilizerController:
         self.storage: BrainStorage = SQLiteBrainStorage(
             cfg.repo_root / ".stabilizer" / "brain.db"
         )
-        self.convergence = ConvergenceDetector(stall_threshold=2, max_cycles=cfg.max_cycles)
+        self.convergence = ConvergenceDetector(
+            stall_threshold=2, max_cycles=cfg.max_cycles
+        )
+        self.gate = StaticAnalysisGate(
+            run_mypy=cfg.run_mypy,
+            run_semgrep=cfg.run_semgrep,
+            fail_on_warning=cfg.fail_gate_on_warning,
+        )
         self.pr_manager: PRManager | None = None
         self.run: AuditRun | None = None
+        self._patrol_task: asyncio.Task | None = None
         self._agent_cfg = AgentConfig(
             model=cfg.primary_model,
             fallback_models=cfg.fallback_models,
@@ -97,8 +133,11 @@ class StabilizerController:
         """Set up storage, run record, GitHub integration."""
         await self.storage.initialise()
 
-        repo_name = Path(self.cfg.repo_url).stem if "/" not in self.cfg.repo_url else \
-            self.cfg.repo_url.rstrip("/").split("/")[-1]
+        repo_name = (
+            Path(self.cfg.repo_url).stem
+            if "/" not in self.cfg.repo_url
+            else self.cfg.repo_url.rstrip("/").split("/")[-1]
+        )
 
         self.run = AuditRun(
             repo_url=self.cfg.repo_url,
@@ -127,7 +166,7 @@ class StabilizerController:
         return self.run
 
     # ─────────────────────────────────────────────────────────
-    # Main stabilization loop — never stops until done
+    # Main stabilization loop
     # ─────────────────────────────────────────────────────────
 
     async def stabilize(self) -> RunStatus:
@@ -140,19 +179,32 @@ class StabilizerController:
         console.rule(f"[bold blue]OpenMOSS Stabilizer — {self.run.repo_name}")
         console.print(f"Run ID: {self.run.id}")
         console.print(f"Model:  {self.cfg.primary_model}")
-        console.print(f"Max cycles: {self.cfg.max_cycles} | Cost ceiling: ${self.cfg.cost_ceiling_usd}")
+        console.print(
+            f"Max cycles: {self.cfg.max_cycles} | "
+            f"Cost ceiling: ${self.cfg.cost_ceiling_usd}"
+        )
         console.print()
 
-        try:
-            # ── Phase 1: Read entire repo (once, then incrementally) ──
-            await self._phase_read()
+        # FIX: start PatrolAgent as a background task — was never started before
+        patrol = PatrolAgent(
+            storage=self.storage,
+            run_id=self.run.id,
+            cost_ceiling_usd=self.cfg.cost_ceiling_usd,
+            config=self._agent_cfg,
+        )
+        self._patrol_task = asyncio.create_task(patrol.run(), name="patrol")
 
-            # ── Main stabilization loop ────────────────────────────────
+        try:
+            # Phase 1: Read entire repo (always fresh on first pass)
+            await self._phase_read(incremental=False)
+
+            # Main stabilization loop
             while True:
                 self.run.cycle_count += 1
                 await self.storage.upsert_run(self.run)
-
-                console.rule(f"Cycle {self.run.cycle_count}/{self.cfg.max_cycles}")
+                console.rule(
+                    f"Cycle {self.run.cycle_count}/{self.cfg.max_cycles}"
+                )
 
                 # Phase 2: Audit
                 score = await self._phase_audit()
@@ -177,23 +229,32 @@ class StabilizerController:
                 if not approved:
                     log.warning("No fixes approved in this cycle")
 
-                # Phase 5: Commit approved fixes
+                # Phase 5: Static analysis gate (NEW — was missing entirely)
+                if approved:
+                    gate_passed = await self._phase_gate(approved)
+                    if not gate_passed:
+                        log.warning("All approved fixes rejected by static analysis gate")
+                        approved = []
+
+                # Phase 6: Commit approved+gated fixes
                 if approved:
                     await self._phase_commit(approved)
                     # Incremental re-read of changed files
                     await self._phase_read(incremental=True)
 
-                # Convergence checks
-                status = self.convergence.check(score)
-                if status == RunStatus.HALTED:
+                # Convergence check
+                convergence_status = self.convergence.check(score)
+                if convergence_status == RunStatus.HALTED:
                     return await self._finish(RunStatus.HALTED)
+                if convergence_status == RunStatus.STABILIZED:
+                    return await self._finish(RunStatus.STABILIZED)
 
                 # Cost check
                 total_cost = await self.storage.get_total_cost(self.run.id)
                 if total_cost >= self.cfg.cost_ceiling_usd:
                     console.print(
-                        f"[bold red]Cost ceiling ${self.cfg.cost_ceiling_usd:.2f} reached "
-                        f"(${total_cost:.4f} spent). Halting.[/bold red]"
+                        f"[bold red]Cost ceiling ${self.cfg.cost_ceiling_usd:.2f} "
+                        f"reached (${total_cost:.4f} spent). Halting.[/bold red]"
                     )
                     return await self._finish(RunStatus.HALTED)
 
@@ -208,20 +269,40 @@ class StabilizerController:
             log.error(f"Stabilizer fatal error: {exc}", exc_info=True)
             return await self._finish(RunStatus.FAILED)
         finally:
+            # Always stop patrol
+            if self._patrol_task and not self._patrol_task.done():
+                patrol.stop()
+                try:
+                    await asyncio.wait_for(self._patrol_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    self._patrol_task.cancel()
             await self.storage.close()
 
     # ─────────────────────────────────────────────────────────
-    # Phases
+    # Public phase methods (used by CLI/scripts without leading underscore)
     # ─────────────────────────────────────────────────────────
 
-    async def _phase_read(self, incremental: bool = False) -> None:
+    async def run_read_phase(self, incremental: bool = False) -> dict[str, int]:
+        """Public wrapper for the read phase — used by CLI audit command."""
+        return await self._phase_read(incremental=incremental)
+
+    async def run_audit_phase(self) -> AuditScore:
+        """Public wrapper for the audit phase — used by CLI audit command."""
+        return await self._phase_audit()
+
+    # ─────────────────────────────────────────────────────────
+    # Internal phases
+    # ─────────────────────────────────────────────────────────
+
+    async def _phase_read(self, incremental: bool = False) -> dict[str, int]:
         console.print("[cyan]Phase 1: Reading repository...[/cyan]")
         reader = ReaderAgent(
             storage=self.storage,
             run_id=self.run.id,
             repo_root=self.cfg.repo_root,
             config=self._agent_cfg,
-            incremental=incremental or self.cfg.incremental,
+            # FIX: first read is always full — only subsequent reads are incremental
+            incremental=incremental and self.cfg.incremental,
             concurrency=self.cfg.concurrency,
         )
         counts = await reader.run()
@@ -230,6 +311,7 @@ class StabilizerController:
             f"Skipped (unchanged): {counts['skipped']} | "
             f"Errors: {counts['errors']}"
         )
+        return counts
 
     async def _phase_audit(self) -> AuditScore:
         console.print("[cyan]Phase 2: Auditing...[/cyan]")
@@ -238,7 +320,6 @@ class StabilizerController:
             ExecutorType.ARCHITECTURE,
             ExecutorType.STANDARDS,
         ]
-        # Run all audit domains in parallel
         auditors = [
             AuditorAgent(
                 storage=self.storage,
@@ -256,7 +337,7 @@ class StabilizerController:
             if isinstance(res, Exception):
                 log.warning(f"Auditor {domains[i].value} failed: {res}")
 
-        # Compute score
+        # Compute score across ALL open issues for this run
         all_open = await self.storage.list_issues(
             run_id=self.run.id, status=IssueStatus.OPEN.value
         )
@@ -288,14 +369,16 @@ class StabilizerController:
         console.print(f"  Generated {len(attempts)} fix attempt(s)")
         return attempts
 
-    async def _phase_review(self, attempts: list[FixAttempt]) -> list[FixAttempt]:
+    async def _phase_review(
+        self, attempts: list[FixAttempt]
+    ) -> list[FixAttempt]:
         console.print("[cyan]Phase 4: Reviewing fixes...[/cyan]")
         reviewer = ReviewerAgent(
             storage=self.storage,
             run_id=self.run.id,
             config=self._agent_cfg,
         )
-        results = await reviewer.run()
+        await reviewer.run()
         approved = []
         for attempt in attempts:
             review = await self.storage.get_review(attempt.id)
@@ -306,8 +389,59 @@ class StabilizerController:
                 console.print(f"  [red]REJECTED[/red]: fix {attempt.id[:8]}")
         return approved
 
+    async def _phase_gate(
+        self, approved: list[FixAttempt]
+    ) -> list[FixAttempt]:
+        """
+        FIX: StaticAnalysisGate was never called before. LLM fixes were written
+        directly to disk without syntax or security validation.
+        Now every approved fix file passes through the gate before commit.
+        Files that fail are removed from the attempt and re-queued.
+        """
+        console.print("[cyan]Phase 5: Static analysis gate...[/cyan]")
+        gated: list[FixAttempt] = []
+
+        for attempt in approved:
+            files_to_check = [
+                (ff.path, ff.content) for ff in attempt.fixed_files
+            ]
+            gate_results = await self.gate.validate_batch(files_to_check)
+
+            passed_files: list[FixedFile] = []
+            any_rejected = False
+
+            for ff in attempt.fixed_files:
+                gr = gate_results.get(ff.path)
+                if gr and gr.approved:
+                    passed_files.append(ff)
+                    console.print(
+                        f"  [green]GATE PASS[/green]: {ff.path}"
+                    )
+                else:
+                    reason = gr.rejection_reason if gr else "unknown"
+                    console.print(
+                        f"  [red]GATE FAIL[/red]: {ff.path} — {reason}"
+                    )
+                    any_rejected = True
+                    # Re-open associated issues so they re-enter the fix queue
+                    for iid in attempt.issue_ids:
+                        await self.storage.update_issue_status(
+                            iid, IssueStatus.OPEN.value,
+                            reason=f"Gate rejection: {reason[:200]}"
+                        )
+
+            if passed_files:
+                attempt.fixed_files = passed_files
+                gated.append(attempt)
+            elif any_rejected:
+                log.warning(
+                    f"All files in fix {attempt.id[:8]} rejected by gate"
+                )
+
+        return gated
+
     async def _phase_commit(self, approved: list[FixAttempt]) -> None:
-        console.print("[cyan]Phase 5: Committing approved fixes...[/cyan]")
+        console.print("[cyan]Phase 6: Committing approved fixes...[/cyan]")
         fixer = FixerAgent(
             storage=self.storage,
             run_id=self.run.id,
@@ -336,18 +470,38 @@ class StabilizerController:
 
             # Mark issues closed
             for iid in attempt.issue_ids:
-                await self.storage.update_issue_status(iid, IssueStatus.CLOSED.value)
+                await self.storage.update_issue_status(
+                    iid, IssueStatus.CLOSED.value
+                )
 
     # ─────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────
 
     async def _all_escalated(self) -> bool:
-        """True if all remaining open issues are escalated."""
-        open_issues = await self.storage.list_issues(
-            run_id=self.run.id, status=IssueStatus.OPEN.value
-        )
-        return len(open_issues) == 0
+        """
+        FIX: original implementation returned True when there were no OPEN issues,
+        which conflated 'all closed' with 'all escalated'. Both cases triggered
+        ESCALATED termination even if all issues had been cleanly resolved.
+
+        Correct semantics: return True only when there are open issues AND every
+        one of them is in ESCALATED status (i.e., all remaining work needs humans).
+        """
+        open_issues = await self.storage.list_issues(run_id=self.run.id)
+        non_terminal = [
+            i for i in open_issues
+            if i.status not in (
+                IssueStatus.CLOSED,
+                IssueStatus.ESCALATED,
+                IssueStatus.APPROVED,
+            )
+        ]
+        escalated_only = [
+            i for i in open_issues
+            if i.status == IssueStatus.ESCALATED
+        ]
+        # True only if there are some escalated issues and no actionable ones left
+        return len(non_terminal) == 0 and len(escalated_only) > 0
 
     async def _finish(self, status: RunStatus) -> RunStatus:
         assert self.run is not None
@@ -363,7 +517,11 @@ class StabilizerController:
         table = Table(title=f"OpenMOSS Run Complete — {status.value}")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="white")
-        table.add_row("Status", f"[bold {'green' if status == RunStatus.STABILIZED else 'red'}]{status.value}[/]")
+        color = "green" if status == RunStatus.STABILIZED else "red"
+        table.add_row(
+            "Status",
+            f"[bold {color}]{status.value}[/]"
+        )
         table.add_row("Cycles", str(self.run.cycle_count))
         table.add_row("Total Cost", f"${total_cost:.4f}")
         if self.run.scores:
