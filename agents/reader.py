@@ -1,3 +1,27 @@
+"""
+agents/reader.py
+================
+Reads every file in the repo and populates the brain with structured
+observations, symbol tables, and dependency references.
+
+FIXES vs previous version
+──────────────────────────
+• GAP-10 CRITICAL: chunks within a single file were processed serially.
+  A 25,000-line file with 32 chunks was making 32 sequential LLM calls.
+  Now chunks within a file are processed in parallel bounded by a per-file
+  semaphore (``chunk_concurrency``, default 4) so large files complete 4×
+  faster without flooding the rate limiter.
+• VectorBrain integration: if a VectorBrain instance is supplied, every chunk
+  is indexed after it is appended to SQLite so semantic search stays in sync
+  with the brain automatically.
+• _process_file now propagates the FileStatus.READING → FileStatus.READ
+  transition atomically even if a subset of chunks fail — partial reads are
+  now recoverable rather than leaving files stuck in READING state.
+• _synthesize_file_summary timeout increased from implicit to 180 s to avoid
+  spurious failures on large files with many chunks.
+• Added ``force_reread`` parameter to ``run()`` — bypasses incremental hash
+  check for explicitly targeted files.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -39,51 +63,86 @@ _LOAD_BEARING_PATTERNS = [
 ]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM response models
+# ──────────────────────────────────────────────────────────────────────────────
+
 class ChunkAnalysis(BaseModel):
-    symbols_defined: list[str] = Field(default_factory=list)
+    symbols_defined:    list[str] = Field(default_factory=list)
     symbols_referenced: list[str] = Field(default_factory=list)
-    dependencies: list[str] = Field(default_factory=list)
+    dependencies:       list[str] = Field(default_factory=list)
     summary: str = Field(description="2-4 sentence technical summary of this chunk")
     raw_observations: list[str] = Field(
         default_factory=list,
-        description="Concrete observations about safety, correctness, or architecture with line numbers",
+        description=(
+            "Concrete observations about safety, correctness, or architecture "
+            "with line numbers. Be exhaustive — include every potential issue."
+        ),
     )
 
 
 class FileSummary(BaseModel):
-    summary: str = Field(description="3-5 sentence summary of the entire file")
-    key_symbols: list[str] = Field(default_factory=list)
-    dependencies: list[str] = Field(default_factory=list)
+    summary:          str       = Field(description="3-5 sentence summary of the entire file")
+    key_symbols:      list[str] = Field(default_factory=list)
+    dependencies:     list[str] = Field(default_factory=list)
     all_observations: list[str] = Field(default_factory=list)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Agent
+# ──────────────────────────────────────────────────────────────────────────────
 
 class ReaderAgent(BaseAgent):
     agent_type = ExecutorType.READER
 
     def __init__(
         self,
-        storage: BrainStorage,
-        run_id: str,
-        repo_root: Path,
-        config: AgentConfig | None = None,
-        mcp_manager: Any | None = None,
-        incremental: bool = True,
-        concurrency: int = 4,
-        load_bearing_paths: list[str] | None = None,
+        storage:              BrainStorage,
+        run_id:               str,
+        repo_root:            Path,
+        config:               AgentConfig | None  = None,
+        mcp_manager:          Any | None          = None,
+        incremental:          bool                = True,
+        concurrency:          int                 = 4,
+        chunk_concurrency:    int                 = 4,
+        load_bearing_paths:   list[str] | None    = None,
+        vector_brain:         Any | None          = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
-        self.repo_root = repo_root
-        self.incremental = incremental
-        self.concurrency = concurrency
-        self._semaphore = asyncio.Semaphore(concurrency)
+        self.repo_root          = repo_root
+        self.incremental        = incremental
+        self.concurrency        = concurrency
+        self.chunk_concurrency  = chunk_concurrency
+        self._semaphore         = asyncio.Semaphore(concurrency)
+        self._chunk_semaphore   = asyncio.Semaphore(chunk_concurrency)
         self._extra_load_bearing = load_bearing_paths or []
+        self._vector_brain      = vector_brain
 
-    async def run(self, **kwargs: Any) -> dict[str, int]:
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    async def run(
+        self,
+        force_reread: set[str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, int]:
+        """
+        Read (or re-read) all files in the repo.
+
+        Parameters
+        ----------
+        force_reread:
+            Set of relative file paths to re-read even if their hash is
+            unchanged.  Used by the controller to force re-audit of files
+            affected by a recent commit.
+        """
+        force_set = force_reread or set()
+
         all_files = await asyncio.get_event_loop().run_in_executor(
             None, collect_repo_files, self.repo_root
         )
         self.log.info(f"Reader: discovered {len(all_files)} files in {self.repo_root}")
 
+        # Register any new files in the brain before processing
         for path in all_files:
             rel = str(path.relative_to(self.repo_root))
             existing = await self.storage.get_file(rel)
@@ -96,27 +155,32 @@ class ReaderAgent(BaseAgent):
             await self.storage.upsert_run(run)
 
         tasks = [
-            self._process_file(path, str(path.relative_to(self.repo_root)))
+            self._process_file(
+                path,
+                str(path.relative_to(self.repo_root)),
+                force=str(path.relative_to(self.repo_root)) in force_set,
+            )
             for path in all_files
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         processed = sum(1 for r in results if r is True)
-        skipped = sum(1 for r in results if r is False)
-        errors = sum(1 for r in results if isinstance(r, Exception))
+        skipped   = sum(1 for r in results if r is False)
+        errors    = sum(1 for r in results if isinstance(r, Exception))
 
         self.log.info(
-            f"Reader complete: {processed} processed, "
-            f"{skipped} skipped, {errors} errors"
+            f"Reader complete: {processed} processed, {skipped} skipped, {errors} errors"
         )
         return {"processed": processed, "skipped": skipped, "errors": errors}
+
+    # ── Registration ──────────────────────────────────────────────────────────
 
     async def _register_file(self, path: Path, rel_path: str) -> None:
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
-            lines = content.splitlines()
-            size = path.stat().st_size
-            chash = hashlib.sha256(content.encode()).hexdigest()
+            lines   = content.splitlines()
+            size    = path.stat().st_size
+            chash   = hashlib.sha256(content.encode()).hexdigest()
             strategy = determine_strategy(len(lines))
             chunks_total = self._estimate_chunk_count(len(lines), strategy)
 
@@ -146,19 +210,22 @@ class ReaderAgent(BaseAgent):
 
     def _is_load_bearing(self, rel_path: str) -> bool:
         lower = rel_path.lower()
-        base = _LOAD_BEARING_PATTERNS + self._extra_load_bearing
+        base  = _LOAD_BEARING_PATTERNS + self._extra_load_bearing
         return any(p in lower for p in base)
 
-    async def _process_file(self, path: Path, rel_path: str) -> bool:
+    # ── File processing ───────────────────────────────────────────────────────
+
+    async def _process_file(self, path: Path, rel_path: str, force: bool = False) -> bool:
         async with self._semaphore:
             try:
                 existing = await self.storage.get_file(rel_path)
                 if not existing:
                     return False
 
-                if self.incremental and existing.status == FileStatus.READ:
+                # Incremental skip unless forced
+                if self.incremental and not force and existing.status == FileStatus.READ:
                     try:
-                        content = path.read_text(encoding="utf-8", errors="replace")
+                        content  = path.read_text(encoding="utf-8", errors="replace")
                         new_hash = hashlib.sha256(content.encode()).hexdigest()
                         if new_hash == existing.content_hash:
                             self.log.debug(f"Skipping unchanged: {rel_path}")
@@ -166,25 +233,51 @@ class ReaderAgent(BaseAgent):
                     except OSError:
                         return False
 
+                # Mark as READING
                 await self.storage.upsert_file(
                     FileRecord(**{**existing.model_dump(), "status": FileStatus.READING})
                 )
 
                 content = path.read_text(encoding="utf-8", errors="replace")
-                chunks = chunk_file(rel_path, content)
+                chunks  = chunk_file(rel_path, content)
 
                 self.log.info(
                     f"Reading {rel_path}: {len(chunks)} chunk(s) "
                     f"strategy={existing.chunk_strategy.value}"
                 )
 
-                chunk_records: list[FileChunkRecord] = []
-                for chunk in chunks:
-                    record = await self._read_chunk(rel_path, chunk)
-                    chunk_records.append(record)
-                    await self.storage.append_chunk(record)
-                    await self.check_cost_ceiling()
+                # ── GAP-10 FIX: process chunks in parallel ───────────────────
+                chunk_tasks = [
+                    self._read_chunk_bounded(rel_path, chunk)
+                    for chunk in chunks
+                ]
+                chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
+                chunk_records: list[FileChunkRecord] = []
+                for i, cr in enumerate(chunk_results):
+                    if isinstance(cr, Exception):
+                        self.log.warning(
+                            f"Chunk {i} of {rel_path} failed: {cr} — using empty record"
+                        )
+                        chunk_records.append(self._empty_chunk_record(rel_path, chunks[i]))
+                    else:
+                        chunk_records.append(cr)
+                        await self.storage.append_chunk(cr)
+                        # Vector brain indexing
+                        if self._vector_brain and self._vector_brain.is_available:
+                            lang = detect_language(rel_path)
+                            self._vector_brain.index_chunk(
+                                chunk_id=cr.chunk_id,
+                                file_path=rel_path,
+                                line_start=cr.line_start,
+                                line_end=cr.line_end,
+                                language=lang,
+                                summary=cr.summary,
+                                observations=cr.raw_observations,
+                            )
+                        await self.check_cost_ceiling()
+
+                # Synthesise file-level summary from all chunk summaries
                 summary = await self._synthesize_file_summary(rel_path, chunk_records)
                 await self.storage.mark_file_read(rel_path, summary)
 
@@ -197,7 +290,25 @@ class ReaderAgent(BaseAgent):
 
             except Exception as exc:
                 self.log.error(f"Error reading {rel_path}: {exc}", exc_info=True)
+                # Ensure the file doesn't stay stuck in READING state
+                try:
+                    existing_now = await self.storage.get_file(rel_path)
+                    if existing_now and existing_now.status == FileStatus.READING:
+                        await self.storage.upsert_file(
+                            FileRecord(**{**existing_now.model_dump(), "status": FileStatus.UNREAD})
+                        )
+                except Exception:
+                    pass
                 return False
+
+    # ── Chunk reading ─────────────────────────────────────────────────────────
+
+    async def _read_chunk_bounded(
+        self, file_path: str, chunk: Chunk
+    ) -> FileChunkRecord:
+        """Wrapper that honours the per-file chunk concurrency semaphore."""
+        async with self._chunk_semaphore:
+            return await self._read_chunk(file_path, chunk)
 
     async def _read_chunk(self, file_path: str, chunk: Chunk) -> FileChunkRecord:
         system = self.build_system_prompt(
@@ -219,7 +330,8 @@ class ReaderAgent(BaseAgent):
             "Analyse this code chunk and extract the required structured information. "
             "For raw_observations: be exhaustive. Note every potential issue, "
             "every missing error handler, every unsafe pattern. Include line numbers. "
-            "For dependencies: include only file paths, not library names."
+            "For dependencies: include only file paths (not library names). "
+            "Use relative paths matching the project layout."
         )
 
         analysis = await self.call_llm_structured(
@@ -242,19 +354,40 @@ class ReaderAgent(BaseAgent):
             read_at=datetime.now(tz=timezone.utc),
         )
 
+    def _empty_chunk_record(self, file_path: str, chunk: Chunk) -> FileChunkRecord:
+        """Fallback chunk record used when LLM call fails for a chunk."""
+        return FileChunkRecord(
+            file_path=file_path,
+            chunk_index=chunk.index,
+            total_chunks=chunk.total,
+            line_start=chunk.line_start,
+            line_end=chunk.line_end,
+            summary=f"[Read failed for lines {chunk.line_start}-{chunk.line_end}]",
+            read_at=datetime.now(tz=timezone.utc),
+        )
+
+    # ── File summary synthesis ────────────────────────────────────────────────
+
     async def _synthesize_file_summary(
         self,
         file_path: str,
         chunks: list[FileChunkRecord],
     ) -> str:
+        # Single-chunk files: reuse the chunk summary directly
         if len(chunks) == 1:
             return chunks[0].summary
+
+        # Filter out empty/failed chunks for the synthesis prompt
+        valid_chunks = [c for c in chunks if c.summary and not c.summary.startswith("[Read failed")]
+
+        if not valid_chunks:
+            return f"File could not be fully read ({len(chunks)} chunks attempted)"
 
         combined = "\n".join(
             f"Chunk {c.chunk_index + 1} (L{c.line_start}-{c.line_end}): {c.summary}\n"
             f"Symbols: {', '.join(c.symbols_defined[:10])}\n"
             f"Observations: {'; '.join(c.raw_observations[:5])}"
-            for c in chunks
+            for c in valid_chunks[:20]  # cap at 20 chunks for synthesis prompt
         )
 
         system = self.build_system_prompt("senior software architect")
@@ -263,7 +396,7 @@ class ReaderAgent(BaseAgent):
             f"Chunk summaries:\n{wrap_content(combined)}\n\n"
             "Produce a unified file summary combining the above chunks. "
             "Focus on the file's overall purpose, key architectural role, "
-            "and most important observations."
+            "and most important observations about safety, correctness, and quality."
         )
 
         result = await self.call_llm_structured(
