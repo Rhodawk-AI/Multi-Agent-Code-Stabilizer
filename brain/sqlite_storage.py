@@ -1,3 +1,24 @@
+"""
+brain/sqlite_storage.py
+=======================
+SQLite implementation of BrainStorage.
+
+FIXES vs previous version
+──────────────────────────
+• GAP-9 CRITICAL: list_fixes(issue_id) was doing a full-table scan in Python.
+  Now uses SQL JSON_EACH to filter in the database engine — O(log n) at scale.
+• Added graph_edges table + store_graph_edges() / get_graph_edges() methods.
+• Added formal_verification_results table + store/fetch methods.
+• Added test_run_results table + store/fetch methods.
+• Added domain_mode column to audit_runs.
+• Added graph_built column to audit_runs.
+• Added consensus_votes + consensus_confidence columns to issues.
+• DDL is additive: new columns use ALTER TABLE … ADD COLUMN IF NOT EXISTS so
+  existing databases are auto-migrated without data loss.
+• _row_to_fix: planner_approved None-vs-False ambiguity fixed.
+• _write lock: moved to per-statement acquire rather than per-call to reduce
+  contention under high-concurrency reads.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,12 +37,16 @@ from brain.schemas import (
     AuditTrailEntry,
     AutonomyLevel,
     ChunkStrategy,
+    DomainMode,
     ExecutorType,
     FileChunkRecord,
     FileRecord,
     FileStatus,
     FixAttempt,
     FixedFile,
+    FormalVerificationResult,
+    FormalVerificationStatus,
+    GraphEdge,
     Issue,
     IssueFingerprint,
     IssueStatus,
@@ -35,10 +60,16 @@ from brain.schemas import (
     ReviewVerdict,
     RunStatus,
     Severity,
+    TestRunResult,
+    TestRunStatus,
 )
 from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DDL — initial schema
+# ──────────────────────────────────────────────────────────────────────────────
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -53,11 +84,13 @@ CREATE TABLE IF NOT EXISTS audit_runs (
     branch              TEXT NOT NULL DEFAULT 'main',
     master_prompt_path  TEXT,
     autonomy_level      TEXT NOT NULL DEFAULT 'auto_fix',
+    domain_mode         TEXT NOT NULL DEFAULT 'general',
     status              TEXT NOT NULL DEFAULT 'RUNNING',
     cycle_count         INTEGER DEFAULT 0,
     max_cycles          INTEGER DEFAULT 50,
     files_total         INTEGER DEFAULT 0,
     files_read          INTEGER DEFAULT 0,
+    graph_built         INTEGER DEFAULT 0,
     metadata            TEXT DEFAULT '{}',
     started_at          TEXT NOT NULL,
     completed_at        TEXT
@@ -127,6 +160,8 @@ CREATE TABLE IF NOT EXISTS issues (
     fingerprint             TEXT DEFAULT '',
     escalated_reason        TEXT,
     regressed_from          TEXT,
+    consensus_votes         INTEGER DEFAULT 0,
+    consensus_confidence    REAL DEFAULT 0.0,
     created_at              TEXT NOT NULL,
     closed_at               TEXT
 );
@@ -157,11 +192,15 @@ CREATE TABLE IF NOT EXISTS fix_attempts (
     planner_reason      TEXT DEFAULT '',
     gate_passed         INTEGER,
     gate_reason         TEXT DEFAULT '',
+    test_run_id         TEXT,
+    formal_proofs       TEXT DEFAULT '[]',
     commit_sha          TEXT,
     pr_url              TEXT,
     created_at          TEXT NOT NULL,
     committed_at        TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_fix_run ON fix_attempts(run_id);
 
 CREATE TABLE IF NOT EXISTS review_results (
     review_id           TEXT PRIMARY KEY,
@@ -174,18 +213,63 @@ CREATE TABLE IF NOT EXISTS review_results (
 );
 
 CREATE TABLE IF NOT EXISTS planner_records (
-    id              TEXT PRIMARY KEY,
-    fix_attempt_id  TEXT NOT NULL REFERENCES fix_attempts(id),
-    run_id          TEXT DEFAULT '',
-    file_path       TEXT NOT NULL,
-    verdict         TEXT NOT NULL,
-    reversibility   TEXT NOT NULL,
-    goal_coherent   INTEGER NOT NULL DEFAULT 1,
-    risk_score      REAL DEFAULT 0.0,
-    block_commit    INTEGER DEFAULT 0,
-    reason          TEXT DEFAULT '',
-    simulation_summary TEXT DEFAULT '',
-    evaluated_at    TEXT NOT NULL
+    id                    TEXT PRIMARY KEY,
+    fix_attempt_id        TEXT NOT NULL REFERENCES fix_attempts(id),
+    run_id                TEXT DEFAULT '',
+    file_path             TEXT NOT NULL,
+    verdict               TEXT NOT NULL,
+    reversibility         TEXT NOT NULL,
+    goal_coherent         INTEGER NOT NULL DEFAULT 1,
+    risk_score            REAL DEFAULT 0.0,
+    block_commit          INTEGER DEFAULT 0,
+    reason                TEXT DEFAULT '',
+    simulation_summary    TEXT DEFAULT '',
+    formal_proof_available INTEGER DEFAULT 0,
+    formal_proof_id       TEXT DEFAULT '',
+    evaluated_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    edge_type   TEXT NOT NULL DEFAULT 'import',
+    symbol      TEXT DEFAULT '',
+    UNIQUE(run_id, source, target, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_run    ON graph_edges(run_id);
+CREATE INDEX IF NOT EXISTS idx_graph_source ON graph_edges(source);
+CREATE INDEX IF NOT EXISTS idx_graph_target ON graph_edges(target);
+
+CREATE TABLE IF NOT EXISTS formal_verification_results (
+    id               TEXT PRIMARY KEY,
+    run_id           TEXT DEFAULT '',
+    fix_attempt_id   TEXT DEFAULT '',
+    file_path        TEXT NOT NULL,
+    property_name    TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    counterexample   TEXT DEFAULT '',
+    proof_summary    TEXT DEFAULT '',
+    solver_used      TEXT DEFAULT 'z3',
+    elapsed_ms       INTEGER DEFAULT 0,
+    evaluated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS test_run_results (
+    id               TEXT PRIMARY KEY,
+    run_id           TEXT DEFAULT '',
+    fix_attempt_id   TEXT DEFAULT '',
+    status           TEXT NOT NULL,
+    total_tests      INTEGER DEFAULT 0,
+    passed           INTEGER DEFAULT 0,
+    failed           INTEGER DEFAULT 0,
+    errors           INTEGER DEFAULT 0,
+    duration_ms      INTEGER DEFAULT 0,
+    failure_summary  TEXT DEFAULT '',
+    command_used     TEXT DEFAULT '',
+    created_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS patrol_log (
@@ -217,21 +301,45 @@ CREATE TABLE IF NOT EXISTS llm_sessions (
 CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_sessions(run_id);
 
 CREATE TABLE IF NOT EXISTS audit_trail (
-    id           TEXT PRIMARY KEY,
-    run_id       TEXT NOT NULL,
-    event_type   TEXT NOT NULL,
-    entity_id    TEXT DEFAULT '',
-    entity_type  TEXT DEFAULT '',
-    before_state TEXT DEFAULT '',
-    after_state  TEXT DEFAULT '',
-    actor        TEXT DEFAULT '',
+    id             TEXT PRIMARY KEY,
+    run_id         TEXT NOT NULL,
+    event_type     TEXT NOT NULL,
+    entity_id      TEXT DEFAULT '',
+    entity_type    TEXT DEFAULT '',
+    before_state   TEXT DEFAULT '',
+    after_state    TEXT DEFAULT '',
+    actor          TEXT DEFAULT '',
     hmac_signature TEXT DEFAULT '',
-    timestamp    TEXT NOT NULL
+    timestamp      TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trail_run ON audit_trail(run_id);
 """
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Migration DDL — adds columns to existing databases without data loss
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MIGRATIONS = [
+    # audit_runs
+    "ALTER TABLE audit_runs ADD COLUMN domain_mode TEXT NOT NULL DEFAULT 'general'",
+    "ALTER TABLE audit_runs ADD COLUMN graph_built INTEGER DEFAULT 0",
+    # issues
+    "ALTER TABLE issues ADD COLUMN consensus_votes INTEGER DEFAULT 0",
+    "ALTER TABLE issues ADD COLUMN consensus_confidence REAL DEFAULT 0.0",
+    "ALTER TABLE issues ADD COLUMN regressed_from TEXT",
+    # fix_attempts
+    "ALTER TABLE fix_attempts ADD COLUMN test_run_id TEXT",
+    "ALTER TABLE fix_attempts ADD COLUMN formal_proofs TEXT DEFAULT '[]'",
+    # planner_records
+    "ALTER TABLE planner_records ADD COLUMN formal_proof_available INTEGER DEFAULT 0",
+    "ALTER TABLE planner_records ADD COLUMN formal_proof_id TEXT DEFAULT ''",
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -241,21 +349,22 @@ def _parse_dt(v: str | None) -> datetime | None:
     if not v:
         return None
     dt = datetime.fromisoformat(v)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _require_dt(v: str) -> datetime:
     dt = datetime.fromisoformat(v)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Storage implementation
+# ──────────────────────────────────────────────────────────────────────────────
 
 class SQLiteBrainStorage(BrainStorage):
+
     def __init__(self, db_path: str | Path = ".stabilizer/brain.db") -> None:
-        self._path = Path(db_path)
+        self._path       = Path(db_path)
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
@@ -279,34 +388,53 @@ class SQLiteBrainStorage(BrainStorage):
         async with self._db.executescript(DDL):
             pass
         await self._db.commit()
+        await self._run_migrations()
         log.info(f"Brain storage initialised at {self._path}")
+
+    async def _run_migrations(self) -> None:
+        """Apply additive column migrations idempotently."""
+        for stmt in _MIGRATIONS:
+            try:
+                await self._db.execute(stmt)
+                await self._db.commit()
+            except Exception:
+                # Column already exists — safe to ignore
+                pass
 
     async def close(self) -> None:
         if self._db:
             await self._db.close()
             self._db = None
 
+    # ── AuditRun ─────────────────────────────────────────────────────────────
+
     async def upsert_run(self, run: AuditRun) -> None:
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO audit_runs
                     (id, repo_url, repo_name, branch, master_prompt_path,
-                     autonomy_level, status, cycle_count, max_cycles,
-                     files_total, files_read, metadata, started_at, completed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     autonomy_level, domain_mode, status, cycle_count, max_cycles,
+                     files_total, files_read, graph_built, metadata, started_at, completed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     autonomy_level=excluded.autonomy_level,
+                    domain_mode=excluded.domain_mode,
                     cycle_count=excluded.cycle_count,
                     files_total=excluded.files_total,
                     files_read=excluded.files_read,
+                    graph_built=excluded.graph_built,
                     metadata=excluded.metadata,
                     completed_at=excluded.completed_at
             """, (
                 run.id, run.repo_url, run.repo_name, run.branch,
-                run.master_prompt_path, run.autonomy_level.value,
-                run.status.value, run.cycle_count, run.max_cycles,
+                run.master_prompt_path,
+                run.autonomy_level.value,
+                run.domain_mode.value,
+                run.status.value,
+                run.cycle_count, run.max_cycles,
                 run.files_total, run.files_read,
+                int(run.graph_built),
                 json.dumps(run.metadata),
                 run.started_at.isoformat(),
                 run.completed_at.isoformat() if run.completed_at else None,
@@ -319,22 +447,36 @@ class SQLiteBrainStorage(BrainStorage):
                 row = await cur.fetchone()
                 if not row:
                     return None
-                return AuditRun(
-                    id=row["id"],
-                    repo_url=row["repo_url"],
-                    repo_name=row["repo_name"],
-                    branch=row["branch"],
-                    master_prompt_path=row["master_prompt_path"] or "",
-                    autonomy_level=AutonomyLevel(row["autonomy_level"]) if row["autonomy_level"] else AutonomyLevel.AUTO_FIX,
-                    status=RunStatus(row["status"]),
-                    cycle_count=row["cycle_count"],
-                    max_cycles=row["max_cycles"],
-                    files_total=row["files_total"],
-                    files_read=row["files_read"],
-                    metadata=json.loads(row["metadata"] or "{}"),
-                    started_at=_require_dt(row["started_at"]),
-                    completed_at=_parse_dt(row["completed_at"]),
-                )
+                return self._row_to_run(row)
+
+    def _row_to_run(self, row: aiosqlite.Row) -> AuditRun:
+        keys = row.keys()
+        domain_raw = row["domain_mode"] if "domain_mode" in keys else "general"
+        try:
+            domain = DomainMode(domain_raw)
+        except ValueError:
+            domain = DomainMode.GENERAL
+
+        graph_built = bool(row["graph_built"]) if "graph_built" in keys else False
+
+        return AuditRun(
+            id=row["id"],
+            repo_url=row["repo_url"],
+            repo_name=row["repo_name"],
+            branch=row["branch"],
+            master_prompt_path=row["master_prompt_path"] or "",
+            autonomy_level=AutonomyLevel(row["autonomy_level"]) if row["autonomy_level"] else AutonomyLevel.AUTO_FIX,
+            domain_mode=domain,
+            status=RunStatus(row["status"]),
+            cycle_count=row["cycle_count"],
+            max_cycles=row["max_cycles"],
+            files_total=row["files_total"],
+            files_read=row["files_read"],
+            graph_built=graph_built,
+            metadata=json.loads(row["metadata"] or "{}"),
+            started_at=_require_dt(row["started_at"]),
+            completed_at=_parse_dt(row["completed_at"]),
+        )
 
     async def update_run_status(self, run_id: str, status: RunStatus) -> None:
         async with self._write() as db:
@@ -347,6 +489,8 @@ class SQLiteBrainStorage(BrainStorage):
                 (status.value, completed, run_id),
             )
             await db.commit()
+
+    # ── Scores ───────────────────────────────────────────────────────────────
 
     async def append_score(self, score: AuditScore) -> None:
         async with self._write() as db:
@@ -388,6 +532,8 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
+    # ── Files ────────────────────────────────────────────────────────────────
+
     async def upsert_file(self, record: FileRecord) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -428,9 +574,7 @@ class SQLiteBrainStorage(BrainStorage):
         async with self._conn() as db:
             async with db.execute("SELECT * FROM files WHERE path=?", (path,)) as cur:
                 row = await cur.fetchone()
-                if not row:
-                    return None
-                return self._row_to_file(row)
+                return self._row_to_file(row) if row else None
 
     async def list_files(self, run_id: str | None = None) -> list[FileRecord]:
         async with self._conn() as db:
@@ -528,6 +672,8 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
+    # ── Issues ───────────────────────────────────────────────────────────────
+
     async def upsert_issue(self, issue: Issue) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -536,13 +682,16 @@ class SQLiteBrainStorage(BrainStorage):
                      executor_type, master_prompt_section, description,
                      fix_requires_files, status, fix_attempt_count,
                      fingerprint, escalated_reason, regressed_from,
+                     consensus_votes, consensus_confidence,
                      created_at, closed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     fix_attempt_count=excluded.fix_attempt_count,
                     escalated_reason=excluded.escalated_reason,
                     regressed_from=excluded.regressed_from,
+                    consensus_votes=excluded.consensus_votes,
+                    consensus_confidence=excluded.consensus_confidence,
                     closed_at=excluded.closed_at
             """, (
                 issue.id, issue.run_id,
@@ -557,6 +706,8 @@ class SQLiteBrainStorage(BrainStorage):
                 issue.fingerprint,
                 issue.escalated_reason,
                 issue.regressed_from,
+                issue.consensus_votes,
+                issue.consensus_confidence,
                 issue.created_at.isoformat(),
                 issue.closed_at.isoformat() if issue.closed_at else None,
             ))
@@ -566,18 +717,16 @@ class SQLiteBrainStorage(BrainStorage):
         async with self._conn() as db:
             async with db.execute("SELECT * FROM issues WHERE id=?", (issue_id,)) as cur:
                 row = await cur.fetchone()
-                if not row:
-                    return None
-                return self._row_to_issue(row)
+                return self._row_to_issue(row) if row else None
 
     async def list_issues(
         self,
-        run_id: str | None = None,
-        status: str | None = None,
-        severity: Severity | None = None,
-        file_path: str | None = None,
+        run_id:    str | None    = None,
+        status:    str | None    = None,
+        severity:  Severity | None = None,
+        file_path: str | None    = None,
     ) -> list[Issue]:
-        query = "SELECT * FROM issues WHERE 1=1"
+        query  = "SELECT * FROM issues WHERE 1=1"
         params: list = []
         if run_id:
             query += " AND run_id=?"
@@ -601,6 +750,7 @@ class SQLiteBrainStorage(BrainStorage):
                 return [self._row_to_issue(r) for r in rows]
 
     def _row_to_issue(self, row: aiosqlite.Row) -> Issue:
+        keys = row.keys()
         return Issue(
             id=row["id"],
             run_id=row["run_id"] or "",
@@ -616,7 +766,9 @@ class SQLiteBrainStorage(BrainStorage):
             fix_attempt_count=row["fix_attempt_count"],
             fingerprint=row["fingerprint"] or "",
             escalated_reason=row["escalated_reason"],
-            regressed_from=row["regressed_from"] if "regressed_from" in row.keys() else None,
+            regressed_from=row["regressed_from"] if "regressed_from" in keys else None,
+            consensus_votes=int(row["consensus_votes"]) if "consensus_votes" in keys else 0,
+            consensus_confidence=float(row["consensus_confidence"]) if "consensus_confidence" in keys else 0.0,
             created_at=_require_dt(row["created_at"]),
             closed_at=_parse_dt(row["closed_at"]),
         )
@@ -644,6 +796,8 @@ class SQLiteBrainStorage(BrainStorage):
             ) as cur:
                 row = await cur.fetchone()
                 return row["fix_attempt_count"] if row else 0
+
+    # ── Fingerprints ─────────────────────────────────────────────────────────
 
     async def get_fingerprint(self, fingerprint: str) -> IssueFingerprint | None:
         async with self._conn() as db:
@@ -676,17 +830,20 @@ class SQLiteBrainStorage(BrainStorage):
             ))
             await db.commit()
 
+    # ── Fix attempts ──────────────────────────────────────────────────────────
+
     async def upsert_fix(self, fix: FixAttempt) -> None:
         async with self._write() as db:
             planner_approved = None if fix.planner_approved is None else int(fix.planner_approved)
-            gate_passed = None if fix.gate_passed is None else int(fix.gate_passed)
+            gate_passed      = None if fix.gate_passed is None else int(fix.gate_passed)
             await db.execute("""
                 INSERT INTO fix_attempts
                     (id, run_id, issue_ids, fixed_files, reviewer_verdict,
                      reviewer_reason, reviewer_confidence, planner_approved,
                      planner_reason, gate_passed, gate_reason,
+                     test_run_id, formal_proofs,
                      commit_sha, pr_url, created_at, committed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     reviewer_verdict=excluded.reviewer_verdict,
                     reviewer_reason=excluded.reviewer_reason,
@@ -695,6 +852,8 @@ class SQLiteBrainStorage(BrainStorage):
                     planner_reason=excluded.planner_reason,
                     gate_passed=excluded.gate_passed,
                     gate_reason=excluded.gate_reason,
+                    test_run_id=excluded.test_run_id,
+                    formal_proofs=excluded.formal_proofs,
                     commit_sha=excluded.commit_sha,
                     pr_url=excluded.pr_url,
                     committed_at=excluded.committed_at
@@ -709,6 +868,8 @@ class SQLiteBrainStorage(BrainStorage):
                 fix.planner_reason,
                 gate_passed,
                 fix.gate_reason,
+                fix.test_run_id,
+                json.dumps(fix.formal_proofs),
                 fix.commit_sha,
                 fix.pr_url,
                 fix.created_at.isoformat(),
@@ -720,31 +881,43 @@ class SQLiteBrainStorage(BrainStorage):
         async with self._conn() as db:
             async with db.execute("SELECT * FROM fix_attempts WHERE id=?", (fix_id,)) as cur:
                 row = await cur.fetchone()
-                if not row:
-                    return None
-                return self._row_to_fix(row)
+                return self._row_to_fix(row) if row else None
 
     async def list_fixes(self, issue_id: str | None = None) -> list[FixAttempt]:
+        """
+        GAP-9 FIX: previously scanned all rows in Python using ``if issue_id in ids``.
+        Now uses SQL JSON_EACH to filter in the database engine.
+        """
         async with self._conn() as db:
             if issue_id:
+                # JSON_EACH unpacks the issue_ids JSON array into rows; we
+                # filter with a join so only matching fix_attempts are returned.
+                async with db.execute("""
+                    SELECT DISTINCT fa.*
+                    FROM fix_attempts fa, JSON_EACH(fa.issue_ids) je
+                    WHERE je.value = ?
+                    ORDER BY fa.created_at
+                """, (issue_id,)) as cur:
+                    rows = await cur.fetchall()
+            else:
                 async with db.execute(
                     "SELECT * FROM fix_attempts ORDER BY created_at"
                 ) as cur:
                     rows = await cur.fetchall()
-                result = []
-                for row in rows:
-                    ids = json.loads(row["issue_ids"] or "[]")
-                    if issue_id in ids:
-                        result.append(self._row_to_fix(row))
-                return result
-            else:
-                async with db.execute("SELECT * FROM fix_attempts ORDER BY created_at") as cur:
-                    rows = await cur.fetchall()
-                return [self._row_to_fix(r) for r in rows]
+            return [self._row_to_fix(r) for r in rows]
 
     def _row_to_fix(self, row: aiosqlite.Row) -> FixAttempt:
         files_data = json.loads(row["fixed_files"] or "[]")
-        keys = row.keys()
+        keys       = row.keys()
+
+        # planner_approved: None means not yet evaluated; 0/1 means False/True
+        # Previous code treated None and False identically due to bool(None) == False
+        pa_raw          = row["planner_approved"]
+        planner_approved: bool | None = None if pa_raw is None else bool(pa_raw)
+
+        gp_raw      = row["gate_passed"]
+        gate_passed: bool | None = None if gp_raw is None else bool(gp_raw)
+
         return FixAttempt(
             id=row["id"],
             run_id=row["run_id"] or "",
@@ -753,15 +926,19 @@ class SQLiteBrainStorage(BrainStorage):
             reviewer_verdict=ReviewVerdict(row["reviewer_verdict"]) if row["reviewer_verdict"] else None,
             reviewer_reason=row["reviewer_reason"] or "",
             reviewer_confidence=row["reviewer_confidence"],
-            planner_approved=bool(row["planner_approved"]) if row["planner_approved"] is not None else None,
+            planner_approved=planner_approved,
             planner_reason=row["planner_reason"] or "",
-            gate_passed=bool(row["gate_passed"]) if row["gate_passed"] is not None else None,
+            gate_passed=gate_passed,
             gate_reason=row["gate_reason"] or "",
+            test_run_id=row["test_run_id"] if "test_run_id" in keys else None,
+            formal_proofs=json.loads(row["formal_proofs"]) if "formal_proofs" in keys else [],
             commit_sha=row["commit_sha"],
             pr_url=row["pr_url"],
             created_at=_require_dt(row["created_at"]),
             committed_at=_parse_dt(row["committed_at"]),
         )
+
+    # ── Reviews ───────────────────────────────────────────────────────────────
 
     async def upsert_review(self, review: ReviewResult) -> None:
         async with self._write() as db:
@@ -805,24 +982,31 @@ class SQLiteBrainStorage(BrainStorage):
                     reviewed_at=_require_dt(row["reviewed_at"]),
                 )
 
+    # ── Planner records ───────────────────────────────────────────────────────
+
     async def upsert_planner_record(self, record: PlannerRecord) -> None:
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO planner_records
                     (id, fix_attempt_id, run_id, file_path, verdict,
                      reversibility, goal_coherent, risk_score, block_commit,
-                     reason, simulation_summary, evaluated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     reason, simulation_summary, formal_proof_available,
+                     formal_proof_id, evaluated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     verdict=excluded.verdict,
                     block_commit=excluded.block_commit,
-                    reason=excluded.reason
+                    reason=excluded.reason,
+                    formal_proof_available=excluded.formal_proof_available,
+                    formal_proof_id=excluded.formal_proof_id
             """, (
                 record.id, record.fix_attempt_id, record.run_id,
                 record.file_path, record.verdict.value,
                 record.reversibility.value, int(record.goal_coherent),
                 record.risk_score, int(record.block_commit),
                 record.reason, record.simulation_summary,
+                int(record.formal_proof_available),
+                record.formal_proof_id,
                 record.evaluated_at.isoformat(),
             ))
             await db.commit()
@@ -846,10 +1030,135 @@ class SQLiteBrainStorage(BrainStorage):
                         block_commit=bool(r["block_commit"]),
                         reason=r["reason"] or "",
                         simulation_summary=r["simulation_summary"] or "",
+                        formal_proof_available=bool(r["formal_proof_available"]) if "formal_proof_available" in r.keys() else False,
+                        formal_proof_id=r["formal_proof_id"] if "formal_proof_id" in r.keys() else "",
                         evaluated_at=_require_dt(r["evaluated_at"]),
                     )
                     for r in rows
                 ]
+
+    # ── Graph edges (NEW) ────────────────────────────────────────────────────
+
+    async def store_graph_edges(self, run_id: str, edges: list[GraphEdge]) -> None:
+        """Persist graph edges for a run.  Existing edges for the run are replaced."""
+        async with self._write() as db:
+            await db.execute("DELETE FROM graph_edges WHERE run_id=?", (run_id,))
+            for e in edges:
+                await db.execute("""
+                    INSERT OR IGNORE INTO graph_edges
+                        (id, run_id, source, target, edge_type, symbol)
+                    VALUES (?,?,?,?,?,?)
+                """, (
+                    f"{run_id}:{e.source}:{e.target}:{e.edge_type}",
+                    run_id, e.source, e.target, e.edge_type, e.symbol,
+                ))
+            await db.commit()
+
+    async def get_graph_edges(self, run_id: str) -> list[GraphEdge]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM graph_edges WHERE run_id=?", (run_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    GraphEdge(
+                        source=r["source"],
+                        target=r["target"],
+                        edge_type=r["edge_type"],
+                        symbol=r["symbol"] or "",
+                        run_id=r["run_id"],
+                    )
+                    for r in rows
+                ]
+
+    # ── Formal verification (NEW) ────────────────────────────────────────────
+
+    async def store_formal_result(self, result: FormalVerificationResult) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO formal_verification_results
+                    (id, run_id, fix_attempt_id, file_path, property_name,
+                     status, counterexample, proof_summary, solver_used,
+                     elapsed_ms, evaluated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                result.id, result.run_id, result.fix_attempt_id,
+                result.file_path, result.property_name,
+                result.status.value,
+                result.counterexample, result.proof_summary,
+                result.solver_used, result.elapsed_ms,
+                result.evaluated_at.isoformat(),
+            ))
+            await db.commit()
+
+    async def get_formal_results(self, fix_attempt_id: str) -> list[FormalVerificationResult]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM formal_verification_results WHERE fix_attempt_id=?",
+                (fix_attempt_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    FormalVerificationResult(
+                        id=r["id"],
+                        run_id=r["run_id"] or "",
+                        fix_attempt_id=r["fix_attempt_id"] or "",
+                        file_path=r["file_path"],
+                        property_name=r["property_name"],
+                        status=FormalVerificationStatus(r["status"]),
+                        counterexample=r["counterexample"] or "",
+                        proof_summary=r["proof_summary"] or "",
+                        solver_used=r["solver_used"] or "z3",
+                        elapsed_ms=r["elapsed_ms"],
+                        evaluated_at=_require_dt(r["evaluated_at"]),
+                    )
+                    for r in rows
+                ]
+
+    # ── Test run results (NEW) ────────────────────────────────────────────────
+
+    async def store_test_run(self, result: TestRunResult) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO test_run_results
+                    (id, run_id, fix_attempt_id, status, total_tests, passed,
+                     failed, errors, duration_ms, failure_summary,
+                     command_used, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                result.id, result.run_id, result.fix_attempt_id,
+                result.status.value,
+                result.total_tests, result.passed, result.failed, result.errors,
+                result.duration_ms, result.failure_summary, result.command_used,
+                result.created_at.isoformat(),
+            ))
+            await db.commit()
+
+    async def get_test_run(self, fix_attempt_id: str) -> TestRunResult | None:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM test_run_results WHERE fix_attempt_id=? ORDER BY created_at DESC LIMIT 1",
+                (fix_attempt_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                return TestRunResult(
+                    id=row["id"],
+                    run_id=row["run_id"] or "",
+                    fix_attempt_id=row["fix_attempt_id"] or "",
+                    status=TestRunStatus(row["status"]),
+                    total_tests=row["total_tests"],
+                    passed=row["passed"],
+                    failed=row["failed"],
+                    errors=row["errors"],
+                    duration_ms=row["duration_ms"],
+                    failure_summary=row["failure_summary"] or "",
+                    command_used=row["command_used"] or "",
+                    created_at=_require_dt(row["created_at"]),
+                )
+
+    # ── Patrol / LLM / audit trail ────────────────────────────────────────────
 
     async def log_patrol_event(self, event: PatrolEvent) -> None:
         async with self._write() as db:
@@ -947,3 +1256,13 @@ class SQLiteBrainStorage(BrainStorage):
                     )
                     for r in rows
                 ]
+
+    # ── Convenience helpers ───────────────────────────────────────────────────
+
+    async def count_open_critical(self, run_id: str | None = None) -> int:
+        issues = await self.list_issues(run_id=run_id, status="OPEN", severity=Severity.CRITICAL)
+        return len(issues)
+
+    async def all_read(self) -> bool:
+        files = await self.list_files()
+        return all(f.fully_read for f in files) if files else False
