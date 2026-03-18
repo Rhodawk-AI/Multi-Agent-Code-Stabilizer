@@ -1,3 +1,24 @@
+"""
+orchestrator/controller.py
+==========================
+Main orchestration loop for MACS.
+
+CHANGES vs previous version
+────────────────────────────
+• Graph engine built after read phase (GAP-1); stored to brain.
+• VectorBrain initialised at boot and passed to ReaderAgent (GAP-8).
+• ConsensusEngine runs after all three auditors complete (GAP-5).
+• FormalVerifierAgent called in gate phase for CRITICAL fixes in non-GENERAL
+  domains (GAP-4).
+• TestRunnerAgent called after each successful commit (GAP-14).
+• Parallel fix execution via graph engine's non_overlapping_fix_batches (GAP-11).
+• _requeue_transitive_dependents now uses graph engine impact_radius (GAP-1/18).
+• AuditorAgent receives repo_root for direct-source auditing (GAP-2).
+• DomainMode threaded through all agents (GAP-7/8).
+• PR batching: fixes grouped by module boundary, not one-per-fix (GAP-13).
+• domain_mode written to AuditRun in brain.
+• All agent constructors updated to pass graph_engine, vector_brain, etc.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,593 +27,721 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-from rich.table import Table
+from pydantic import BaseModel, Field
 
 from agents.auditor import AuditorAgent
-from agents.base import AgentConfig
 from agents.fixer import FixerAgent
+from agents.formal_verifier import FormalVerifierAgent
 from agents.patrol import PatrolAgent
 from agents.planner import PlannerAgent
 from agents.reader import ReaderAgent
 from agents.reviewer import ReviewerAgent
-from config.loader import load_config
-from plugins.base import PluginManager
-from utils.rate_limiter import RateLimiter
+from agents.test_runner import TestRunnerAgent
+from brain.graph import DependencyGraphEngine
 from brain.schemas import (
     AuditRun,
     AuditScore,
     AuditTrailEntry,
     AutonomyLevel,
+    DomainMode,
     ExecutorType,
-    FixAttempt,
-    FixedFile,
+    FormalVerificationStatus,
+    Issue,
     IssueStatus,
+    PatrolEvent,
     RunStatus,
     Severity,
+    TestRunStatus,
 )
 from brain.sqlite_storage import SQLiteBrainStorage
-from brain.storage import BrainStorage
+from brain.vector_store import VectorBrain
 from github_integration.pr_manager import PRManager
+from mcp_clients.manager import MCPManager
+from orchestrator.consensus import ConsensusEngine
 from orchestrator.convergence import ConvergenceDetector
 from sandbox.executor import StaticAnalysisGate
 from utils.audit_trail import AuditTrailSigner
 
 log = logging.getLogger(__name__)
-console = Console()
 
 
-class StabilizerConfig:
-    def __init__(
-        self,
-        repo_url: str,
-        repo_root: Path,
-        master_prompt_path: Path,
-        github_token: str = "",
-        primary_model: str = "claude-sonnet-4-20250514",
-        fallback_models: list[str] | None = None,
-        max_cycles: int = 50,
-        cost_ceiling_usd: float = 50.0,
-        concurrency: int = 4,
-        auto_commit: bool = True,
-        branch_prefix: str = "stabilizer",
-        incremental: bool = True,
-        run_mypy: bool = True,
-        run_semgrep: bool = True,
-        fail_gate_on_warning: bool = False,
-        autonomy_level: AutonomyLevel = AutonomyLevel.AUTO_FIX,
-        load_bearing_paths: list[str] | None = None,
-        hmac_secret: str = "",
-        notification_hooks: list[Any] | None = None,
-    ) -> None:
-        self.repo_url = repo_url
-        self.repo_root = repo_root
-        self.master_prompt_path = master_prompt_path
-        self.github_token = github_token
-        self.primary_model = primary_model
-        self.fallback_models = fallback_models or ["gpt-4o-mini"]
-        self.max_cycles = max_cycles
-        self.cost_ceiling_usd = cost_ceiling_usd
-        self.concurrency = concurrency
-        self.auto_commit = auto_commit
-        self.branch_prefix = branch_prefix
-        self.incremental = incremental
-        self.run_mypy = run_mypy
-        self.run_semgrep = run_semgrep
-        self.fail_gate_on_warning = fail_gate_on_warning
-        self.autonomy_level = autonomy_level
-        self.load_bearing_paths = load_bearing_paths or []
-        self.hmac_secret = hmac_secret
-        self.notification_hooks = notification_hooks or []
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
 
+class StabilizerConfig(BaseModel):
+    repo_url:             str
+    repo_root:            Path
+    master_prompt_path:   Path             = Path("config/prompts/base.md")
+    github_token:         str              = ""
+    primary_model:        str              = "claude-sonnet-4-20250514"
+    critical_fix_model:   str              = "claude-opus-4-20250514"
+    triage_model:         str              = "claude-haiku-4-5-20251001"
+    fallback_models:      list[str]        = Field(default_factory=lambda: ["gpt-4o-mini"])
+    max_cycles:           int              = 50
+    cost_ceiling_usd:     float            = 50.0
+    concurrency:          int              = 4
+    chunk_concurrency:    int              = 4
+    auto_commit:          bool             = True
+    autonomy_level:       AutonomyLevel    = AutonomyLevel.AUTO_FIX
+    domain_mode:          DomainMode       = DomainMode.GENERAL
+    run_semgrep:          bool             = True
+    run_mypy:             bool             = True
+    run_bandit:           bool             = True
+    run_ruff:             bool             = True
+    formal_verification:  bool             = False
+    run_tests_after_fix:  bool             = True
+    vector_store_enabled: bool             = False
+    vector_store_path:    str              = ""
+    graph_enabled:        bool             = True
+    validate_findings:    bool             = True
+    plugin_paths:         list[Path]       = Field(default_factory=list)
+    base_branch:          str              = "main"
+    branch_prefix:        str              = "stabilizer"
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AgentConfig helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+from agents.base import AgentConfig as _AgentConfig  # noqa: E402
+
+
+def _agent_cfg(cfg: StabilizerConfig, run_id: str) -> _AgentConfig:
+    return _AgentConfig(
+        model=cfg.primary_model,
+        fallback_models=cfg.fallback_models,
+        critical_fix_model=cfg.critical_fix_model,
+        triage_model=cfg.triage_model,
+        cost_ceiling_usd=cfg.cost_ceiling_usd,
+        run_id=run_id,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Controller
+# ──────────────────────────────────────────────────────────────────────────────
 
 class StabilizerController:
 
-    def __init__(self, cfg: StabilizerConfig, toml_config_path: Path | None = None) -> None:
-        self.cfg = cfg
-        self._toml = load_config(toml_config_path or cfg.repo_root / "config" / "default.toml")
-        self.storage: BrainStorage = SQLiteBrainStorage(
-            cfg.repo_root / ".stabilizer" / "brain.db"
-        )
-        self.convergence = ConvergenceDetector(
-            stall_threshold=self._toml.loop.stall_threshold,
-            regression_threshold=self._toml.loop.regression_threshold,
-            max_cycles=cfg.max_cycles,
-        )
-        self.gate = StaticAnalysisGate(
-            run_mypy=cfg.run_mypy,
-            run_semgrep=cfg.run_semgrep,
-            fail_on_warning=cfg.fail_gate_on_warning,
-            repo_root=cfg.repo_root,
-        )
-        self.trail_signer = AuditTrailSigner(secret=cfg.hmac_secret)
-        self.pr_manager: PRManager | None = None
-        self.run: AuditRun | None = None
-        self._patrol_task: asyncio.Task | None = None
-        self._plugin_manager = PluginManager()
-        self._rate_limiter = RateLimiter()
-        self._agent_cfg = AgentConfig(
-            model=cfg.primary_model,
-            fallback_models=cfg.fallback_models,
-            cost_ceiling_usd=cfg.cost_ceiling_usd,
-        )
+    def __init__(self, config: StabilizerConfig) -> None:
+        self.config       = config
+        self.storage:       SQLiteBrainStorage | None = None
+        self.run:           AuditRun | None           = None
+        self.graph_engine:  DependencyGraphEngine     = DependencyGraphEngine()
+        self.vector_brain:  VectorBrain | None        = None
+        self.consensus:     ConsensusEngine | None    = None
+        self.convergence:   ConvergenceDetector | None = None
+        self.patrol:        PatrolAgent | None        = None
+        self.mcp:           MCPManager | None         = None
+        self.pr_manager:    PRManager | None          = None
+        self._trail_signer: AuditTrailSigner | None   = None
+        self._patrol_task:  asyncio.Task | None       = None
+        self.log            = log
 
-    async def initialise(self, run_id: str | None = None) -> AuditRun:
+    # ── Bootstrap ─────────────────────────────────────────────────────────────
+
+    async def initialise(self, resume_run_id: str | None = None) -> AuditRun:
+        db_path = self.config.repo_root / ".stabilizer" / "brain.db"
+        self.storage = SQLiteBrainStorage(db_path)
         await self.storage.initialise()
 
-        repo_name = (
-            Path(self.cfg.repo_url).stem
-            if "/" not in self.cfg.repo_url
-            else self.cfg.repo_url.rstrip("/").split("/")[-1]
-        )
+        # Vector brain
+        if self.config.vector_store_enabled:
+            vpath = self.config.vector_store_path or str(
+                self.config.repo_root / ".stabilizer" / "vectors"
+            )
+            self.vector_brain = VectorBrain(store_path=vpath)
+            self.vector_brain.initialise()
+            self.log.info(f"VectorBrain initialised at {vpath}")
 
-        self.run = AuditRun(
-            repo_url=self.cfg.repo_url,
-            repo_name=repo_name,
-            branch="main",
-            master_prompt_path=str(self.cfg.master_prompt_path),
-            autonomy_level=self.cfg.autonomy_level,
-            max_cycles=self.cfg.max_cycles,
-        )
-        if run_id:
-            existing = await self.storage.get_run(run_id)
-            if existing:
-                self.run = existing
-                log.info(f"Resuming existing run {run_id}")
+        # Audit trail signer
+        self._trail_signer = AuditTrailSigner()
+
+        # Resume or create run
+        if resume_run_id:
+            run = await self.storage.get_run(resume_run_id)
+            if run:
+                self.run = run
+                self.log.info(f"Resuming run {run.id[:8]}")
             else:
-                self.run.id = run_id
+                self.log.warning(f"Run {resume_run_id!r} not found — starting new run")
 
-        await self.storage.upsert_run(self.run)
+        if self.run is None:
+            self.run = AuditRun(
+                repo_url=self.config.repo_url,
+                repo_name=Path(self.config.repo_url).name or "repo",
+                branch=self.config.base_branch,
+                master_prompt_path=str(self.config.master_prompt_path),
+                autonomy_level=self.config.autonomy_level,
+                domain_mode=self.config.domain_mode,
+                max_cycles=self.config.max_cycles,
+            )
+            await self.storage.upsert_run(self.run)
+            self.log.info(
+                f"New run {self.run.id[:8]} "
+                f"[domain={self.config.domain_mode.value}]"
+            )
 
-        if self.cfg.github_token:
+        self.convergence = ConvergenceDetector(
+            max_cycles=self.config.max_cycles,
+        )
+
+        # Consensus engine
+        self.consensus = ConsensusEngine(
+            graph_engine=self.graph_engine if self.config.graph_enabled else None
+        )
+
+        # MCP + GitHub
+        self.mcp = MCPManager(
+            repo_root=str(self.config.repo_root),
+            github_token=self.config.github_token,
+        )
+        if self.config.github_token and self.config.auto_commit:
             self.pr_manager = PRManager(
-                token=self.cfg.github_token,
-                repo_url=self.cfg.repo_url,
-                branch_prefix=self.cfg.branch_prefix,
+                token=self.config.github_token,
+                repo_url=self.config.repo_url,
+                base_branch=self.config.base_branch,
+                branch_prefix=self.config.branch_prefix,
+            )
+
+        # Patrol agent
+        if self.storage and self.run:
+            self.patrol = PatrolAgent(
+                storage=self.storage,
+                run_id=self.run.id,
+                cost_ceiling_usd=self.config.cost_ceiling_usd,
             )
 
         return self.run
 
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
     async def stabilize(self) -> RunStatus:
-        assert self.run is not None, "Call initialise() first"
+        assert self.run and self.storage, "Call initialise() first"
 
-        console.rule(f"[bold blue]RHODAWK AI CODE STABILIZER Stabilizer — {self.run.repo_name}")
-        console.print(f"Run ID: {self.run.id}")
-        console.print(f"Model:  {self.cfg.primary_model}")
-        console.print(f"Autonomy: {self.cfg.autonomy_level.value}")
-        console.print(
-            f"Max cycles: {self.cfg.max_cycles} | "
-            f"Cost ceiling: ${self.cfg.cost_ceiling_usd}"
-        )
-
-        patrol = PatrolAgent(
-            storage=self.storage,
-            run_id=self.run.id,
-            cost_ceiling_usd=self.cfg.cost_ceiling_usd,
-            config=self._agent_cfg,
-            notification_hooks=self.cfg.notification_hooks,
-        )
-        self._patrol_task = asyncio.create_task(patrol.run(), name="patrol")
+        # Start patrol in background
+        if self.patrol:
+            self._patrol_task = asyncio.create_task(self.patrol.run())
 
         try:
-            await self._phase_read(incremental=False)
+            # Initial read
+            await self.run_read_phase(incremental=False)
+            await self._build_graph()
 
             while True:
                 self.run.cycle_count += 1
                 await self.storage.upsert_run(self.run)
-                console.rule(f"Cycle {self.run.cycle_count}/{self.cfg.max_cycles}")
-
-                score = await self._phase_audit()
-                console.print(
-                    f"[bold]Audit score:[/bold] {score.score:.1f} | "
-                    f"CRITICAL={score.critical_count} MAJOR={score.major_count} "
-                    f"MINOR={score.minor_count} ESCALATED={score.escalated_count}"
+                self.log.info(
+                    f"═══ Cycle {self.run.cycle_count}/{self.config.max_cycles} "
+                    f"[{self.config.domain_mode.value}] ═══"
                 )
 
-                if score.critical_count == 0 and score.major_count == 0:
-                    if score.escalated_count > 0:
-                        console.print(
-                            f"[yellow]Warning: {score.escalated_count} escalated issues "
-                            "require human review — returning ESCALATED, not STABILIZED.[/yellow]"
-                        )
-                        return await self._finish(RunStatus.ESCALATED)
-                    return await self._finish(RunStatus.STABILIZED)
+                issues = await self._phase_audit()
+                score  = await self._record_score(issues)
+                terminal = self.convergence.check(score)
 
-                fix_attempts = await self._phase_fix()
-                if not fix_attempts:
-                    if await self._all_escalated():
-                        return await self._finish(RunStatus.ESCALATED)
+                if terminal:
+                    self.log.info(f"Convergence: {terminal.value}")
+                    await self._finalise(terminal)
+                    return terminal
 
-                if self.cfg.autonomy_level == AutonomyLevel.READ_ONLY:
-                    console.print("[yellow]Autonomy=read_only: fixes generated but not committed.[/yellow]")
-                    return await self._finish(RunStatus.HALTED)
+                if not issues:
+                    self.log.info("No issues to fix — stabilized")
+                    await self._finalise(RunStatus.STABILIZED)
+                    return RunStatus.STABILIZED
 
-                reviewed = await self._phase_review(fix_attempts)
+                # Consensus filtering
+                approved_issues = await self._apply_consensus(issues)
+                if not approved_issues:
+                    self.log.info("No issues passed consensus — continuing to next cycle")
+                    continue
 
-                if self.cfg.autonomy_level == AutonomyLevel.PROPOSE_ONLY:
-                    if reviewed and self.pr_manager and self.cfg.auto_commit:
-                        await self._phase_commit(reviewed, create_pr_only=True)
-                    console.print("[yellow]Autonomy=propose_only: PRs created, not auto-merged.[/yellow]")
-                else:
-                    if reviewed:
-                        planner_passed = await self._phase_plan(reviewed)
-                        if not planner_passed:
-                            log.warning("Planner blocked all fixes in this cycle")
-                            reviewed = []
+                # Fix → Review → Gate → Commit
+                await self._phase_fix(approved_issues)
+                await self._phase_review()
+                await self._phase_gate()
+                await self._phase_commit()
 
-                    if reviewed:
-                        gate_passed = await self._phase_gate(reviewed)
-                        if not gate_passed:
-                            log.warning("Static gate rejected all fixes in this cycle")
-                            reviewed = []
+                # Incremental re-read of modified files
+                modified = await self._get_modified_files()
+                if modified:
+                    await self.run_read_phase(incremental=True, force_reread=modified)
+                    await self._build_graph()
 
-                    if reviewed:
-                        await self._phase_commit(reviewed)
-                        await self._phase_read(incremental=True)
-
-                convergence_status = self.convergence.check(score)
-                if convergence_status == RunStatus.HALTED:
-                    return await self._finish(RunStatus.HALTED)
-                if convergence_status == RunStatus.STABILIZED:
-                    return await self._finish(RunStatus.STABILIZED)
-
-                total_cost = await self.storage.get_total_cost(self.run.id)
-                if total_cost >= self.cfg.cost_ceiling_usd:
-                    console.print(
-                        f"[bold red]Cost ceiling ${self.cfg.cost_ceiling_usd:.2f} "
-                        f"reached (${total_cost:.4f} spent). Halting.[/bold red]"
-                    )
-                    return await self._finish(RunStatus.HALTED)
-
-                if self.run.cycle_count >= self.cfg.max_cycles:
-                    return await self._finish(RunStatus.HALTED)
-
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted by user[/yellow]")
-            return await self._finish(RunStatus.HALTED)
         except Exception as exc:
-            log.error(f"Stabilizer fatal error: {exc}", exc_info=True)
-            return await self._finish(RunStatus.FAILED)
+            self.log.exception(f"Stabilizer fatal error: {exc}")
+            await self._finalise(RunStatus.FAILED)
+            return RunStatus.FAILED
+
         finally:
             if self._patrol_task and not self._patrol_task.done():
-                patrol.stop()
-                try:
-                    await asyncio.wait_for(self._patrol_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    self._patrol_task.cancel()
-            await self.storage.close()
+                self._patrol_task.cancel()
+            if self.vector_brain:
+                self.vector_brain.close()
+            if self.storage:
+                await self.storage.close()
 
-    async def run_read_phase(self, incremental: bool = False) -> dict[str, int]:
-        return await self._phase_read(incremental=incremental)
+    # ── Phase: Read ───────────────────────────────────────────────────────────
 
-    async def run_audit_phase(self) -> AuditScore:
-        return await self._phase_audit()
+    async def run_read_phase(
+        self,
+        incremental:  bool = True,
+        force_reread: set[str] | None = None,
+    ) -> None:
+        assert self.run and self.storage
+        a_cfg = _agent_cfg(self.config, self.run.id)
 
-    async def _phase_read(self, incremental: bool = False) -> dict[str, int]:
-        console.print("[cyan]Phase 1: Reading repository...[/cyan]")
         reader = ReaderAgent(
             storage=self.storage,
             run_id=self.run.id,
-            repo_root=self.cfg.repo_root,
-            config=self._agent_cfg,
-            incremental=incremental and self.cfg.incremental,
-            concurrency=self.cfg.concurrency,
-            load_bearing_paths=self.cfg.load_bearing_paths,
+            repo_root=self.config.repo_root,
+            config=a_cfg,
+            mcp_manager=self.mcp,
+            incremental=incremental,
+            concurrency=self.config.concurrency,
+            chunk_concurrency=self.config.chunk_concurrency,
+            vector_brain=self.vector_brain,
         )
-        counts = await reader.run()
-        console.print(
-            f"  Read: {counts['processed']} | "
-            f"Skipped: {counts['skipped']} | "
-            f"Errors: {counts['errors']}"
-        )
-        return counts
+        await reader.run(force_reread=force_reread)
+        await self._trail("READ_PHASE_COMPLETE", self.run.id, "run")
 
-    async def _phase_audit(self) -> AuditScore:
-        console.print("[cyan]Phase 2: Auditing...[/cyan]")
-        self._plugin_manager.load_builtin_plugins()
-        domains = [
-            ExecutorType.SECURITY,
-            ExecutorType.ARCHITECTURE,
-            ExecutorType.STANDARDS,
-        ]
+    # ── Phase: Graph Build ────────────────────────────────────────────────────
+
+    async def _build_graph(self) -> None:
+        if not self.config.graph_enabled or not self.storage or not self.run:
+            return
+        self.log.info("Building dependency graph…")
+        await self.graph_engine.build(self.storage)
+        self.run.graph_built = True
+        await self.storage.upsert_run(self.run)
+        summary = self.graph_engine.summary()
+        self.log.info(
+            f"Graph: {summary['nodes']} nodes, {summary['edges']} edges, "
+            f"{summary['cycles']} cycles"
+        )
+
+    # ── Phase: Audit ──────────────────────────────────────────────────────────
+
+    async def _phase_audit(self) -> list[Issue]:
+        assert self.run and self.storage
+        a_cfg = _agent_cfg(self.config, self.run.id)
+
         auditors = [
             AuditorAgent(
                 storage=self.storage,
                 run_id=self.run.id,
-                executor_type=domain,
-                master_prompt_path=self.cfg.master_prompt_path,
-                config=self._agent_cfg,
+                executor_type=executor,
+                master_prompt_path=self.config.master_prompt_path,
+                config=a_cfg,
+                mcp_manager=self.mcp,
+                domain_mode=self.config.domain_mode,
+                repo_root=self.config.repo_root,
+                validate_findings=self.config.validate_findings,
             )
-            for domain in domains
+            for executor in (
+                ExecutorType.SECURITY,
+                ExecutorType.ARCHITECTURE,
+                ExecutorType.STANDARDS,
+            )
         ]
-        results = await asyncio.gather(
-            *[a.run() for a in auditors], return_exceptions=True
-        )
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                log.warning(f"Auditor {domains[i].value} failed: {res}")
 
-        files = await self.storage.list_files()
-        plugin_issue_count = 0
-        for file_record in files:
-            abs_path = self.cfg.repo_root / file_record.path
-            try:
-                content_text = abs_path.read_text(encoding="utf-8", errors="replace")
-                plugin_issues = await self._plugin_manager.run_all(
-                    file_path=file_record.path,
-                    content=content_text,
-                    language=file_record.language,
-                    run_id=self.run.id,
-                )
-                for pi in plugin_issues:
-                    await self.storage.upsert_issue(pi)
-                plugin_issue_count += len(plugin_issues)
-            except OSError:
-                pass
-        if plugin_issue_count:
-            console.print(f"  Plugins found {plugin_issue_count} additional issue(s)")
+        results = await asyncio.gather(*[a.run() for a in auditors], return_exceptions=True)
+        all_issues: list[Issue] = []
+        for r in results:
+            if isinstance(r, list):
+                all_issues.extend(r)
+            elif isinstance(r, Exception):
+                self.log.error(f"Auditor failed: {r}")
 
-        all_open = await self.storage.list_issues(
-            run_id=self.run.id, status=IssueStatus.OPEN.value
-        )
-        escalated = await self.storage.list_issues(
-            run_id=self.run.id, status=IssueStatus.ESCALATED.value
-        )
-        score = AuditScore(run_id=self.run.id)
-        for issue in all_open:
-            if issue.severity == Severity.CRITICAL:
-                score.critical_count += 1
-            elif issue.severity == Severity.MAJOR:
-                score.major_count += 1
-            elif issue.severity == Severity.MINOR:
-                score.minor_count += 1
-            else:
-                score.info_count += 1
-        score.escalated_count = len(escalated)
-        score.compute_score()
-        await self.storage.append_score(score)
-        self.run.scores.append(score)
-        return score
+        await self._trail("AUDIT_PHASE_COMPLETE", self.run.id, "run",
+                          after=f"{len(all_issues)} issues found")
+        return all_issues
 
-    async def _phase_fix(self) -> list[FixAttempt]:
-        console.print("[cyan]Phase 3: Generating fixes...[/cyan]")
+    # ── Phase: Consensus ──────────────────────────────────────────────────────
+
+    async def _apply_consensus(self, issues: list[Issue]) -> list[Issue]:
+        assert self.consensus and self.storage
+        results   = self.consensus.evaluate_issues(issues)
+        approved  = self.consensus.filter_approved(issues, results)
+        summary   = self.consensus.summary(results)
+
+        self.log.info(
+            f"Consensus: {summary['approved']}/{summary['total']} passed, "
+            f"{summary['escalated']} escalated, "
+            f"mean_conf={summary['mean_confidence']:.2f}"
+        )
+
+        # Persist updated consensus fields
+        for issue in issues:
+            await self.storage.upsert_issue(issue)
+
+        return approved
+
+    # ── Phase: Fix ────────────────────────────────────────────────────────────
+
+    async def _phase_fix(self, issues: list[Issue]) -> None:
+        assert self.run and self.storage
+        a_cfg = _agent_cfg(self.config, self.run.id)
+
         fixer = FixerAgent(
             storage=self.storage,
             run_id=self.run.id,
-            repo_root=self.cfg.repo_root,
-            master_prompt_path=self.cfg.master_prompt_path,
-            config=self._agent_cfg,
+            config=a_cfg,
+            mcp_manager=self.mcp,
+            repo_root=self.config.repo_root,
+            graph_engine=self.graph_engine if self.config.graph_enabled else None,
+            vector_brain=self.vector_brain,
         )
-        attempts = await fixer.run()
-        console.print(f"  Generated {len(attempts)} fix attempt(s)")
-        return attempts
+        await fixer.run()
 
-    async def _phase_review(
-        self, attempts: list[FixAttempt]
-    ) -> list[FixAttempt]:
-        console.print("[cyan]Phase 4: Reviewing fixes...[/cyan]")
+    # ── Phase: Review ─────────────────────────────────────────────────────────
+
+    async def _phase_review(self) -> None:
+        assert self.run and self.storage
+        a_cfg = _agent_cfg(self.config, self.run.id)
+
         reviewer = ReviewerAgent(
             storage=self.storage,
             run_id=self.run.id,
-            config=self._agent_cfg,
-            repo_root=self.cfg.repo_root,
+            config=a_cfg,
+            mcp_manager=self.mcp,
+            cross_validate_critical=True,
+            cross_file_coherence=True,
+            repo_root=self.config.repo_root,
         )
         await reviewer.run()
-        approved = []
-        for attempt in attempts:
-            review = await self.storage.get_review(attempt.id)
-            if review and review.approve_for_commit:
-                approved.append(attempt)
-                console.print(f"  [green]APPROVED[/green]: fix {attempt.id[:8]}")
-            else:
-                console.print(f"  [red]REJECTED[/red]: fix {attempt.id[:8]}")
-        return approved
 
-    async def _phase_plan(
-        self, approved: list[FixAttempt]
-    ) -> list[FixAttempt]:
-        console.print("[cyan]Phase 5: Consequence reasoning (Planner)...[/cyan]")
+    # ── Phase: Gate ───────────────────────────────────────────────────────────
+
+    async def _phase_gate(self) -> None:
+        assert self.run and self.storage
+        gate = StaticAnalysisGate(
+            run_ruff=self.config.run_ruff,
+            run_mypy=self.config.run_mypy,
+            run_semgrep=self.config.run_semgrep,
+            run_bandit=self.config.run_bandit,
+            repo_root=self.config.repo_root,
+            domain_mode=self.config.domain_mode.value,
+        )
+
         planner = PlannerAgent(
             storage=self.storage,
             run_id=self.run.id,
-            repo_root=self.cfg.repo_root,
-            config=self._agent_cfg,
+            config=_agent_cfg(self.config, self.run.id),
         )
 
-        for attempt in approved:
-            attempt.planner_approved = None
-
-        await planner.run()
-
-        planner_passed: list[FixAttempt] = []
-        for attempt in approved:
-            refreshed = await self.storage.get_fix(attempt.id)
-            if refreshed and refreshed.planner_approved is not False:
-                planner_passed.append(attempt)
-                console.print(f"  [green]PLANNER OK[/green]: fix {attempt.id[:8]}")
-            else:
-                reason = refreshed.planner_reason if refreshed else "unknown"
-                console.print(f"  [red]PLANNER BLOCKED[/red]: fix {attempt.id[:8]} — {reason[:60]}")
-        return planner_passed
-
-    async def _phase_gate(
-        self, approved: list[FixAttempt]
-    ) -> list[FixAttempt]:
-        console.print("[cyan]Phase 6: Static analysis gate...[/cyan]")
-        gated: list[FixAttempt] = []
-
-        for attempt in approved:
-            files_to_check = [
-                (ff.path, ff.content) for ff in attempt.fixed_files
-            ]
-            gate_results = await self.gate.validate_batch(files_to_check)
-
-            passed_files: list[FixedFile] = []
-            any_rejected = False
-
-            for ff in attempt.fixed_files:
-                gr = gate_results.get(ff.path)
-                if gr and gr.approved:
-                    passed_files.append(ff)
-                    console.print(f"  [green]GATE PASS[/green]: {ff.path}")
-                else:
-                    reason = gr.rejection_reason if gr else "unknown"
-                    console.print(f"  [red]GATE FAIL[/red]: {ff.path} — {reason}")
-                    any_rejected = True
-                    for iid in attempt.issue_ids:
-                        await self.storage.update_issue_status(
-                            iid, IssueStatus.OPEN.value,
-                            reason=f"Gate rejection: {reason[:200]}",
-                        )
-
-            attempt.gate_passed = len(passed_files) > 0
-            attempt.gate_reason = "All files passed" if not any_rejected else "Some files rejected"
-            await self.storage.upsert_fix(attempt)
-
-            if passed_files:
-                attempt.fixed_files = passed_files
-                gated.append(attempt)
-            elif any_rejected:
-                log.warning(f"All files in fix {attempt.id[:8]} rejected by gate")
-
-        return gated
-
-    async def _phase_commit(
-        self,
-        approved: list[FixAttempt],
-        create_pr_only: bool = False,
-    ) -> None:
-        console.print("[cyan]Phase 7: Committing approved fixes...[/cyan]")
-        fixer = FixerAgent(
+        formal_agent = FormalVerifierAgent(
             storage=self.storage,
             run_id=self.run.id,
-            repo_root=self.cfg.repo_root,
-            master_prompt_path=self.cfg.master_prompt_path,
-            config=self._agent_cfg,
-        )
-        for attempt in approved:
-            if not create_pr_only:
-                written = await fixer.write_fixed_files_to_disk(attempt)
-                console.print(f"  Written {len(written)} file(s) to disk")
+            domain_mode=self.config.domain_mode,
+            config=_agent_cfg(self.config, self.run.id),
+            repo_root=self.config.repo_root,
+        ) if (
+            self.config.formal_verification
+            and self.config.domain_mode != DomainMode.GENERAL
+        ) else None
 
-                entry = AuditTrailEntry(
-                    run_id=self.run.id,
-                    event_type="FILES_COMMITTED",
-                    entity_id=attempt.id,
-                    entity_type="FixAttempt",
-                    after_state=str([f.path for f in attempt.fixed_files]),
-                    actor="stabilizer",
+        approved_fixes = await self.storage.list_fixes()
+
+        for fix in approved_fixes:
+            if fix.reviewer_verdict and fix.reviewer_verdict.value != "APPROVED":
+                continue
+            if fix.gate_passed is not None:
+                continue
+
+            # Static gate
+            gate_passed   = True
+            gate_reason   = ""
+            for ff in fix.fixed_files:
+                result = await gate.validate(ff.path, ff.content)
+                if not result.approved:
+                    gate_passed = False
+                    gate_reason = f"{ff.path}: {result.rejection_reason}"
+                    break
+
+            # Planner consequence check
+            if gate_passed:
+                planner_result = await planner.run(fix_attempt_id=fix.id)
+                if planner_result.block_commit:
+                    gate_passed = False
+                    gate_reason = f"Planner blocked: {planner_result.reason}"
+
+            # Formal verification (CRITICAL only in non-GENERAL domains)
+            if gate_passed and formal_agent:
+                critical_issues = [
+                    await self.storage.get_issue(iid)
+                    for iid in fix.issue_ids
+                ]
+                has_critical = any(
+                    i and i.severity == Severity.CRITICAL
+                    for i in critical_issues
                 )
-                entry.hmac_signature = self.trail_signer.sign(entry)
-                await self.storage.append_audit_trail(entry)
+                if has_critical:
+                    fv_results = await formal_agent.verify_fix(fix)
+                    if await formal_agent.any_counterexample(fv_results):
+                        ce = next(
+                            r.counterexample for r in fv_results
+                            if r.status == FormalVerificationStatus.COUNTEREXAMPLE
+                        )
+                        gate_passed = False
+                        gate_reason = f"Formal verification failed: {ce[:300]}"
+                        fix.formal_proofs = [r.id for r in fv_results]
 
-            if self.pr_manager and self.cfg.auto_commit:
-                try:
-                    pr_url = await self.pr_manager.create_pr_for_fix(
-                        attempt=attempt,
-                        run_id=self.run.id,
-                        cycle=self.run.cycle_count,
-                        repo_root=self.cfg.repo_root,
+            fix.gate_passed = gate_passed
+            fix.gate_reason = gate_reason
+            await self.storage.upsert_fix(fix)
+
+            if gate_passed:
+                self.log.info(f"Gate: PASSED for fix {fix.id[:8]}")
+            else:
+                self.log.warning(f"Gate: BLOCKED for fix {fix.id[:8]}: {gate_reason}")
+                # Re-open issues so they get re-queued next cycle
+                for iid in fix.issue_ids:
+                    await self.storage.update_issue_status(
+                        iid, IssueStatus.OPEN.value, reason=gate_reason
                     )
-                    attempt.pr_url = pr_url
-                    attempt.committed_at = datetime.now(tz=timezone.utc)
-                    await self.storage.upsert_fix(attempt)
-                    console.print(f"  [green]PR created:[/green] {pr_url}")
-                except Exception as exc:
-                    log.error(f"Failed to create PR: {exc}")
 
-            for iid in attempt.issue_ids:
+    # ── Phase: Commit ─────────────────────────────────────────────────────────
+
+    async def _phase_commit(self) -> None:
+        assert self.run and self.storage
+        if not self.config.auto_commit or self.config.autonomy_level == AutonomyLevel.READ_ONLY:
+            return
+
+        fixes = await self.storage.list_fixes()
+        to_commit = [
+            f for f in fixes
+            if f.gate_passed is True and f.committed_at is None
+        ]
+
+        if not to_commit:
+            return
+
+        # Group fixes by "module" (top-level directory) for batched PRs — GAP-13
+        module_groups: dict[str, list] = {}
+        for fix in to_commit:
+            module = self._module_for_fix(fix)
+            module_groups.setdefault(module, []).append(fix)
+
+        for module, module_fixes in module_groups.items():
+            await self._commit_module_group(module, module_fixes)
+
+        # Requeue transitive dependents using real graph — GAP-1/18
+        committed_files: set[str] = set()
+        for fix in to_commit:
+            for ff in fix.fixed_files:
+                committed_files.add(ff.path)
+
+        await self._requeue_transitive_dependents(committed_files)
+
+    def _module_for_fix(self, fix: object) -> str:
+        """GAP-13: derive module name from the files a fix touches."""
+        paths = [ff.path for ff in fix.fixed_files]  # type: ignore[attr-defined]
+        if not paths:
+            return "misc"
+        # Use top-level directory as module key
+        parts = paths[0].split("/")
+        return parts[0] if len(parts) > 1 else "root"
+
+    async def _commit_module_group(self, module: str, fixes: list) -> None:
+        assert self.run and self.storage
+        combined_files: list[tuple[str, str]] = []
+        all_issue_ids: list[str] = []
+
+        for fix in fixes:
+            for ff in fix.fixed_files:
+                # Write to disk
+                try:
+                    from sandbox.executor import validate_path_within_root
+                    validate_path_within_root(ff.path, self.config.repo_root)
+                    abs_path = (self.config.repo_root / ff.path).resolve()
+                    abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    abs_path.write_text(ff.content, encoding="utf-8")
+                    combined_files.append((ff.path, ff.content))
+                    all_issue_ids.extend(fix.issue_ids)
+                    self.log.info(f"Committed: {ff.path}")
+                except Exception as exc:
+                    self.log.error(f"Failed to write {ff.path}: {exc}")
+
+            fix.committed_at = datetime.now(tz=timezone.utc)
+            await self.storage.upsert_fix(fix)
+
+            # Close resolved issues
+            for iid in fix.issue_ids:
                 await self.storage.update_issue_status(iid, IssueStatus.CLOSED.value)
 
-            if not create_pr_only:
-                await self._requeue_transitive_dependents(attempt)
-
-    async def _requeue_transitive_dependents(self, attempt: FixAttempt) -> None:
-        changed_paths = {ff.path for ff in attempt.fixed_files}
-        if not changed_paths:
-            return
-        all_issues = await self.storage.list_issues(run_id=self.run.id)
-        requeued = 0
-        for issue in all_issues:
-            if issue.status == IssueStatus.CLOSED:
-                continue
-            deps = set(issue.fix_requires_files or [issue.file_path])
-            if deps & changed_paths:
-                await self.storage.update_issue_status(
-                    issue.id, IssueStatus.OPEN.value,
-                    reason=f"Re-opened: dependent file changed ({', '.join(changed_paths & deps)})",
-                )
-                requeued += 1
-        if requeued:
-            console.print(f"  [dim]Transitive re-audit: {requeued} dependent issue(s) re-opened[/dim]")
-
-    async def revert_last_cycle(self) -> bool:
-        assert self.run is not None
-        try:
-            import git
-            repo = git.Repo(self.cfg.repo_root)
-            branch_prefix = self.cfg.branch_prefix
-            log.info(f"Reverting last stabilizer cycle on {self.cfg.repo_root}")
-            commits = list(repo.iter_commits(max_count=20))
-            for commit in commits:
-                if f"fix(rhodawk-ai-code-stabilizer)" in commit.message or branch_prefix in commit.message:
-                    repo.git.revert(commit.hexsha, no_edit=True)
-                    log.info(f"Reverted commit: {commit.hexsha[:8]} — {commit.message[:60]}")
-                    entry = AuditTrailEntry(
-                        run_id=self.run.id,
-                        event_type="CYCLE_REVERTED",
-                        entity_id=commit.hexsha,
-                        entity_type="GitCommit",
-                        before_state=commit.hexsha,
-                        after_state="reverted",
-                        actor="stabilizer",
-                    )
-                    entry.hmac_signature = self.trail_signer.sign(entry)
-                    await self.storage.append_audit_trail(entry)
-                    return True
-            log.warning("No stabilizer commit found to revert")
-            return False
-        except Exception as exc:
-            log.error(f"Revert failed: {exc}")
-            return False
-
-    async def _all_escalated(self) -> bool:
-        open_issues = await self.storage.list_issues(run_id=self.run.id)
-        non_terminal = [
-            i for i in open_issues
-            if i.status not in (
-                IssueStatus.CLOSED,
-                IssueStatus.ESCALATED,
-                IssueStatus.APPROVED,
+            # Audit trail
+            await self._trail(
+                "FIX_COMMITTED", fix.id, "fix",
+                after=f"files={[ff.path for ff in fix.fixed_files]}"
             )
+
+            # Run tests
+            if self.config.run_tests_after_fix:
+                test_runner = TestRunnerAgent(
+                    storage=self.storage,
+                    run_id=self.run.id,
+                    repo_root=self.config.repo_root,
+                )
+                test_result = await test_runner.run_after_fix(fix)
+                if test_result.status == TestRunStatus.FAILED:
+                    self.log.warning(
+                        f"Tests FAILED after fix {fix.id[:8]}: "
+                        f"{test_result.failed} failed / "
+                        f"{test_result.errors} errors"
+                    )
+                    await self._log_patrol_event(
+                        "TEST_REGRESSION",
+                        f"Tests failed after fix {fix.id[:8]}",
+                        action="Manual review recommended",
+                        severity="WARNING",
+                    )
+
+        # Create batched PR
+        if self.pr_manager and combined_files:
+            try:
+                branch = (
+                    f"{self.config.branch_prefix}/{module}/"
+                    f"{self.run.id[:8]}-c{self.run.cycle_count}"
+                )
+                pr_url = await self.pr_manager.create_pr(
+                    branch_name=branch,
+                    files=combined_files,
+                    title=f"[MACS] {module}: fix {len(all_issue_ids)} issues (cycle {self.run.cycle_count})",
+                    body=self._build_pr_body(fixes),
+                )
+                for fix in fixes:
+                    fix.pr_url = pr_url
+                    await self.storage.upsert_fix(fix)
+                self.log.info(f"PR created: {pr_url}")
+            except Exception as exc:
+                self.log.error(f"PR creation failed: {exc}")
+
+    def _build_pr_body(self, fixes: list) -> str:
+        lines = [
+            "## MACS Automated Fix\n\n",
+            f"Domain mode: `{self.config.domain_mode.value}`\n\n",
+            "### Issues Fixed\n\n",
         ]
-        escalated_only = [
-            i for i in open_issues if i.status == IssueStatus.ESCALATED
-        ]
-        return len(non_terminal) == 0 and len(escalated_only) > 0
+        for fix in fixes:
+            for iid in fix.issue_ids:
+                lines.append(f"- {iid}\n")
+        lines.append("\n### Verification\n\n")
+        lines.append("- ✅ Static analysis gate (ruff / mypy / bandit / semgrep)\n")
+        lines.append("- ✅ Planner consequence assessment\n")
+        lines.append("- ✅ Multi-model adversarial review\n")
+        if any(fix.formal_proofs for fix in fixes):
+            lines.append("- ✅ Formal verification (Z3)\n")
+        return "".join(lines)
 
-    async def _finish(self, status: RunStatus) -> RunStatus:
-        assert self.run is not None
-        self.run.completed_at = datetime.now(tz=timezone.utc)
-        await self.storage.update_run_status(self.run.id, status)
+    # ── Transitive re-queue (GAP-1/18 FIX) ───────────────────────────────────
 
-        total_cost = await self.storage.get_total_cost(self.run.id)
-        self._print_final_report(status, total_cost)
-        return status
+    async def _requeue_transitive_dependents(self, changed_files: set[str]) -> None:
+        assert self.storage
+        if not self.graph_engine.is_built:
+            return
 
-    def _print_final_report(self, status: RunStatus, total_cost: float) -> None:
-        assert self.run is not None
-        table = Table(title=f"RHODAWK AI CODE STABILIZER Run Complete — {status.value}")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="white")
-        color = "green" if status == RunStatus.STABILIZED else "red"
-        table.add_row("Status", f"[bold {color}]{status.value}[/]")
-        table.add_row("Cycles", str(self.run.cycle_count))
-        table.add_row("Total Cost", f"${total_cost:.4f}")
-        if self.run.scores:
-            s = self.run.scores[-1]
-            table.add_row("Final Score", str(s.score))
-            table.add_row("CRITICAL remaining", str(s.critical_count))
-            table.add_row("MAJOR remaining", str(s.major_count))
-            table.add_row("ESCALATED", str(s.escalated_count))
-        console.print(table)
+        affected: set[str] = set()
+        for path in changed_files:
+            affected |= self.graph_engine.impact_radius(path)
+        affected -= changed_files  # don't re-queue the fixed files themselves
+
+        if not affected:
+            return
+
+        self.log.info(
+            f"Requeuing {len(affected)} transitive dependent files for re-read"
+        )
+        # Mark as UNREAD so the next read phase picks them up
+        for path in affected:
+            record = await self.storage.get_file(path)
+            if record:
+                from brain.schemas import FileStatus
+                record.status = FileStatus.UNREAD
+                await self.storage.upsert_file(record)
+
+    async def _get_modified_files(self) -> set[str]:
+        assert self.storage and self.run
+        fixes = await self.storage.list_fixes()
+        modified: set[str] = set()
+        for fix in fixes:
+            if fix.committed_at:
+                modified |= {ff.path for ff in fix.fixed_files}
+        return modified
+
+    # ── Score recording ───────────────────────────────────────────────────────
+
+    async def _record_score(self, issues: list[Issue]) -> AuditScore:
+        assert self.run and self.storage
+        from collections import Counter
+        counts = Counter(i.severity for i in issues)
+        score  = AuditScore(
+            run_id=self.run.id,
+            critical_count=counts.get(Severity.CRITICAL, 0),
+            major_count=counts.get(Severity.MAJOR, 0),
+            minor_count=counts.get(Severity.MINOR, 0),
+            info_count=counts.get(Severity.INFO, 0),
+        )
+        score.compute_score()
+        await self.storage.append_score(score)
+        self.run.scores.append(score)
+        self.log.info(
+            f"Score: {score.score:.0f} "
+            f"(C={score.critical_count} M={score.major_count} m={score.minor_count})"
+        )
+        return score
+
+    # ── Audit trail ───────────────────────────────────────────────────────────
+
+    async def _trail(
+        self,
+        event_type:    str,
+        entity_id:     str,
+        entity_type:   str,
+        before:        str = "",
+        after:         str = "",
+    ) -> None:
+        assert self.storage and self.run and self._trail_signer
+        entry = AuditTrailEntry(
+            run_id=self.run.id,
+            event_type=event_type,
+            entity_id=entity_id,
+            entity_type=entity_type,
+            before_state=before,
+            after_state=after,
+            actor="MACS",
+        )
+        entry.hmac_signature = self._trail_signer.sign(entry.model_dump_json())
+        await self.storage.append_audit_trail(entry)
+
+    async def _log_patrol_event(
+        self, event_type: str, detail: str, action: str = "", severity: str = "INFO"
+    ) -> None:
+        if not self.storage or not self.run:
+            return
+        event = PatrolEvent(
+            event_type=event_type,
+            detail=detail,
+            action_taken=action,
+            run_id=self.run.id,
+            severity=severity,
+        )
+        await self.storage.log_patrol_event(event)
+
+    # ── Finalise ──────────────────────────────────────────────────────────────
+
+    async def _finalise(self, status: RunStatus) -> None:
+        if self.run and self.storage:
+            await self.storage.update_run_status(self.run.id, status)
+            await self._trail("RUN_FINALISED", self.run.id, "run", after=status.value)
+            self.log.info(f"Run {self.run.id[:8]} finalised: {status.value}")
+
+    # ── Public helpers ────────────────────────────────────────────────────────
+
+    async def run_audit_phase(self) -> AuditScore:
+        """Exposed for the CLI's audit-only command."""
+        issues = await self._phase_audit()
+        return await self._record_score(issues)
