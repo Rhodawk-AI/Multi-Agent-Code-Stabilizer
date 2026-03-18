@@ -1,116 +1,126 @@
-# RHODAWK AI CODE STABILIZER Default Configuration
-# All values here are overridable via environment variables or CLI flags
+# ─────────────────────────────────────────────────────────────────────────────
+# MACS — Multi-Agent Code Stabilizer
+# Default Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# All values can be overridden by environment variables.
+# See config/loader.py for the full override map.
+# ─────────────────────────────────────────────────────────────────────────────
 
+# Domain mode: general | finance | medical | military | embedded
+# Finance: PCI-DSS, no float on monetary values, atomic balance ops
+# Medical: IEC 62304, HIPAA, dosage safety
+# Military: MISRA-C, DO-178C, no dynamic alloc, no goto
+# Embedded: RTOS rules: no dynamic alloc, bounded loops, no stdio
+domain_mode = "general"
+
+# ─── Models ──────────────────────────────────────────────────────────────────
 [models]
-# Primary model — used for fixes and critical audits
-primary = "claude-sonnet-4-20250514"
-
-# Fallback models (tried in order if primary fails or rate-limits)
-fallbacks = ["gpt-4o-mini", "deepseek-chat"]
-
-# Local model for cost-free triage (requires Ollama)
-local = "ollama/qwen2.5-coder:32b"
-
-# Tier strategy:
-#   triage = cheap/fast model for initial file scan
-#   audit  = mid-tier for issue synthesis
-#   fix    = best model for critical fixes
-triage_model = "claude-haiku-4-5-20251001"
-audit_model  = "claude-sonnet-4-20250514"
-fix_model    = "claude-sonnet-4-20250514"
-critical_fix_model = "claude-opus-4-20250514"
-
-# Cross-validate CRITICAL fixes with a second model
+primary               = "claude-sonnet-4-20250514"
+triage_model          = "claude-haiku-4-5-20251001"
+audit_model           = "claude-sonnet-4-20250514"
+fix_model             = "claude-sonnet-4-20250514"
+critical_fix_model    = "claude-opus-4-20250514"
+fallbacks             = ["gpt-4o-mini", "ollama/qwen2.5-coder:32b"]
 cross_validate_critical = true
 
-[chunking]
-# File size thresholds (lines) — determines chunking strategy
-threshold_full         = 200
-threshold_half         = 1000
-threshold_ast          = 5000
-threshold_skeleton     = 20000
-# Above threshold_skeleton: skeleton-only mode
-
-# Line overlap between adjacent chunks
-overlap_lines = 20
-
-# Max lines per chunk (hard ceiling for token safety)
-max_chunk_lines = 800
-
-# Max file size to read at all (bytes)
-max_file_size_bytes = 10_485_760  # 10MB
-
+# ─── Loop parameters ─────────────────────────────────────────────────────────
 [loop]
-# Maximum stabilization cycles before halting
-max_cycles = 50
+max_cycles             = 50
+cost_ceiling_usd       = 50.0
+concurrency            = 4
+chunk_concurrency      = 4
+stall_threshold        = 2
+regression_threshold   = 0.10
+max_fix_attempts       = 3
+parallel_fixes         = true
 
-# Maximum USD to spend per run
-cost_ceiling_usd = 50.0
+# ─── Chunking thresholds ─────────────────────────────────────────────────────
+[chunking]
+threshold_full         = 200    # < 200 lines → FULL (single chunk)
+threshold_half         = 1_000  # < 1 000 lines → HALF (two chunks)
+threshold_ast          = 5_000  # < 5 000 lines → AST_NODES
+threshold_skeleton     = 20_000 # < 20 000 lines → SKELETON
+# ≥ 20 000 lines → SKELETON_ONLY
 
-# Number of parallel agent sessions
-concurrency = 4
+# ─── Direct audit threshold ──────────────────────────────────────────────────
+[auditing]
+direct_audit_line_threshold = 5_000   # files below this are audited from source
+validate_findings           = true    # run hallucination filter on LLM findings
+audit_batch_size            = 20      # files per LLM audit call
 
-# Stall detection: halt after N cycles with no score improvement
-stall_threshold = 2
-
-# Regression threshold: halt if score increases by more than this fraction
-regression_threshold = 0.10
-
-# Maximum fix attempts per issue before escalating to human
-max_fix_attempts = 3
-
-[github]
-# Base branch for PRs (default: main)
-base_branch = "main"
-
-# PR branch prefix
-branch_prefix = "stabilizer"
-
-# Auto-merge PRs (requires branch protection rules to be set)
-auto_merge = false
-
+# ─── Static analysis ─────────────────────────────────────────────────────────
 [static_analysis]
-# Run these tools before any fix is committed
-run_ruff    = true
-run_mypy    = true
-run_semgrep = true
-run_bandit  = true
+run_ruff          = true
+run_mypy          = true
+run_semgrep       = true
+run_bandit        = true
+fail_on_warning   = false
+timeout_s         = 60
 
-# Fail on warnings (stricter mode)
-fail_on_warning = false
+# ─── Dependency graph ────────────────────────────────────────────────────────
+[graph]
+enabled                     = true
+backend                     = "networkx"    # networkx | neo4j
+min_centrality_threshold    = 0.0
+# Neo4j settings (only used when backend = "neo4j")
+neo4j_uri                   = "bolt://localhost:7687"
+neo4j_user                  = "neo4j"
+neo4j_password              = ""
 
-# Analysis timeout per tool (seconds)
-timeout_s = 60
+# ─── Formal verification ─────────────────────────────────────────────────────
+[formal_verification]
+enabled     = false        # enable for finance / medical / military
+solver      = "z3"
+timeout_s   = 30
+# Only run formal verification when domain_mode is in this list
+domains     = ["finance", "medical", "military"]
 
-[api]
-# FastAPI server settings
-host = "0.0.0.0"
-port = 8000
-reload = false
+# ─── Test runner ─────────────────────────────────────────────────────────────
+[test_runner]
+enabled     = true         # run target repo's test suite after each fix commit
+timeout_s   = 300          # 5 minutes
 
-[logging]
-level = "INFO"
-format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-file = ".stabilizer/rhodawk-ai-code-stabilizer.log"
-
+# ─── Brain storage ───────────────────────────────────────────────────────────
 [brain]
-# Storage backend: sqlite (default), json (small repos only)
-backend = "sqlite"
-db_path = ".stabilizer/brain.db"
+backend               = "sqlite"
+db_path               = ".stabilizer/brain.db"
+vector_store_enabled  = false
+vector_store_path     = ".stabilizer/vectors"
+vector_embedding_model = "all-MiniLM-L6-v2"
 
-# Vector store for semantic cross-file search (requires chromadb)
-vector_store_enabled = false
-vector_store_path = ".stabilizer/vectors"
-
+# ─── Patrol ──────────────────────────────────────────────────────────────────
 [patrol]
-# How often the patrol agent checks system health (seconds)
-poll_interval_s = 60
+poll_interval_s           = 60
+task_timeout_min          = 15
+rejection_rate_threshold  = 0.50
+cost_warn_pct             = 0.80
 
-# Task timeout — escalate if an agent session exceeds this (minutes)
-task_timeout_min = 15
+# ─── GitHub integration ───────────────────────────────────────────────────────
+[github]
+base_branch    = "main"
+branch_prefix  = "stabilizer"
+auto_merge     = false
 
-# Rejection rate threshold — alert if >X% of fixes are rejected
-rejection_rate_threshold = 0.50
+# ─── API server ──────────────────────────────────────────────────────────────
+[api]
+host    = "0.0.0.0"
+port    = 8000
+reload  = false
 
-# Cost warning threshold — warn at this % of cost ceiling
-cost_warn_pct = 0.80
+# ─── Consensus ───────────────────────────────────────────────────────────────
+[consensus]
+# These match orchestrator/consensus.py DEFAULT_RULES
+# Override here to raise/lower the bar per severity
+critical_min_agents         = 2
+critical_confidence_floor   = 0.85
+critical_requires_security  = true
+major_min_agents            = 2
+major_confidence_floor      = 0.70
+minor_min_agents            = 1
+minor_confidence_floor      = 0.50
+high_centrality_threshold   = 0.70
+high_centrality_multiplier  = 1.20
+
+# ─── Plugin paths ─────────────────────────────────────────────────────────────
+[plugins]
+paths = []
