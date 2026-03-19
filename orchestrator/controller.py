@@ -71,6 +71,7 @@ from metrics.prometheus_exporter import (
     ACTIVE_RUNS, record_issue, record_fix, record_gate, record_test_run,
     update_cost_pct, time_cycle,
 )
+from metrics.langsmith_tracer import LangSmithTracer
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +192,11 @@ class StabilizerController:
         self._escalation_mgr: EscalationManager | None = None
         self._independence_enforcer: IndependenceEnforcer | None = None
         self._feature_matrix = None
+        self._langsmith: LangSmithTracer              = LangSmithTracer()
         self.log = log
+        # ── Inter-phase state (FIX: was missing — caused silent pipeline break) ──
+        self._last_audit_issues:    list = []   # set by run_audit_phase()
+        self._last_approved_issues: list = []   # set by run_consensus_phase()
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -298,6 +303,11 @@ class StabilizerController:
         )
 
         ACTIVE_RUNS.inc()
+        self._langsmith.start_run(
+            run_id=self.run.id,
+            repo=self.config.repo_url,
+            domain=self.config.domain_mode.value,
+        )
         return self.run
 
     async def _init_storage(self) -> None:
@@ -429,12 +439,19 @@ class StabilizerController:
 
     async def run_audit_phase(self) -> AuditScore:
         issues = await self._phase_audit()
+        # FIX (CRITICAL): populate inter-phase state so DeerFlow consensus/fix
+        # steps receive the issue list.  Without this assignment _last_audit_issues
+        # defaulted to [] and the entire fix pipeline was a silent no-op.
+        self._last_audit_issues = issues
         return await self._record_score(issues)
 
     async def run_consensus_phase(
         self, issues: list[Issue]
     ) -> list[Issue]:
-        return await self._apply_consensus(issues)
+        approved = await self._apply_consensus(issues)
+        # FIX: persist approved list so the fix step in DeerFlow can read it
+        self._last_approved_issues = approved
+        return approved
 
     async def run_fix_phase(self, issues: list[Issue]) -> None:
         await self._phase_fix(issues)
@@ -716,6 +733,50 @@ class StabilizerController:
                         gate_reason = f"Formal: {ce[:300]}"
                         fix.formal_proofs = [r.id for r in fv]
 
+            # ── 6. LDRA / Polyspace (C/C++ compliance modes) ────────────────
+            if gate_passed and self.config.domain_mode in {
+                DomainMode.MILITARY, DomainMode.AEROSPACE,
+                DomainMode.NUCLEAR, DomainMode.EMBEDDED,
+            }:
+                for ff in fix.fixed_files:
+                    if ff.path.endswith((".c", ".cpp", ".cc", ".h", ".hpp")):
+                        content = ff.content or ""
+                        try:
+                            from tools.servers.ldra_polyspace_server import (
+                                ldra_check, polyspace_verify,
+                            )
+                            ldra_findings = await ldra_check(
+                                ff.path, content, self.run.id
+                            )
+                            for finding in ldra_findings:
+                                await self.storage.upsert_ldra_finding(finding)
+                                if finding.severity == "Mandatory":
+                                    gate_passed = False
+                                    gate_reason = (
+                                        f"LDRA: mandatory rule {finding.rule_id} "
+                                        f"in {ff.path}:{finding.line_number}"
+                                    )
+                                    break
+                            if gate_passed:
+                                poly_findings = await polyspace_verify(
+                                    ff.path, content, self.run.id
+                                )
+                                for pf in poly_findings:
+                                    await self.storage.upsert_polyspace_finding(pf)
+                                    if pf.verdict.value in ("RED", "UNPROVEN") and pf.is_critical:
+                                        gate_passed = False
+                                        gate_reason = (
+                                            f"Polyspace: {pf.verdict.value} "
+                                            f"{pf.property_category} in {ff.path}:{pf.line_number}"
+                                        )
+                                        break
+                        except ImportError:
+                            self.log.debug("LDRA/Polyspace server not available — skipping")
+                        except Exception as exc:
+                            self.log.warning(f"LDRA/Polyspace gate failed for {ff.path}: {exc}")
+                        if not gate_passed:
+                            break
+
             fix.gate_passed = gate_passed
             fix.gate_reason = gate_reason
             await self.storage.upsert_fix(fix)
@@ -799,6 +860,28 @@ class StabilizerController:
         combined: list[tuple[str, str, str]] = []  # (path, content, patch)
         all_ids: list[str] = []
 
+        # ── Determine VCS mode ──────────────────────────────────────────────────
+        import shutil
+        _jj_ok  = bool(shutil.which("jj"))
+        _git_ok = bool(shutil.which("git"))
+
+        # When JJ is available: open a new JJ change before writing files,
+        # then describe it after — giving us lock-free, atomic commit semantics.
+        jj_change_opened = False
+        if _jj_ok:
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["jj", "new", "--message",
+                     f"rhodawk: open fix batch {module}/{self.run.id[:8]}"],
+                    cwd=str(self.config.repo_root),
+                    capture_output=True, timeout=15,
+                )
+                jj_change_opened = True
+                self.log.info(f"[commit] JJ new change opened for module={module}")
+            except Exception as exc:
+                self.log.warning(f"[commit] jj new failed ({exc}), falling back to direct write")
+
         for fix in fixes:
             for ff in fix.fixed_files:
                 try:
@@ -807,11 +890,15 @@ class StabilizerController:
                     abs_path = (self.config.repo_root / ff.path).resolve()
                     abs_path.parent.mkdir(parents=True, exist_ok=True)
 
+                    # Keep .orig backup for revert / staleness detection
+                    orig_backup = Path(str(abs_path) + ".orig")
+                    if abs_path.exists() and not orig_backup.exists():
+                        import shutil as _shutil
+                        _shutil.copy2(abs_path, orig_backup)
+
                     if ff.patch_mode == PatchMode.UNIFIED_DIFF and ff.patch:
-                        # Apply unified diff patch surgically
                         await self._apply_patch(abs_path, ff.patch)
                     else:
-                        # Full file replacement (small files only)
                         abs_path.write_text(ff.content, encoding="utf-8")
 
                     combined.append((ff.path, ff.content, ff.patch))
@@ -846,6 +933,57 @@ class StabilizerController:
                         f"fix {fix.id[:12]}. Reverting commit."
                     )
                     await self._revert_fix(fix)
+                    # If JJ was used, abandon the change on regression
+                    if jj_change_opened:
+                        try:
+                            import subprocess as _sp
+                            _sp.run(
+                                ["jj", "abandon"],
+                                cwd=str(self.config.repo_root),
+                                capture_output=True, timeout=15,
+                            )
+                            jj_change_opened = False
+                        except Exception:
+                            pass
+                    return  # do not PR on regression
+
+        # ── Finalise the VCS change ─────────────────────────────────────────────
+        commit_msg = (
+            f"[rhodawk/{module}] fix {len(all_ids)} issues "
+            f"(run={self.run.id[:8]} cycle={self.run.cycle_count})"
+        )
+
+        if jj_change_opened and combined:
+            # JJ path: describe the already-opened change
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["jj", "describe", "--message", commit_msg],
+                    cwd=str(self.config.repo_root),
+                    capture_output=True, timeout=15,
+                )
+                self.log.info(f"[commit] JJ change described: {commit_msg}")
+            except Exception as exc:
+                self.log.warning(f"[commit] jj describe failed: {exc}")
+        elif _git_ok and combined:
+            # Git fallback: stage and commit
+            try:
+                import subprocess as _sp
+                paths_to_stage = [ff.path for ff in [f for fix in fixes for ff in fix.fixed_files]]
+                _sp.run(
+                    ["git", "add", "--"] + paths_to_stage,
+                    cwd=str(self.config.repo_root),
+                    capture_output=True, timeout=30,
+                )
+                _sp.run(
+                    ["git", "commit", "--message", commit_msg,
+                     "--author", "Rhodawk AI <ai@rhodawk.local>"],
+                    cwd=str(self.config.repo_root),
+                    capture_output=True, timeout=30,
+                )
+                self.log.info(f"[commit] git commit: {commit_msg}")
+            except Exception as exc:
+                self.log.warning(f"[commit] git commit failed: {exc}")
 
         if self.pr_manager and combined:
             try:
@@ -867,6 +1005,7 @@ class StabilizerController:
                         "- ✅ Multi-model adversarial review\n"
                         "- ✅ Consequence reasoning (PlannerAgent)\n"
                         f"- ✅ Independence verified: fixer≠reviewer model family\n"
+                        f"- VCS: {'JJ (lock-free)' if jj_change_opened else 'git'}\n"
                         f"- Domain: {self.config.domain_mode.value}"
                     ),
                 )
@@ -1041,6 +1180,7 @@ class StabilizerController:
             self.run.finished_at = datetime.now(tz=timezone.utc)
             await self.storage.update_run_status(self.run.id, status)
             await self._trail("RUN_FINALISED", self.run.id, "run", after=status.value)
+            self._langsmith.end_run(self.run.id, status=status.value)
             self.log.info(f"Run {self.run.id[:8]} finalised: {status.value}")
             if status == RunStatus.STABILIZED:
                 self.log.info(
