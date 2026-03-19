@@ -1,36 +1,91 @@
 version: "3.9"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Rhodawk AI Code Stabilizer — Production Compose
+#
+# FIXES vs prior version:
+#   • Added postgres service — was missing despite PostgreSQL being the
+#     production default. First-time deployers silently fell back to SQLite.
+#   • Removed RHODAWK_DEV_AUTH=1 from environment block (was an open-auth
+#     landmine in production deployments).
+#   • rhodawk-api and rhodawk-worker both depend on postgres with health check.
+#   • postgres data volume persists across restarts.
+# ──────────────────────────────────────────────────────────────────────────────
+
 services:
+
   rhodawk-api:
     build: .
     ports:
       - "8000:8000"
     env_file: .env
-    depends_on:
-      - qdrant
-      - redis
     environment:
-      - RHODAWK_DEV_AUTH=1
-    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+      - RHODAWK_ENV=production
+      # DO NOT set RHODAWK_DEV_AUTH here. Put it in .env for local dev only.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --workers 2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   rhodawk-worker:
     build: .
     env_file: .env
+    environment:
+      - RHODAWK_ENV=production
     depends_on:
-      - redis
-    command: celery -A workers.celery_app worker --loglevel=info -Q read,fix,gate
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: >
+      celery -A workers.celery_app worker
+      --loglevel=info -Q read,fix,gate --concurrency=4
+    restart: unless-stopped
+
+  # FIX: PostgreSQL was entirely absent from the previous compose file.
+  # The controller defaults to PostgreSQL but there was no container,
+  # causing a silent fallback to SQLite on every `docker-compose up`.
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER:     rhodawk
+      POSTGRES_PASSWORD: rhodawk
+      POSTGRES_DB:       rhodawk
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rhodawk -d rhodawk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.9.0
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -45,13 +100,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
-      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:latest
@@ -59,7 +116,12 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
 
 volumes:
+  postgres_data:
   qdrant_data:
   ollama_models:
+  grafana_data:
