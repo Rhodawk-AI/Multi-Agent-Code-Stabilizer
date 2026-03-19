@@ -154,10 +154,16 @@ class DeerFlowOrchestrator:
 
     def _make_consensus_step(self, c) -> Callable[[], Awaitable[Any]]:
         async def _consensus() -> Any:
-            # Audit step stored its result in controller state
+            # FIX: _last_audit_issues is now set by the fixed run_audit_phase().
+            # getattr fallback to [] is kept for test harness compatibility.
             issues = getattr(c, "_last_audit_issues", [])
+            if not issues:
+                log.warning(
+                    "[DeerFlow] _last_audit_issues is empty — audit phase may have "
+                    "produced no findings or run_audit_phase() was not called first."
+                )
             approved = await c.run_consensus_phase(issues)
-            c._last_approved_issues = approved
+            # run_consensus_phase() also sets c._last_approved_issues itself
             return approved
         return _consensus
 
