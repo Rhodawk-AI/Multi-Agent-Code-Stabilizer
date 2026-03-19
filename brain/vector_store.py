@@ -1,376 +1,175 @@
 """
-brain/vector_store.py
-=====================
-Semantic vector store for MACS using ChromaDB.
-
-Closes GAP-8: the ``vector_store_enabled`` flag existed in config/default.toml
-and BrainConfig, but the implementation was absent.
-
-Architecture
-────────────
-• ``VectorBrain`` wraps a persistent ChromaDB collection.
-• The ``ReaderAgent`` calls ``index_chunk()`` after each ``append_chunk()``
-  when ``vector_store_enabled=True``.
-• Any agent or controller can call ``find_similar()`` to find semantically
-  related code chunks — e.g. "all places that handle balance arithmetic" for
-  finance domain analysis, or "all safety gate patterns" for architecture audit.
-• Falls back to a no-op stub when chromadb is not installed so the system
-  degrades gracefully.
-
-Dependencies
-────────────
-    pip install chromadb sentence-transformers
-
-Notes
-─────
-• We use ``all-MiniLM-L6-v2`` (22 MB) as the default embedding model.
-  For air-gapped deployments, supply ``embedding_function=None`` to use
-  ChromaDB's built-in hash-based embedder (lower quality but zero deps).
-• The ChromaDB collection is created with cosine distance — appropriate for
-  code summaries where magnitude is less meaningful than direction.
+brain/vector_store.py — VectorBrain with Qdrant + ChromaDB backends.
+Exposes is_available, index_chunk(), find_similar_to_issue().
 """
 from __future__ import annotations
-
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional imports — graceful degradation
-# ──────────────────────────────────────────────────────────────────────────────
 
-try:
-    import chromadb                                          # type: ignore[import]
-    from chromadb.config import Settings as _ChromaSettings  # type: ignore[import]
-    _CHROMA_AVAILABLE = True
-except ImportError:
-    _CHROMA_AVAILABLE = False
-    log.info(
-        "chromadb not installed — VectorBrain operating in stub mode. "
-        "Run: pip install chromadb sentence-transformers"
-    )
-
-try:
-    from chromadb.utils.embedding_functions import (         # type: ignore[import]
-        SentenceTransformerEmbeddingFunction as _STEF,
-    )
-    _STEF_AVAILABLE = True
-except (ImportError, Exception):
-    _STEF_AVAILABLE = False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Result types
-# ──────────────────────────────────────────────────────────────────────────────
-
+@dataclass
 class VectorSearchResult:
-    """Single result from ``VectorBrain.find_similar()``."""
+    chunk_id:   str   = ""
+    file_path:  str   = ""
+    line_start: int   = 0
+    line_end:   int   = 0
+    language:   str   = ""
+    summary:    str   = ""
+    distance:   float = 1.0
 
-    __slots__ = ("chunk_id", "file_path", "line_start", "line_end",
-                 "language", "summary", "distance")
-
-    def __init__(
-        self,
-        chunk_id:   str,
-        file_path:  str,
-        line_start: int,
-        line_end:   int,
-        language:   str,
-        summary:    str,
-        distance:   float,
-    ) -> None:
-        self.chunk_id   = chunk_id
-        self.file_path  = file_path
-        self.line_start = line_start
-        self.line_end   = line_end
-        self.language   = language
-        self.summary    = summary
-        self.distance   = distance
-
-    def __repr__(self) -> str:
-        return (
-            f"VectorSearchResult(file={self.file_path!r}, "
-            f"L{self.line_start}-{self.line_end}, dist={self.distance:.3f})"
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# VectorBrain
-# ──────────────────────────────────────────────────────────────────────────────
 
 class VectorBrain:
-    """
-    Persistent vector index over code chunks.
-
-    Parameters
-    ----------
-    store_path:
-        Directory for ChromaDB's on-disk storage.
-    embedding_model:
-        HuggingFace sentence-transformers model name.
-        Pass ``None`` to use ChromaDB's built-in hash embedder.
-    collection_name:
-        ChromaDB collection name.
-    """
-
-    COLLECTION_NAME = "macs_code_chunks"
-
     def __init__(
         self,
-        store_path:      str | Path = ".stabilizer/vectors",
-        embedding_model: str | None = "all-MiniLM-L6-v2",
-        collection_name: str        = COLLECTION_NAME,
+        store_path: str = "",
+        qdrant_url: str = "http://localhost:6333",
+        collection: str = "rhodawk_chunks",
     ) -> None:
-        self._store_path   = Path(store_path)
-        self._model_name   = embedding_model
-        self._collection_name = collection_name
-        self._client: Any       = None
-        self._collection: Any   = None
-        self._available: bool   = False
-
-    # ── Lifecycle ────────────────────────────────────────────────────────────
-
-    def initialise(self) -> None:
-        """Open (or create) the ChromaDB collection.  Idempotent."""
-        if not _CHROMA_AVAILABLE:
-            log.info("VectorBrain: chromadb unavailable — running as stub")
-            return
-
-        self._store_path.mkdir(parents=True, exist_ok=True)
-
-        try:
-            self._client = chromadb.PersistentClient(
-                path=str(self._store_path),
-                settings=_ChromaSettings(anonymized_telemetry=False),
-            )
-        except TypeError:
-            # Older chromadb versions don't accept Settings in PersistentClient
-            self._client = chromadb.PersistentClient(path=str(self._store_path))
-
-        ef = self._make_embedding_function()
-
-        try:
-            self._collection = self._client.get_or_create_collection(
-                name=self._collection_name,
-                embedding_function=ef,
-                metadata={"hnsw:space": "cosine"},
-            )
-            self._available = True
-            log.info(
-                f"VectorBrain: collection '{self._collection_name}' ready "
-                f"at {self._store_path} "
-                f"({self._collection.count()} existing documents)"
-            )
-        except Exception as exc:
-            log.error(f"VectorBrain: failed to open collection: {exc}")
-
-    def _make_embedding_function(self) -> Any:
-        """Return best available embedding function, falling back gracefully."""
-        if self._model_name and _STEF_AVAILABLE:
-            try:
-                ef = _STEF(model_name=self._model_name)
-                log.info(f"VectorBrain: using SentenceTransformer '{self._model_name}'")
-                return ef
-            except Exception as exc:
-                log.warning(f"VectorBrain: SentenceTransformer failed ({exc}) — using default")
-        log.info("VectorBrain: using ChromaDB default embedding function")
-        return None   # ChromaDB will use its built-in
-
-    def close(self) -> None:
-        self._client    = None
-        self._collection = None
-        self._available = False
+        self.store_path = store_path
+        self.qdrant_url = qdrant_url
+        self.collection = collection
+        self._client: Any = None
+        self._backend = "none"
 
     @property
     def is_available(self) -> bool:
-        return self._available
+        return self._client is not None
 
-    # ── Write ────────────────────────────────────────────────────────────────
+    def initialise(self) -> None:
+        # Try Qdrant first
+        try:
+            from qdrant_client import QdrantClient  # type: ignore
+            self._client  = QdrantClient(url=self.qdrant_url, timeout=5)
+            self._client.get_collections()
+            self._backend = "qdrant"
+            log.info(f"VectorBrain: Qdrant connected at {self.qdrant_url}")
+            return
+        except Exception:
+            pass
+        # Try ChromaDB
+        try:
+            import chromadb  # type: ignore
+            path = self.store_path or "/tmp/rhodawk_vectors"
+            self._client  = chromadb.PersistentClient(path=path)
+            self._backend = "chroma"
+            log.info(f"VectorBrain: ChromaDB at {path}")
+            return
+        except Exception:
+            pass
+        log.info("VectorBrain: no vector backend available — semantic search disabled")
 
     def index_chunk(
-        self,
-        chunk_id:   str,
-        file_path:  str,
-        line_start: int,
-        line_end:   int,
-        language:   str,
-        summary:    str,
-        observations: list[str],
+        self, chunk_id: str, file_path: str, line_start: int, line_end: int,
+        language: str, summary: str, observations: list[str],
     ) -> None:
-        """
-        Upsert a single code chunk into the vector index.
-
-        The document text is ``summary + " " + " ".join(observations)`` which
-        gives the model both high-level context and concrete low-level signals.
-        """
-        if not self._available:
+        if not self._client:
             return
-
-        document = (summary + " " + " ".join(observations)).strip()
-        if not document:
-            return
-
-        metadata: dict[str, Any] = {
-            "file_path":  file_path,
-            "line_start": line_start,
-            "line_end":   line_end,
-            "language":   language,
-            "summary":    summary[:500],   # ChromaDB metadata values must be str/int/float
-        }
-
+        text = f"{file_path} {summary} {' '.join(observations[:5])}"
         try:
-            self._collection.upsert(
-                ids=[chunk_id],
-                documents=[document],
-                metadatas=[metadata],
-            )
+            if self._backend == "qdrant":
+                self._qdrant_upsert(chunk_id, file_path, line_start, line_end,
+                                    language, summary, text)
+            elif self._backend == "chroma":
+                self._chroma_upsert(chunk_id, file_path, line_start, line_end,
+                                    language, summary, text)
         except Exception as exc:
-            log.debug(f"VectorBrain.index_chunk failed for {chunk_id}: {exc}")
-
-    def index_chunks_batch(self, chunks: list[dict]) -> None:
-        """
-        Bulk upsert.  Each dict must have the same keys as the parameters of
-        ``index_chunk()``.
-        """
-        if not self._available or not chunks:
-            return
-
-        ids       = []
-        documents = []
-        metadatas = []
-
-        for c in chunks:
-            doc = (c.get("summary", "") + " " + " ".join(c.get("observations", []))).strip()
-            if not doc:
-                continue
-            ids.append(c["chunk_id"])
-            documents.append(doc)
-            metadatas.append({
-                "file_path":  c["file_path"],
-                "line_start": c.get("line_start", 0),
-                "line_end":   c.get("line_end", 0),
-                "language":   c.get("language", "unknown"),
-                "summary":    c.get("summary", "")[:500],
-            })
-
-        if not ids:
-            return
-
-        try:
-            self._collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-            log.debug(f"VectorBrain: indexed {len(ids)} chunks")
-        except Exception as exc:
-            log.warning(f"VectorBrain.index_chunks_batch failed: {exc}")
-
-    # ── Read ─────────────────────────────────────────────────────────────────
-
-    def find_similar(
-        self,
-        query:          str,
-        n:              int           = 10,
-        language_filter: str | None   = None,
-        file_filter:    str | None    = None,
-    ) -> list[VectorSearchResult]:
-        """
-        Semantic nearest-neighbour search.
-
-        Parameters
-        ----------
-        query:
-            Natural language or code snippet to search for.
-        n:
-            Maximum results to return.
-        language_filter:
-            If set, restrict results to chunks from files of this language.
-        file_filter:
-            If set, restrict results to this specific file path.
-
-        Returns
-        -------
-        List of ``VectorSearchResult`` sorted by ascending cosine distance
-        (lower = more similar).
-        """
-        if not self._available:
-            return []
-
-        where: dict[str, Any] | None = None
-        filters: list[dict] = []
-        if language_filter:
-            filters.append({"language": {"$eq": language_filter}})
-        if file_filter:
-            filters.append({"file_path": {"$eq": file_filter}})
-
-        if len(filters) == 1:
-            where = filters[0]
-        elif len(filters) > 1:
-            where = {"$and": filters}
-
-        try:
-            raw = self._collection.query(
-                query_texts=[query],
-                n_results=min(n, max(1, self._collection.count())),
-                where=where,
-            )
-        except Exception as exc:
-            log.warning(f"VectorBrain.find_similar failed: {exc}")
-            return []
-
-        results: list[VectorSearchResult] = []
-        ids       = raw.get("ids",       [[]])[0]
-        metas     = raw.get("metadatas", [[]])[0]
-        distances = raw.get("distances", [[]])[0]
-
-        for chunk_id, meta, dist in zip(ids, metas, distances):
-            results.append(VectorSearchResult(
-                chunk_id   = chunk_id,
-                file_path  = meta.get("file_path",  ""),
-                line_start = int(meta.get("line_start", 0)),
-                line_end   = int(meta.get("line_end",   0)),
-                language   = meta.get("language",   "unknown"),
-                summary    = meta.get("summary",    ""),
-                distance   = float(dist),
-            ))
-
-        return results
+            log.debug(f"VectorBrain.index_chunk failed: {exc}")
 
     def find_similar_to_issue(
-        self,
-        issue_description: str,
-        n: int = 8,
+        self, query: str, n: int = 8
     ) -> list[VectorSearchResult]:
-        """
-        Convenience wrapper: find code chunks semantically related to a given
-        issue description.  Used by the fixer to gather cross-file context.
-        """
-        return self.find_similar(
-            query=f"code pattern: {issue_description}",
-            n=n,
+        if not self._client:
+            return []
+        try:
+            if self._backend == "qdrant":
+                return self._qdrant_search(query, n)
+            elif self._backend == "chroma":
+                return self._chroma_search(query, n)
+        except Exception as exc:
+            log.debug(f"VectorBrain.find_similar_to_issue failed: {exc}")
+        return []
+
+    def _embed(self, text: str) -> list[float]:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            if not hasattr(self, "_model"):
+                self._model = SentenceTransformer("all-MiniLM-L6-v2")
+            return self._model.encode(text).tolist()
+        except Exception:
+            # Fallback: deterministic hash embedding (very poor quality but won't crash)
+            import hashlib
+            h = hashlib.sha256(text.encode()).digest()
+            return [b / 255.0 for b in h[:16]] * 24  # 384 dims
+
+    def _qdrant_upsert(self, chunk_id, file_path, line_start, line_end,
+                       language, summary, text) -> None:
+        from qdrant_client.models import PointStruct  # type: ignore
+        vec = self._embed(text)
+        self._client.upsert(
+            collection_name=self.collection,
+            points=[PointStruct(
+                id=abs(hash(chunk_id)) % (10**9),
+                vector=vec,
+                payload={
+                    "chunk_id": chunk_id, "file_path": file_path,
+                    "line_start": line_start, "line_end": line_end,
+                    "language": language, "summary": summary,
+                },
+            )],
         )
 
-    def collection_size(self) -> int:
-        if not self._available:
-            return 0
-        try:
-            return self._collection.count()
-        except Exception:
-            return 0
+    def _qdrant_search(self, query: str, n: int) -> list[VectorSearchResult]:
+        vec = self._embed(query)
+        hits = self._client.search(
+            collection_name=self.collection, query_vector=vec, limit=n
+        )
+        return [
+            VectorSearchResult(
+                chunk_id=str(h.payload.get("chunk_id","")),
+                file_path=h.payload.get("file_path",""),
+                line_start=h.payload.get("line_start",0),
+                line_end=h.payload.get("line_end",0),
+                language=h.payload.get("language",""),
+                summary=h.payload.get("summary",""),
+                distance=1.0 - h.score,
+            )
+            for h in hits
+        ]
 
-    def delete_file_chunks(self, file_path: str) -> None:
-        """Remove all vectors for *file_path* — called when a file is re-indexed."""
-        if not self._available:
-            return
-        try:
-            self._collection.delete(where={"file_path": {"$eq": file_path}})
-        except Exception as exc:
-            log.debug(f"VectorBrain.delete_file_chunks({file_path}): {exc}")
+    def _chroma_upsert(self, chunk_id, file_path, line_start, line_end,
+                       language, summary, text) -> None:
+        coll = self._client.get_or_create_collection(self.collection)
+        coll.upsert(
+            ids=[chunk_id],
+            documents=[text],
+            metadatas=[{"file_path": file_path, "line_start": line_start,
+                        "line_end": line_end, "language": language,
+                        "summary": summary}],
+        )
 
-    def summary(self) -> dict:
-        return {
-            "available":       self._available,
-            "collection":      self._collection_name,
-            "store_path":      str(self._store_path),
-            "document_count":  self.collection_size(),
-            "embedding_model": self._model_name or "chromadb-default",
-        }
+    def _chroma_search(self, query: str, n: int) -> list[VectorSearchResult]:
+        coll = self._client.get_or_create_collection(self.collection)
+        results = coll.query(query_texts=[query], n_results=n)
+        out = []
+        for i, (doc_id, meta, dist) in enumerate(zip(
+            results["ids"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        )):
+            out.append(VectorSearchResult(
+                chunk_id=doc_id,
+                file_path=meta.get("file_path",""),
+                line_start=meta.get("line_start",0),
+                line_end=meta.get("line_end",0),
+                language=meta.get("language",""),
+                summary=meta.get("summary",""),
+                distance=float(dist),
+            ))
+        return out
+
+    def close(self) -> None:
+        self._client = None

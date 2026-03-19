@@ -586,3 +586,139 @@ def get_storage(db_path: str = ".stabilizer/brain.db") -> BrainStorage:
         return PostgresBrainStorage(fallback_db_path=db_path)
     from pathlib import Path
     return SQLiteBrainStorage(db_path)
+
+    # ── New abstract method implementations (delegate to SQLite fallback) ──────
+
+    async def log_llm_session(self, session: dict) -> None:
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.log_llm_session(session)
+            return
+        try:
+            import uuid, datetime
+            await self._execute("""
+                INSERT INTO llm_sessions
+                    (id, run_id, agent_type, model, prompt_tokens, completion_tokens,
+                     cost_usd, duration_ms, success, error, started_at)
+                VALUES (:id,:run_id,:at,:model,:pt,:ct,:cost,:dur,:success,:error,:ts)
+                ON CONFLICT(id) DO NOTHING
+            """, {
+                "id": uuid.uuid4().hex, "run_id": session.get("run_id",""),
+                "at": session.get("agent_type",""), "model": session.get("model",""),
+                "pt": session.get("prompt_tokens",0), "ct": session.get("completion_tokens",0),
+                "cost": session.get("cost_usd",0.0), "dur": session.get("duration_ms",0),
+                "success": 1 if session.get("success") else 0,
+                "error": session.get("error",""),
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            })
+        except Exception:
+            if self._fallback:
+                await self._fallback.log_llm_session(session)
+
+    async def upsert_escalation(self, esc) -> None:
+        if self._fallback: await self._fallback.upsert_escalation(esc)
+
+    async def get_escalation(self, escalation_id: str):
+        if self._fallback: return await self._fallback.get_escalation(escalation_id)
+        return None
+
+    async def list_escalations(self, run_id: str = "", status=None) -> list:
+        if self._fallback: return await self._fallback.list_escalations(run_id=run_id, status=status)
+        return []
+
+    async def upsert_baseline(self, baseline) -> None:
+        if self._fallback: await self._fallback.upsert_baseline(baseline)
+
+    async def get_baseline(self, baseline_id: str):
+        if self._fallback: return await self._fallback.get_baseline(baseline_id)
+        return None
+
+    async def get_active_baseline(self, run_id: str):
+        if self._fallback: return await self._fallback.get_active_baseline(run_id)
+        return None
+
+    async def list_baselines(self, run_id: str = "") -> list:
+        if self._fallback: return await self._fallback.list_baselines(run_id=run_id)
+        return []
+
+    async def upsert_staleness_mark(self, mark) -> None:
+        if self._fallback: await self._fallback.upsert_staleness_mark(mark)
+
+    async def list_stale_functions(self, file_path: str = "", run_id: str = "") -> list:
+        if self._fallback: return await self._fallback.list_stale_functions(file_path=file_path, run_id=run_id)
+        return []
+
+    async def clear_staleness_mark(self, file_path: str, function_name: str) -> None:
+        if self._fallback: await self._fallback.clear_staleness_mark(file_path, function_name)
+
+    async def upsert_ldra_finding(self, finding) -> None:
+        if self._fallback: await self._fallback.upsert_ldra_finding(finding)
+
+    async def list_ldra_findings(self, run_id: str = "", file_path: str = "") -> list:
+        if self._fallback: return await self._fallback.list_ldra_findings(run_id=run_id, file_path=file_path)
+        return []
+
+    async def upsert_polyspace_finding(self, finding) -> None:
+        if self._fallback: await self._fallback.upsert_polyspace_finding(finding)
+
+    async def list_polyspace_findings(self, run_id: str = "") -> list:
+        if self._fallback: return await self._fallback.list_polyspace_findings(run_id=run_id)
+        return []
+
+    async def upsert_cbmc_result(self, result) -> None:
+        if self._fallback: await self._fallback.upsert_cbmc_result(result)
+
+    async def get_cbmc_result(self, result_id: str):
+        if self._fallback: return await self._fallback.get_cbmc_result(result_id)
+        return None
+
+    async def upsert_rtm_entry(self, entry) -> None:
+        if self._fallback: await self._fallback.upsert_rtm_entry(entry)
+
+    async def get_rtm_for_issue(self, issue_id: str):
+        if self._fallback: return await self._fallback.get_rtm_for_issue(issue_id)
+        return None
+
+    async def list_rtm_entries(self, run_id: str = "") -> list:
+        if self._fallback: return await self._fallback.list_rtm_entries(run_id=run_id)
+        return []
+
+    async def upsert_independence_record(self, record) -> None:
+        if self._fallback: await self._fallback.upsert_independence_record(record)
+
+    async def get_independence_record(self, fix_attempt_id: str):
+        if self._fallback: return await self._fallback.get_independence_record(fix_attempt_id)
+        return None
+
+    async def upsert_sas(self, sas) -> None:
+        if self._fallback: await self._fallback.upsert_sas(sas)
+
+    async def get_sas(self, run_id: str):
+        if self._fallback: return await self._fallback.get_sas(run_id)
+        return None
+
+    async def upsert_sci(self, sci) -> None:
+        if self._fallback: await self._fallback.upsert_sci(sci)
+
+    async def get_sci(self, baseline_id: str):
+        if self._fallback: return await self._fallback.get_sci(baseline_id)
+        return None
+
+    async def upsert_formal_result(self, result) -> None:
+        if self._fallback: await self._fallback.upsert_formal_result(result)
+
+    async def upsert_planner_record(self, record) -> None:
+        if self._fallback: await self._fallback.upsert_planner_record(record)
+
+    async def append_patrol_event(self, event) -> None:
+        if self._fallback: await self._fallback.append_patrol_event(event)
+
+    async def upsert_test_result(self, result) -> None:
+        if self._fallback: await self._fallback.upsert_test_result(result)
+
+    async def update_issue_status(self, issue_id: str, status: str, reason: str = "") -> None:
+        if self._fallback: await self._fallback.update_issue_status(issue_id, status, reason)
+
+    async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list:
+        if self._fallback: return await self._fallback.list_audit_trail(run_id, limit)
+        return []

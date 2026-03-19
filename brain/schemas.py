@@ -1,18 +1,30 @@
 """
 brain/schemas.py
 ================
-All Pydantic v2 data models for MACS (Multi-Agent Code Stabilizer).
+All Pydantic v2 data models for Rhodawk AI Code Stabilizer.
 
-CHANGELOG vs previous version
-──────────────────────────────
-• Added DomainMode enum (general / finance / medical / military / embedded)
-• Added ConsensusRule + ConsensusRequirement for the weighted voting engine
-• Added GraphNode + GraphEdge + DependencySnapshot for the dependency graph layer
-• Added FormalVerificationResult for Z3/CBMC proofs attached to planner records
-• Added TestRunResult for post-fix test execution tracking
-• Extended PlannerRecord with formal_proof_available flag
-• Extended FixAttempt with test_run_id foreign key
-• All existing models preserved without breaking changes
+PRODUCTION FIXES vs audit report
+──────────────────────────────────
+• Added MilStd882eCategory (CAT_I–IV) mapped to Severity
+• Added RequirementTraceability for DO-178C RTM (Table A-5)
+• Added BaselineRecord for DO-178C Sec 11 configuration management
+• Added SoftwareConfigurationIndex for DO-178C SCM evidence
+• Added SoftwareAccomplishmentSummary for DO-178C Sec 11.20
+• Added ReviewerIndependenceRecord enforcing model-family separation (DO-178C 6.3.4)
+• Added FunctionStalenessMark for function-level incremental re-audit
+• Added EscalationRecord with blocking approval (DO-178C 6.3.4 / MIL-STD-882E Task 402)
+• Added ComplianceViolation, DeviationRecord for rule-level findings
+• Added CbmcVerificationResult for CBMC bounded model checker evidence
+• Added PolyspaceFinding for abstract interpretation evidence
+• Added LdraFinding for LDRA Testbed MISRA/DO-178C traceability
+• Extended Issue: requirement_id, test_case_id, cwe_id, misra_rule, jsf_rule,
+  cert_rule, mil882e_category, deviation_record, function_name
+• Extended FixAttempt: reviewer_model_family, fixer_model_family, patch_mode,
+  cbmc_result_id, polyspace_verdict, unified-diff support
+• Extended AuditTrailEntry: artifact_id, artifact_type, baseline_id, change_request_id
+• Extended AuditRun: software_level, tool_qualification_level, baseline_id
+• Added PatchMode enum (FULL_FILE / UNIFIED_DIFF / AST_REWRITE)
+• Removed FIX_RATIO_MIN — replaced by compiler-based correctness gate
 """
 from __future__ import annotations
 
@@ -24,17 +36,21 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def _new_id() -> str:
+    return str(uuid.uuid4())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Core enumerations
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Severity(str, Enum):
     CRITICAL = "CRITICAL"
@@ -43,16 +59,38 @@ class Severity(str, Enum):
     INFO     = "INFO"
 
 
+class MilStd882eCategory(str, Enum):
+    """MIL-STD-882E Mishap Risk Assessment Code — software-level mapping."""
+    CAT_I   = "CAT_I"    # Catastrophic
+    CAT_II  = "CAT_II"   # Critical
+    CAT_III = "CAT_III"  # Marginal
+    CAT_IV  = "CAT_IV"   # Negligible
+    NONE    = "NONE"
+
+
+SEVERITY_TO_MIL882E: dict[Severity, MilStd882eCategory] = {
+    Severity.CRITICAL: MilStd882eCategory.CAT_I,
+    Severity.MAJOR:    MilStd882eCategory.CAT_II,
+    Severity.MINOR:    MilStd882eCategory.CAT_III,
+    Severity.INFO:     MilStd882eCategory.CAT_IV,
+}
+
+
 class IssueStatus(str, Enum):
-    OPEN           = "OPEN"
-    FIX_QUEUED     = "FIX_QUEUED"
-    FIX_GENERATED  = "FIX_GENERATED"
-    REVIEWING      = "REVIEWING"
-    APPROVED       = "APPROVED"
-    REJECTED       = "REJECTED"
-    CLOSED         = "CLOSED"
-    ESCALATED      = "ESCALATED"
-    REGRESSED      = "REGRESSED"
+    OPEN                = "OPEN"
+    FIX_QUEUED          = "FIX_QUEUED"
+    FIX_GENERATED       = "FIX_GENERATED"
+    REVIEWING           = "REVIEWING"
+    APPROVED            = "APPROVED"
+    REJECTED            = "REJECTED"
+    CLOSED              = "CLOSED"
+    ESCALATED           = "ESCALATED"
+    ESCALATION_PENDING  = "ESCALATION_PENDING"
+    ESCALATION_APPROVED = "ESCALATION_APPROVED"
+    ESCALATION_REJECTED = "ESCALATION_REJECTED"
+    REGRESSED           = "REGRESSED"
+    DEFERRED            = "DEFERRED"
+    BASELINE_LOCKED     = "BASELINE_LOCKED"
 
 
 class FileStatus(str, Enum):
@@ -61,12 +99,15 @@ class FileStatus(str, Enum):
     READ     = "READ"
     MODIFIED = "MODIFIED"
     LOCKED   = "LOCKED"
+    STALE    = "STALE"
+    PARTIAL  = "PARTIAL"
 
 
 class ReviewVerdict(str, Enum):
-    APPROVED = "APPROVED"
-    REJECTED = "REJECTED"
-    ESCALATE = "ESCALATE"
+    APPROVED         = "APPROVED"
+    REJECTED         = "REJECTED"
+    ESCALATE         = "ESCALATE"
+    APPROVED_WARNING = "APPROVED_WARNING"
 
 
 class ExecutorType(str, Enum):
@@ -82,6 +123,12 @@ class ExecutorType(str, Enum):
     FORMAL       = "FORMAL"
     DOMAIN       = "DOMAIN"
     TEST_RUNNER  = "TEST_RUNNER"
+    CBMC         = "CBMC"
+    POLYSPACE    = "POLYSPACE"
+    LDRA         = "LDRA"
+    MISRA        = "MISRA"
+    CERT         = "CERT"
+    JSF          = "JSF"
 
 
 class ChunkStrategy(str, Enum):
@@ -90,449 +137,707 @@ class ChunkStrategy(str, Enum):
     AST_NODES     = "AST_NODES"
     SKELETON      = "SKELETON"
     SKELETON_ONLY = "SKELETON_ONLY"
+    FUNCTION      = "FUNCTION"
+    PREPROCESSED  = "PREPROCESSED"
 
 
 class RunStatus(str, Enum):
-    RUNNING     = "RUNNING"
-    STABILIZED  = "STABILIZED"
-    HALTED      = "HALTED"
-    ESCALATED   = "ESCALATED"
-    FAILED      = "FAILED"
+    RUNNING           = "RUNNING"
+    STABILIZED        = "STABILIZED"
+    HALTED            = "HALTED"
+    ESCALATED         = "ESCALATED"
+    FAILED            = "FAILED"
+    BASELINE_PENDING  = "BASELINE_PENDING"
+    BASELINE_APPROVED = "BASELINE_APPROVED"
 
 
 class AutonomyLevel(str, Enum):
-    READ_ONLY    = "read_only"
-    PROPOSE_ONLY = "propose_only"
-    AUTO_FIX     = "auto_fix"
+    READ_ONLY       = "READ_ONLY"
+    SUGGEST         = "SUGGEST"
+    AUTO_FIX        = "AUTO_FIX"
+    AUTO_FIX_PR     = "AUTO_FIX_PR"
+    FULL_AUTONOMOUS = "FULL_AUTONOMOUS"
+
+
+class DomainMode(str, Enum):
+    GENERAL   = "GENERAL"
+    FINANCE   = "FINANCE"
+    MEDICAL   = "MEDICAL"
+    MILITARY  = "MILITARY"
+    EMBEDDED  = "EMBEDDED"
+    AEROSPACE = "AEROSPACE"
+    NUCLEAR   = "NUCLEAR"
+
+
+class ReversibilityClass(str, Enum):
+    REVERSIBLE   = "REVERSIBLE"
+    CONDITIONAL  = "CONDITIONAL"
+    IRREVERSIBLE = "IRREVERSIBLE"
 
 
 class PlannerVerdict(str, Enum):
     SAFE              = "SAFE"
     SAFE_WITH_WARNING = "SAFE_WITH_WARNING"
     UNSAFE            = "UNSAFE"
-    NEEDS_SIMULATION  = "NEEDS_SIMULATION"
+    NEEDS_HUMAN       = "NEEDS_HUMAN"
 
-
-class ReversibilityClass(str, Enum):
-    REVERSIBLE   = "REVERSIBLE"
-    IRREVERSIBLE = "IRREVERSIBLE"
-    CONDITIONAL  = "CONDITIONAL"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW — Domain modes for mission-critical contexts
-# ──────────────────────────────────────────────────────────────────────────────
-
-class DomainMode(str, Enum):
-    """Selects which mission-critical rule set to inject into auditors and the gate."""
-    GENERAL   = "general"    # Default — standard best-practices
-    FINANCE   = "finance"    # PCI-DSS, no float on monetary values, atomic balance ops
-    MEDICAL   = "medical"    # IEC 62304, HIPAA, dosage safety, audit trail completeness
-    MILITARY  = "military"   # MISRA C:2012, DO-178C, deterministic execution, no malloc
-    EMBEDDED  = "embedded"   # RTOS rules: no dynamic alloc, bounded loops, no stdio
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW — Consensus engine schemas
-# ──────────────────────────────────────────────────────────────────────────────
 
 class DisagreementAction(str, Enum):
-    ESCALATE_HUMAN  = "ESCALATE_HUMAN"
-    DEEPER_ANALYSIS = "DEEPER_ANALYSIS"
-    FLAG_UNCERTAIN  = "FLAG_UNCERTAIN"
-    AUTO_REJECT     = "AUTO_REJECT"
+    FLAG_UNCERTAIN = "FLAG_UNCERTAIN"
+    ESCALATE_HUMAN = "ESCALATE_HUMAN"
+    BLOCK          = "BLOCK"
+    AUTO_RESOLVE   = "AUTO_RESOLVE"
 
-
-class ConsensusRule(BaseModel):
-    """
-    Defines what it takes for a finding at a given severity to proceed to fix.
-    Enforced by ConsensusEngine in orchestrator/consensus.py.
-    """
-    minimum_agents:         int                = 2
-    required_domains:       list[ExecutorType] = Field(default_factory=list)
-    confidence_floor:       float              = Field(0.75, ge=0.0, le=1.0)
-    disagreement_action:    DisagreementAction = DisagreementAction.FLAG_UNCERTAIN
-    high_centrality_raises: bool               = True
-    """If the target file has betweenness centrality > 0.8, multiply confidence_floor by 1.2."""
-
-
-class ConsensusVote(BaseModel):
-    """Single agent's vote on a fingerprinted finding."""
-    agent_id:     str
-    domain:       ExecutorType
-    confirms:     bool
-    confidence:   float = Field(ge=0.0, le=1.0)
-    reasoning:    str   = ""
-    evidence_lines: list[str] = Field(default_factory=list)
-
-
-class ConsensusResult(BaseModel):
-    """Output of ConsensusEngine.evaluate() for a single fingerprinted finding."""
-    fingerprint:         str
-    approved:            bool
-    weighted_confidence: float  = Field(ge=0.0, le=1.0)
-    votes:               list[ConsensusVote] = Field(default_factory=list)
-    action:              DisagreementAction | None = None
-    reason:              str    = ""
-    evaluated_at:        datetime = Field(default_factory=_utcnow)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW — Dependency graph schemas
-# ──────────────────────────────────────────────────────────────────────────────
-
-class EdgeType(str, Enum):
-    IMPORT      = "import"     # file A imports file B
-    CALL        = "call"       # function in A calls function in B
-    INHERITANCE = "inheritance"# class in A inherits from class in B
-    DATA_FLOW   = "data_flow"  # data flows from A to B
-
-
-class GraphNode(BaseModel):
-    path:            str
-    language:        str             = "unknown"
-    is_load_bearing: bool            = False
-    size_lines:      int             = 0
-    centrality:      float           = 0.0
-    """Betweenness centrality — updated after each graph build."""
-    page_rank:       float           = 0.0
-
-
-class GraphEdge(BaseModel):
-    source:    str
-    target:    str
-    edge_type: EdgeType = EdgeType.IMPORT
-    symbol:    str      = ""
-    """For CALL edges: the fully-qualified symbol name."""
-    run_id:    str      = ""
-
-
-class DependencySnapshot(BaseModel):
-    """Serialized graph snapshot stored in the brain after each read phase."""
-    id:         str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:     str
-    node_count: int      = 0
-    edge_count: int      = 0
-    created_at: datetime = Field(default_factory=_utcnow)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW — Formal verification result
-# ──────────────────────────────────────────────────────────────────────────────
 
 class FormalVerificationStatus(str, Enum):
-    PROVEN_SAFE    = "PROVEN_SAFE"     # Z3 returned UNSAT — property always holds
-    COUNTEREXAMPLE = "COUNTEREXAMPLE"  # Z3 returned SAT — bug found
-    TIMEOUT        = "TIMEOUT"         # Solver exceeded time budget
-    UNSUPPORTED    = "UNSUPPORTED"     # Language/construct not supported
-    ERROR          = "ERROR"           # Solver error
+    PROVED         = "PROVED"
+    REFUTED        = "REFUTED"
+    UNKNOWN        = "UNKNOWN"
+    COUNTEREXAMPLE = "COUNTEREXAMPLE"
+    TIMEOUT        = "TIMEOUT"
+    ERROR          = "ERROR"
+    SKIPPED        = "SKIPPED"
 
-
-class FormalVerificationResult(BaseModel):
-    id:              str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:          str      = ""
-    fix_attempt_id:  str      = ""
-    file_path:       str
-    property_name:   str
-    """Human-readable name of the invariant being verified, e.g. 'balance_non_negative'."""
-    status:          FormalVerificationStatus
-    counterexample:  str      = ""
-    """Z3 model in string form when status == COUNTEREXAMPLE."""
-    proof_summary:   str      = ""
-    solver_used:     str      = "z3"
-    elapsed_ms:      int      = 0
-    evaluated_at:    datetime = Field(default_factory=_utcnow)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW — Test runner result
-# ──────────────────────────────────────────────────────────────────────────────
 
 class TestRunStatus(str, Enum):
-    PASSED       = "PASSED"
-    FAILED       = "FAILED"
-    ERROR        = "ERROR"
-    NO_TESTS     = "NO_TESTS"
-    TIMED_OUT    = "TIMED_OUT"
-    SKIPPED      = "SKIPPED"
+    PASSED  = "PASSED"
+    FAILED  = "FAILED"
+    ERROR   = "ERROR"
+    SKIPPED = "SKIPPED"
+    PARTIAL = "PARTIAL"
 
 
-class TestRunResult(BaseModel):
-    id:              str           = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:          str           = ""
-    fix_attempt_id:  str           = ""
-    status:          TestRunStatus
-    total_tests:     int           = 0
-    passed:          int           = 0
-    failed:          int           = 0
-    errors:          int           = 0
-    duration_ms:     int           = 0
-    failure_summary: str           = ""
-    command_used:    str           = ""
-    created_at:      datetime      = Field(default_factory=_utcnow)
+class ComplianceStandard(str, Enum):
+    DO_178C   = "DO-178C"
+    MISRA_C   = "MISRA-C:2023"
+    MISRA_CPP = "MISRA-C++:2023"
+    CERT_C    = "CERT-C"
+    CERT_CPP  = "CERT-C++"
+    MIL_882E  = "MIL-STD-882E"
+    JSF_AV    = "JSF-AV-RULES"
+    CWE       = "CWE"
+    OWASP     = "OWASP"
+    IEC_61513 = "IEC-61513"
+    IEC_62304 = "IEC-62304"
+    AUTOSAR   = "AUTOSAR-C++14"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Existing models — unchanged except noted
-# ──────────────────────────────────────────────────────────────────────────────
+class PatchMode(str, Enum):
+    FULL_FILE    = "FULL_FILE"
+    UNIFIED_DIFF = "UNIFIED_DIFF"
+    AST_REWRITE  = "AST_REWRITE"
 
-class FileChunkRecord(BaseModel):
-    chunk_id:           str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    file_path:          str
-    chunk_index:        int
-    total_chunks:       int
-    line_start:         int
-    line_end:           int
-    symbols_defined:    list[str] = Field(default_factory=list)
-    symbols_referenced: list[str] = Field(default_factory=list)
-    dependencies:       list[str] = Field(default_factory=list)
-    summary:            str       = ""
-    raw_observations:   list[str] = Field(default_factory=list)
-    token_count:        int       = 0
-    read_at:            datetime  = Field(default_factory=_utcnow)
 
+class ArtifactType(str, Enum):
+    REQUIREMENT = "REQUIREMENT"
+    DESIGN      = "DESIGN"
+    CODE        = "CODE"
+    TEST_CASE   = "TEST_CASE"
+    TEST_RESULT = "TEST_RESULT"
+    COVERAGE    = "COVERAGE"
+    EVIDENCE    = "EVIDENCE"
+    FIX         = "FIX"
+    AUDIT_ENTRY = "AUDIT_ENTRY"
+    BASELINE    = "BASELINE"
+    SAS         = "SAS"
+
+
+class ToolQualificationLevel(str, Enum):
+    TQL_1 = "TQL-1"
+    TQL_2 = "TQL-2"
+    TQL_3 = "TQL-3"
+    TQL_4 = "TQL-4"
+    TQL_5 = "TQL-5"
+    NONE  = "NONE"
+
+
+class SoftwareLevel(str, Enum):
+    DAL_A = "DAL-A"
+    DAL_B = "DAL-B"
+    DAL_C = "DAL-C"
+    DAL_D = "DAL-D"
+    DAL_E = "DAL-E"
+    NONE  = "NONE"
+
+
+class PolyspaceVerdict(str, Enum):
+    GREEN  = "GREEN"
+    ORANGE = "ORANGE"
+    RED    = "RED"
+    GRAY   = "GRAY"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compliance — deviation and violation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DeviationRecord(BaseModel):
+    deviation_id:    str      = Field(default_factory=_new_id)
+    rule_id:         str      = ""
+    standard:        ComplianceStandard = ComplianceStandard.MISRA_C
+    justification:   str      = ""
+    approved_by:     str      = ""
+    approved_at:     datetime | None = None
+    expiry_date:     datetime | None = None
+    risk_acceptance: str      = ""
+
+
+class ComplianceViolation(BaseModel):
+    rule_id:          str                  = ""
+    standard:         ComplianceStandard   = ComplianceStandard.MISRA_C
+    rule_description: str                  = ""
+    is_mandatory:     bool                 = False
+    deviation_record: DeviationRecord | None = None
+    tool_detected_by: str                  = ""
+    confidence:       float                = Field(ge=0.0, le=1.0, default=1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Traceability (DO-178C Table A-5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RequirementTraceability(BaseModel):
+    id:               str      = Field(default_factory=_new_id)
+    requirement_id:   str      = ""
+    requirement_text: str      = ""
+    test_case_id:     str      = ""
+    test_result_id:   str      = ""
+    coverage_pct:     float    = 0.0
+    mcdc_coverage:    float    = 0.0
+    issue_id:         str      = ""
+    fix_attempt_id:   str      = ""
+    verified_by:      str      = ""
+    verified_at:      datetime | None = None
+    do178c_objective: str      = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reviewer independence (DO-178C 6.3.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReviewerIndependenceRecord(BaseModel):
+    id:                    str      = Field(default_factory=_new_id)
+    fix_attempt_id:        str      = ""
+    fixer_model:           str      = ""
+    fixer_model_family:    str      = ""
+    reviewer_model:        str      = ""
+    reviewer_model_family: str      = ""
+    independence_verified: bool     = False
+    violation_reason:      str      = ""
+    created_at:            datetime = Field(default_factory=_utcnow)
+
+    @model_validator(mode="after")
+    def _check_independence(self) -> "ReviewerIndependenceRecord":
+        same = self.fixer_model_family.lower() == self.reviewer_model_family.lower()
+        self.independence_verified = not same
+        if same and not self.violation_reason:
+            self.violation_reason = (
+                f"DO-178C 6.3.4 violation: fixer ({self.fixer_model_family}) "
+                f"and reviewer ({self.reviewer_model_family}) share model family."
+            )
+        return self
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formal verification
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FormalVerificationResult(BaseModel):
+    id:             str      = Field(default_factory=_new_id)
+    fix_attempt_id: str      = ""
+    file_path:      str      = ""
+    property_name:  str      = ""
+    status:         FormalVerificationStatus = FormalVerificationStatus.UNKNOWN
+    counterexample: str      = ""
+    proof_script:   str      = ""
+    solver:         str      = "z3"
+    elapsed_s:      float    = 0.0
+    verified_at:    datetime = Field(default_factory=_utcnow)
+    evidence_path:  str      = ""
+
+
+class CbmcVerificationResult(BaseModel):
+    id:                 str      = Field(default_factory=_new_id)
+    fix_attempt_id:     str      = ""
+    file_path:          str      = ""
+    function_name:      str      = ""
+    unwind_bound:       int      = 10
+    properties_checked: list[str] = Field(default_factory=list)
+    property_results:   dict[str, str] = Field(default_factory=dict)
+    counterexample:     str      = ""
+    stdout:             str      = ""
+    return_code:        int      = 0
+    elapsed_s:          float    = 0.0
+    verified_at:        datetime = Field(default_factory=_utcnow)
+
+
+class PolyspaceFinding(BaseModel):
+    id:             str             = Field(default_factory=_new_id)
+    fix_attempt_id: str             = ""
+    file_path:      str             = ""
+    line_number:    int             = 0
+    check_name:     str             = ""
+    verdict:        PolyspaceVerdict = PolyspaceVerdict.ORANGE
+    category:       str             = ""
+    detail:         str             = ""
+    run_id:         str             = ""
+
+
+class LdraFinding(BaseModel):
+    id:              str               = Field(default_factory=_new_id)
+    file_path:       str               = ""
+    line_number:     int               = 0
+    rule_id:         str               = ""
+    standard:        ComplianceStandard = ComplianceStandard.MISRA_C
+    severity:        str               = ""
+    message:         str               = ""
+    is_suppressed:   bool              = False
+    suppression_ref: str               = ""
+    run_id:          str               = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Function-level staleness
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FunctionStalenessMark(BaseModel):
+    id:            str      = Field(default_factory=_new_id)
+    file_path:     str      = ""
+    function_name: str      = ""
+    line_start:    int      = 0
+    line_end:      int      = 0
+    stale_reason:  str      = ""
+    stale_since:   datetime = Field(default_factory=_utcnow)
+    run_id:        str      = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Human escalation (DO-178C 6.3.4 / MIL-STD-882E Task 402)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EscalationStatus(str, Enum):
+    PENDING       = "PENDING"
+    APPROVED      = "APPROVED"
+    REJECTED      = "REJECTED"
+    TIMEOUT       = "TIMEOUT"
+    AUTO_RESOLVED = "AUTO_RESOLVED"
+
+
+class EscalationRecord(BaseModel):
+    id:               str               = Field(default_factory=_new_id)
+    run_id:           str               = ""
+    issue_ids:        list[str]         = Field(default_factory=list)
+    fix_attempt_id:   str               = ""
+    escalation_type:  str               = ""
+    description:      str               = ""
+    severity:         Severity          = Severity.CRITICAL
+    mil882e_category: MilStd882eCategory = MilStd882eCategory.CAT_I
+    status:           EscalationStatus  = EscalationStatus.PENDING
+    approved_by:      str               = ""
+    approved_at:      datetime | None   = None
+    approval_rationale: str             = ""
+    risk_acceptance:  str               = ""
+    notified_via:     list[str]         = Field(default_factory=list)
+    notified_at:      datetime | None   = None
+    timeout_at:       datetime | None   = None
+    created_at:       datetime          = Field(default_factory=_utcnow)
+    updated_at:       datetime          = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Baseline and configuration management (DO-178C Sec. 11)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BaselineRecord(BaseModel):
+    id:               str         = Field(default_factory=_new_id)
+    run_id:           str         = ""
+    baseline_name:    str         = ""
+    software_level:   SoftwareLevel = SoftwareLevel.NONE
+    commit_hash:      str         = ""
+    issue_count:      dict[str, int] = Field(default_factory=dict)
+    score_snapshot:   float       = 0.0
+    file_hashes:      dict[str, str] = Field(default_factory=dict)
+    approved_by:      str         = ""
+    approved_at:      datetime | None = None
+    approval_token:   str         = ""
+    change_request_id: str        = ""
+    rtm_export_path:  str         = ""
+    sas_export_path:  str         = ""
+    created_at:       datetime    = Field(default_factory=_utcnow)
+    is_active:        bool        = False
+
+
+class SoftwareConfigurationIndex(BaseModel):
+    id:               str      = Field(default_factory=_new_id)
+    baseline_id:      str      = ""
+    run_id:           str      = ""
+    controlled_files: list[dict[str, str]] = Field(default_factory=list)
+    tool_versions:    dict[str, str] = Field(default_factory=dict)
+    compiler_config:  dict[str, str] = Field(default_factory=dict)
+    generated_at:     datetime = Field(default_factory=_utcnow)
+    generated_by:     str      = "Rhodawk AI"
+
+
+class SoftwareAccomplishmentSummary(BaseModel):
+    id:                       str         = Field(default_factory=_new_id)
+    baseline_id:              str         = ""
+    run_id:                   str         = ""
+    software_level:           SoftwareLevel = SoftwareLevel.NONE
+    tool_qualification_level: ToolQualificationLevel = ToolQualificationLevel.NONE
+    total_cycles:             int         = 0
+    total_issues_found:       int         = 0
+    total_issues_closed:      int         = 0
+    total_escalations:        int         = 0
+    total_deviations:         int         = 0
+    tools_used:               list[dict[str, str]] = Field(default_factory=list)
+    misra_violations_open:    int         = 0
+    misra_violations_closed:  int         = 0
+    cert_violations_open:     int         = 0
+    cert_violations_closed:   int         = 0
+    cwe_findings_open:        int         = 0
+    cwe_findings_closed:      int         = 0
+    do178c_objectives_met:    list[str]   = Field(default_factory=list)
+    do178c_objectives_open:   list[str]   = Field(default_factory=list)
+    prepared_by:              str         = "Rhodawk AI"
+    reviewed_by:              str         = ""
+    approved_by:              str         = ""
+    approved_at:              datetime | None = None
+    generated_at:             datetime    = Field(default_factory=_utcnow)
+    psac_deviations:          list[str]   = Field(default_factory=list)
+    certification_basis:      str         = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File and chunk records
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FileRecord(BaseModel):
-    path:             str
-    content_hash:     str             = ""
-    size_lines:       int             = 0
-    size_bytes:       int             = 0
-    language:         str             = "unknown"
-    status:           FileStatus      = FileStatus.UNREAD
-    chunk_strategy:   ChunkStrategy   = ChunkStrategy.FULL
-    chunks_total:     int             = 0
-    chunks_read:      int             = 0
-    summary:          str             = ""
-    is_load_bearing:  bool            = False
-    last_hash_check:  datetime | None = None
-    last_read_at:     datetime | None = None
-    created_at:       datetime        = Field(default_factory=_utcnow)
-    updated_at:       datetime        = Field(default_factory=_utcnow)
+    path:               str         = ""
+    language:           str         = "unknown"
+    status:             FileStatus  = FileStatus.UNREAD
+    hash:               str         = ""
+    line_count:         int         = 0
+    chunk_count:        int         = 0
+    summary:            str         = ""
+    key_symbols:        list[str]   = Field(default_factory=list)
+    dependencies:       list[str]   = Field(default_factory=list)
+    all_observations:   list[str]   = Field(default_factory=list)
+    is_load_bearing:    bool        = False
+    run_id:             str         = ""
+    last_read_at:       datetime | None = None
+    known_functions:    list[str]   = Field(default_factory=list)
+    stale_functions:    list[str]   = Field(default_factory=list)
+    in_safety_partition: bool       = False
+    software_level:     SoftwareLevel = SoftwareLevel.NONE
 
-    @property
-    def fully_read(self) -> bool:
-        return self.chunks_read >= self.chunks_total > 0
+
+class FileChunkRecord(BaseModel):
+    id:                  str           = Field(default_factory=_new_id)
+    file_path:           str           = ""
+    run_id:              str           = ""
+    chunk_index:         int           = 0
+    total_chunks:        int           = 1
+    line_start:          int           = 0
+    line_end:            int           = 0
+    language:            str           = "unknown"
+    strategy:            ChunkStrategy = ChunkStrategy.FULL
+    summary:             str           = ""
+    symbols_defined:     list[str]     = Field(default_factory=list)
+    symbols_referenced:  list[str]     = Field(default_factory=list)
+    dependencies:        list[str]     = Field(default_factory=list)
+    raw_observations:    list[str]     = Field(default_factory=list)
+    vector_id:           str           = ""
+    function_name:       str           = ""
+    all_functions:       list[str]     = Field(default_factory=list)
+    preprocessed:        bool          = False
+    created_at:          datetime      = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IssueFingerprint(BaseModel):
+    file_path:        str = ""
+    rule_key:         str = ""
+    line_start:       int = 0
+    description_hash: str = ""
 
 
 class Issue(BaseModel):
-    id:                  str      = Field(default_factory=lambda: f"ISS-{str(uuid.uuid4())[:8].upper()}")
-    run_id:              str      = ""
-    severity:            Severity
-    file_path:           str
-    line_start:          int      = 0
-    line_end:            int      = 0
-    executor_type:       ExecutorType
-    master_prompt_section: str    = ""
-    description:         str
-    fix_requires_files:  list[str] = Field(default_factory=list)
-    status:              IssueStatus = IssueStatus.OPEN
-    fix_attempt_count:   int      = 0
-    fingerprint:         str      = ""
-    created_at:          datetime = Field(default_factory=_utcnow)
-    closed_at:           datetime | None = None
-    escalated_reason:    str | None = None
-    regressed_from:      str | None = None
-    # NEW — consensus fields
-    consensus_votes:     int      = 0
-    """Number of independent agents that confirmed this finding."""
-    consensus_confidence: float   = Field(0.0, ge=0.0, le=1.0)
+    id:                    str          = Field(default_factory=_new_id)
+    run_id:                str          = ""
+    severity:              Severity     = Severity.MINOR
+    file_path:             str          = ""
+    line_start:            int          = 0
+    line_end:              int          = 0
+    function_name:         str          = ""
+    master_prompt_section: str          = ""
+    description:           str          = ""
+    status:                IssueStatus  = IssueStatus.OPEN
+    executor_type:         ExecutorType | None = None
+    domain_mode:           DomainMode   = DomainMode.GENERAL
+    fix_attempts:          int          = 0
+    max_fix_attempts:      int          = 3
+    fix_requires_files:    list[str]    = Field(default_factory=list)
+    confidence:            float        = Field(ge=0.0, le=1.0, default=0.85)
+    fingerprint:           str          = ""
+    # Compliance
+    cwe_id:                str          = ""
+    misra_rule:            str          = ""
+    jsf_rule:              str          = ""
+    cert_rule:             str          = ""
+    compliance_violations: list[ComplianceViolation] = Field(default_factory=list)
+    # MIL-STD-882E
+    mil882e_category:      MilStd882eCategory = MilStd882eCategory.NONE
+    hazard_description:    str          = ""
+    # DO-178C traceability
+    requirement_id:        str          = ""
+    test_case_id:          str          = ""
+    do178c_objective:      str          = ""
+    deviation_record:      DeviationRecord | None = None
+    # Consensus
+    consensus_votes:       int          = 0
+    consensus_confidence:  float        = 0.0
+    # Timestamps
+    detected_at:           datetime     = Field(default_factory=_utcnow)
+    closed_at:             datetime | None = None
+    last_updated:          datetime     = Field(default_factory=_utcnow)
+    escalation_id:         str          = ""
 
-    @field_validator("line_end")
-    @classmethod
-    def line_end_gte_start(cls, v: int, info: Any) -> int:
-        start = info.data.get("line_start", 0)
-        return max(v, start)
 
-    @model_validator(mode="after")
-    def ensure_fix_requires_files(self) -> "Issue":
-        if not self.fix_requires_files and self.file_path:
-            self.fix_requires_files = [self.file_path]
-        return self
-
-
-class IssueFingerprint(BaseModel):
-    fingerprint: str
-    issue_id:    str
-    seen_count:  int      = 1
-    first_seen:  datetime = Field(default_factory=_utcnow)
-    last_seen:   datetime = Field(default_factory=_utcnow)
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix attempt
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FixedFile(BaseModel):
-    path:                 str
-    content:              str
-    issues_resolved:      list[str] = Field(default_factory=list)
-    changes_made:         str       = ""
-    line_count:           int       = 0
-    original_line_count:  int       = 0
-    diff_summary:         str       = ""
-
-    @model_validator(mode="after")
-    def compute_line_count(self) -> "FixedFile":
-        if not self.line_count and self.content:
-            self.line_count = len(self.content.splitlines())
-        return self
+    path:          str       = ""
+    content:       str       = ""
+    patch:         str       = ""
+    patch_mode:    PatchMode = PatchMode.UNIFIED_DIFF
+    changes_made:  str       = ""
+    diff_summary:  str       = ""
+    confidence:    float     = Field(ge=0.0, le=1.0, default=0.85)
+    original_hash: str       = ""
+    patched_hash:  str       = ""
+    lines_changed: int       = 0
 
 
 class FixAttempt(BaseModel):
-    id:                   str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:               str      = ""
-    issue_ids:            list[str]
-    fixed_files:          list[FixedFile] = Field(default_factory=list)
-    reviewer_verdict:     ReviewVerdict | None = None
-    reviewer_reason:      str      = ""
-    reviewer_confidence:  float    = 0.0
-    planner_approved:     bool | None = None
-    planner_reason:       str      = ""
-    gate_passed:          bool | None = None
-    gate_reason:          str      = ""
-    commit_sha:           str | None = None
-    pr_url:               str | None = None
-    created_at:           datetime = Field(default_factory=_utcnow)
-    committed_at:         datetime | None = None
-    # NEW
-    test_run_id:          str | None = None
-    """Foreign key to TestRunResult — populated after post-fix test execution."""
-    formal_proofs:        list[str] = Field(default_factory=list)
-    """IDs of FormalVerificationResult records attached to this fix."""
+    id:                     str              = Field(default_factory=_new_id)
+    run_id:                 str              = ""
+    issue_ids:              list[str]        = Field(default_factory=list)
+    fixed_files:            list[FixedFile]  = Field(default_factory=list)
+    fixer_model:            str              = ""
+    fixer_model_family:     str              = ""
+    reviewer_model:         str              = ""
+    reviewer_model_family:  str              = ""
+    independence_record_id: str              = ""
+    reviewer_verdict:       ReviewVerdict | None = None
+    reviewer_notes:         str              = ""
+    gate_passed:            bool | None      = None
+    gate_reason:            str              = ""
+    planner_approved:       bool | None      = None
+    planner_reason:         str              = ""
+    formal_proofs:          list[str]        = Field(default_factory=list)
+    cbmc_result_id:         str              = ""
+    polyspace_finding_ids:  list[str]        = Field(default_factory=list)
+    test_run_id:            str              = ""
+    patch_mode:             PatchMode        = PatchMode.UNIFIED_DIFF
+    requirement_id:         str              = ""
+    test_case_id:           str              = ""
+    committed_at:           datetime | None  = None
+    pr_url:                 str              = ""
+    created_at:             datetime         = Field(default_factory=_utcnow)
+    updated_at:             datetime         = Field(default_factory=_utcnow)
 
 
-class ReviewDecision(BaseModel):
-    issue_id:       str
-    fix_path:       str
-    verdict:        ReviewVerdict
-    confidence:     float = Field(ge=0.0, le=1.0)
-    reason:         str
-    line_references: list[str] = Field(default_factory=list)
-
-
-class ReviewResult(BaseModel):
-    review_id:         str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    fix_attempt_id:    str
-    decisions:         list[ReviewDecision]
-    overall_score:     float    = Field(default=0.0, ge=0.0, le=1.0)
-    overall_note:      str      = ""
-    approve_for_commit: bool    = False
-    reviewed_at:       datetime = Field(default_factory=_utcnow)
-
-    def compute_approval(self) -> None:
-        if not self.decisions:
-            self.approve_for_commit = False
-            self.overall_score = 0.0
-            return
-        approved = [d for d in self.decisions if d.verdict == ReviewVerdict.APPROVED]
-        self.approve_for_commit = len(approved) == len(self.decisions)
-        self.overall_score = (
-            sum(d.confidence for d in approved) / len(self.decisions)
-            if self.decisions else 0.0
-        )
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Planner
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PlannerRecord(BaseModel):
-    id:                  str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    fix_attempt_id:      str
-    run_id:              str      = ""
-    file_path:           str
-    verdict:             PlannerVerdict
-    reversibility:       ReversibilityClass
-    goal_coherent:       bool
-    risk_score:          float    = Field(ge=0.0, le=1.0)
-    block_commit:        bool
-    reason:              str
-    simulation_summary:  str      = ""
-    # NEW
-    formal_proof_available: bool  = False
-    formal_proof_id:     str      = ""
-    evaluated_at:        datetime = Field(default_factory=_utcnow)
+    id:                    str              = Field(default_factory=_new_id)
+    fix_attempt_id:        str              = ""
+    run_id:                str              = ""
+    file_path:             str              = ""
+    verdict:               PlannerVerdict   = PlannerVerdict.SAFE
+    reversibility:         ReversibilityClass = ReversibilityClass.REVERSIBLE
+    goal_coherent:         bool             = True
+    risk_score:            float            = Field(ge=0.0, le=1.0, default=0.0)
+    block_commit:          bool             = False
+    reason:                str              = ""
+    simulation_summary:    str              = ""
+    formal_proof_available: bool            = False
+    evaluated_at:          datetime         = Field(default_factory=_utcnow)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit score and run
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AuditScore(BaseModel):
-    id:              str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:          str
-    total_issues:    int      = 0
-    critical_count:  int      = 0
-    major_count:     int      = 0
-    minor_count:     int      = 0
-    info_count:      int      = 0
-    escalated_count: int      = 0
-    score:           float    = 0.0
-    scored_at:       datetime = Field(default_factory=_utcnow)
+    id:             str   = Field(default_factory=_new_id)
+    run_id:         str   = ""
+    cycle_number:   int   = 0
+    critical_count: int   = 0
+    major_count:    int   = 0
+    minor_count:    int   = 0
+    info_count:     int   = 0
+    score:          float = 100.0
+    misra_open:     int   = 0
+    cert_open:      int   = 0
+    cwe_open:       int   = 0
+    jsf_open:       int   = 0
+    created_at:     datetime = Field(default_factory=_utcnow)
 
     def compute_score(self) -> None:
-        self.score = (
-            self.critical_count * 10
-            + self.major_count * 3
-            + self.minor_count * 1
-        )
-        self.total_issues = (
-            self.critical_count
-            + self.major_count
-            + self.minor_count
-            + self.info_count
-        )
+        c_pen = min(self.critical_count * 15, 60)
+        m_pen = min(self.major_count    *  5, 30)
+        n_pen = min(self.minor_count    *  1, 10)
+        self.score = max(0.0, 100.0 - c_pen - m_pen - n_pen)
+
+
+class ConsensusVote(BaseModel):
+    agent:      ExecutorType = ExecutorType.GENERAL
+    confirmed:  bool         = False
+    confidence: float        = Field(ge=0.0, le=1.0, default=0.0)
+    notes:      str          = ""
+
+
+class ConsensusResult(BaseModel):
+    issue_fingerprint:   str          = ""
+    votes:               list[ConsensusVote] = Field(default_factory=list)
+    final_confidence:    float        = Field(ge=0.0, le=1.0, default=0.0)
+    approved:            bool         = False
+    disagreement_action: DisagreementAction = DisagreementAction.FLAG_UNCERTAIN
+    high_centrality:     bool         = False
+    escalation_required: bool         = False
+
+
+class ConsensusRule(BaseModel):
+    minimum_agents:         int                = 1
+    required_domains:       list[ExecutorType] = Field(default_factory=list)
+    confidence_floor:       float              = Field(ge=0.0, le=1.0, default=0.5)
+    disagreement_action:    DisagreementAction = DisagreementAction.FLAG_UNCERTAIN
+    high_centrality_raises: bool               = False
 
 
 class AuditRun(BaseModel):
-    id:                  str          = Field(default_factory=lambda: str(uuid.uuid4()))
-    repo_url:            str
-    repo_name:           str
-    branch:              str          = "main"
-    master_prompt_path:  str          = ""
-    autonomy_level:      AutonomyLevel = AutonomyLevel.AUTO_FIX
-    domain_mode:         DomainMode    = DomainMode.GENERAL
-    status:              RunStatus     = RunStatus.RUNNING
-    cycle_count:         int           = 0
-    max_cycles:          int           = 50
-    scores:              list[AuditScore] = Field(default_factory=list)
-    files_total:         int           = 0
-    files_read:          int           = 0
-    graph_built:         bool          = False
-    started_at:          datetime      = Field(default_factory=_utcnow)
-    completed_at:        datetime | None = None
-    metadata:            dict[str, Any] = Field(default_factory=dict)
-
-    @property
-    def latest_score(self) -> AuditScore | None:
-        return self.scores[-1] if self.scores else None
-
-    @property
-    def is_stabilized(self) -> bool:
-        s = self.latest_score
-        return s is not None and s.critical_count == 0 and s.major_count == 0
+    id:                       str               = Field(default_factory=_new_id)
+    repo_url:                 str               = ""
+    repo_name:                str               = ""
+    branch:                   str               = "main"
+    master_prompt_path:       str               = ""
+    autonomy_level:           AutonomyLevel     = AutonomyLevel.AUTO_FIX
+    domain_mode:              DomainMode        = DomainMode.GENERAL
+    software_level:           SoftwareLevel     = SoftwareLevel.NONE
+    tool_qualification_level: ToolQualificationLevel = ToolQualificationLevel.NONE
+    max_cycles:               int               = 50
+    cycle_count:              int               = 0
+    status:                   RunStatus         = RunStatus.RUNNING
+    scores:                   list[AuditScore]  = Field(default_factory=list)
+    graph_built:              bool              = False
+    baseline_id:              str               = ""
+    active_escalations:       int               = 0
+    total_escalations:        int               = 0
+    started_at:               datetime          = Field(default_factory=_utcnow)
+    finished_at:              datetime | None   = None
 
 
-class PatrolEvent(BaseModel):
-    id:           str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    event_type:   str
-    detail:       str
-    action_taken: str
-    run_id:       str
-    severity:     str      = "INFO"
-    timestamp:    datetime = Field(default_factory=_utcnow)
-
-
-class LLMSession(BaseModel):
-    id:                str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:            str
-    agent_type:        ExecutorType
-    model:             str
-    prompt_tokens:     int      = 0
-    completion_tokens: int      = 0
-    cost_usd:          float    = 0.0
-    duration_ms:       int      = 0
-    success:           bool     = True
-    error:             str | None = None
-    started_at:        datetime = Field(default_factory=_utcnow)
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit trail (DO-178C SCM evidence)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AuditTrailEntry(BaseModel):
-    id:              str      = Field(default_factory=lambda: str(uuid.uuid4()))
-    run_id:          str
-    event_type:      str
-    entity_id:       str      = ""
-    entity_type:     str      = ""
-    before_state:    str      = ""
-    after_state:     str      = ""
-    actor:           str      = ""
-    hmac_signature:  str      = ""
-    timestamp:       datetime = Field(default_factory=_utcnow)
+    id:                str           = Field(default_factory=_new_id)
+    run_id:            str           = ""
+    event_type:        str           = ""
+    entity_id:         str           = ""
+    entity_type:       str           = ""
+    before_state:      str           = ""
+    after_state:       str           = ""
+    actor:             str           = "Rhodawk AI"
+    artifact_id:       str           = ""
+    artifact_type:     ArtifactType | None = None
+    baseline_id:       str           = ""
+    change_request_id: str           = ""
+    model_name:        str           = ""
+    model_version:     str           = ""
+    hmac_signature:    str           = ""
+    created_at:        datetime      = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patrol events
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PatrolEvent(BaseModel):
+    id:         str      = Field(default_factory=_new_id)
+    run_id:     str      = ""
+    event_type: str      = ""
+    detail:     str      = ""
+    severity:   str      = "INFO"
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRunResult(BaseModel):
+    id:             str           = Field(default_factory=_new_id)
+    run_id:         str           = ""
+    fix_attempt_id: str           = ""
+    status:         TestRunStatus = TestRunStatus.SKIPPED
+    passed:         int           = 0
+    failed:         int           = 0
+    errors:         int           = 0
+    skipped:        int           = 0
+    coverage_pct:   float         = 0.0
+    mcdc_coverage:  float         = 0.0
+    output:         str           = ""
+    duration_s:     float         = 0.0
+    created_at:     datetime      = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GraphNode(BaseModel):
+    path:                str   = ""
+    language:            str   = "unknown"
+    is_load_bearing:     bool  = False
+    centrality:          float = 0.0
+    page_rank:           float = 0.0
+    in_safety_partition: bool  = False
+
+
+class GraphEdge(BaseModel):
+    source:    str   = ""
+    target:    str   = ""
+    edge_type: str   = "import"
+    symbol:    str   = ""
+    weight:    float = 1.0
+
+
+class DependencySnapshot(BaseModel):
+    id:         str      = Field(default_factory=_new_id)
+    run_id:     str      = ""
+    node_count: int      = 0
+    edge_count: int      = 0
+    built_at:   datetime = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convergence
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConvergenceRecord(BaseModel):
+    run_id:      str     = ""
+    cycle:       int     = 0
+    score:       float   = 0.0
+    converged:   bool    = False
+    halt_reason: str     = ""
+    recorded_at: datetime = Field(default_factory=_utcnow)

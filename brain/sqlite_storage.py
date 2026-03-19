@@ -1266,3 +1266,397 @@ class SQLiteBrainStorage(BrainStorage):
     async def all_read(self) -> bool:
         files = await self.list_files()
         return all(f.fully_read for f in files) if files else False
+
+    # ── NEW: Abstract method implementations for compliance/escalation ─────────
+
+    async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list[AuditTrailEntry]:
+        return (await self.get_audit_trail(run_id))[:limit]
+
+    async def log_llm_session(self, session: dict) -> None:
+        """Store LLM call metadata for cost tracking."""
+        async with self._write() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO llm_sessions
+                    (id, run_id, agent_type, model, prompt_tokens, completion_tokens,
+                     cost_usd, duration_ms, success, error, timestamp)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                __import__("uuid").uuid4().hex,
+                session.get("run_id", ""),
+                session.get("agent_type", ""),
+                session.get("model", ""),
+                session.get("prompt_tokens", 0),
+                session.get("completion_tokens", 0),
+                session.get("cost_usd", 0.0),
+                session.get("duration_ms", 0),
+                1 if session.get("success") else 0,
+                session.get("error", ""),
+                __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            ))
+            await db.commit()
+
+    async def upsert_escalation(self, esc) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO escalations
+                    (id, run_id, issue_ids, fix_attempt_id, escalation_type,
+                     description, severity, mil882e_category, status,
+                     approved_by, approved_at, approval_rationale, risk_acceptance,
+                     notified_via, notified_at, timeout_at, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                esc.id, esc.run_id,
+                __import__("json").dumps(esc.issue_ids),
+                esc.fix_attempt_id, esc.escalation_type,
+                esc.description, esc.severity.value, esc.mil882e_category.value,
+                esc.status.value, esc.approved_by,
+                esc.approved_at.isoformat() if esc.approved_at else None,
+                esc.approval_rationale, esc.risk_acceptance,
+                __import__("json").dumps(esc.notified_via),
+                esc.notified_at.isoformat() if esc.notified_at else None,
+                esc.timeout_at.isoformat() if esc.timeout_at else None,
+                esc.created_at.isoformat(), esc.updated_at.isoformat(),
+            ))
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT, issue_ids TEXT, fix_attempt_id TEXT,
+                    escalation_type TEXT, description TEXT,
+                    severity TEXT, mil882e_category TEXT, status TEXT,
+                    approved_by TEXT, approved_at TEXT, approval_rationale TEXT,
+                    risk_acceptance TEXT, notified_via TEXT, notified_at TEXT,
+                    timeout_at TEXT, created_at TEXT, updated_at TEXT
+                )
+            """)
+            await db.commit()
+
+    async def get_escalation(self, escalation_id: str):
+        await self._ensure_escalations_table()
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM escalations WHERE id=?", (escalation_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return self._row_to_escalation(row) if row else None
+
+    async def list_escalations(self, run_id: str = "", status=None) -> list:
+        await self._ensure_escalations_table()
+        async with self._conn() as db:
+            q = "SELECT * FROM escalations WHERE 1=1"
+            params: list = []
+            if run_id:
+                q += " AND run_id=?"; params.append(run_id)
+            if status is not None:
+                q += " AND status=?"; params.append(status.value if hasattr(status, "value") else status)
+            async with db.execute(q, params) as cur:
+                rows = await cur.fetchall()
+                return [self._row_to_escalation(r) for r in rows if r]
+
+    async def _ensure_escalations_table(self) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id TEXT PRIMARY KEY, run_id TEXT, issue_ids TEXT,
+                    fix_attempt_id TEXT, escalation_type TEXT, description TEXT,
+                    severity TEXT, mil882e_category TEXT, status TEXT,
+                    approved_by TEXT, approved_at TEXT, approval_rationale TEXT,
+                    risk_acceptance TEXT, notified_via TEXT, notified_at TEXT,
+                    timeout_at TEXT, created_at TEXT, updated_at TEXT
+                )
+            """)
+            await db.commit()
+
+    def _row_to_escalation(self, row):
+        from brain.schemas import EscalationRecord, EscalationStatus, Severity, MilStd882eCategory
+        import json as _json, datetime as _dt
+        return EscalationRecord(
+            id=row["id"], run_id=row["run_id"] or "",
+            issue_ids=_json.loads(row["issue_ids"] or "[]"),
+            fix_attempt_id=row["fix_attempt_id"] or "",
+            escalation_type=row["escalation_type"] or "",
+            description=row["description"] or "",
+            severity=Severity(row["severity"]) if row["severity"] else Severity.CRITICAL,
+            mil882e_category=MilStd882eCategory(row["mil882e_category"]) if row["mil882e_category"] else MilStd882eCategory.CAT_I,
+            status=EscalationStatus(row["status"]) if row["status"] else EscalationStatus.PENDING,
+            approved_by=row["approved_by"] or "",
+            approval_rationale=row["approval_rationale"] or "",
+            risk_acceptance=row["risk_acceptance"] or "",
+            notified_via=_json.loads(row["notified_via"] or "[]"),
+        )
+
+    # Baseline
+    async def upsert_baseline(self, baseline) -> None:
+        await self._ensure_baselines_table()
+        async with self._write() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO baselines
+                    (id, run_id, baseline_name, software_level, commit_hash,
+                     issue_count, score_snapshot, file_hashes, approved_by,
+                     approved_at, is_active, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                baseline.id, baseline.run_id, baseline.baseline_name,
+                baseline.software_level.value, baseline.commit_hash,
+                __import__("json").dumps(baseline.issue_count),
+                baseline.score_snapshot,
+                __import__("json").dumps(baseline.file_hashes),
+                baseline.approved_by,
+                baseline.approved_at.isoformat() if baseline.approved_at else None,
+                1 if baseline.is_active else 0,
+                baseline.created_at.isoformat(),
+            ))
+            await db.commit()
+
+    async def _ensure_baselines_table(self) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS baselines (
+                    id TEXT PRIMARY KEY, run_id TEXT, baseline_name TEXT,
+                    software_level TEXT, commit_hash TEXT, issue_count TEXT,
+                    score_snapshot REAL, file_hashes TEXT, approved_by TEXT,
+                    approved_at TEXT, is_active INTEGER DEFAULT 0, created_at TEXT
+                )
+            """)
+            await db.commit()
+
+    async def get_baseline(self, baseline_id: str):
+        await self._ensure_baselines_table()
+        async with self._conn() as db:
+            async with db.execute("SELECT * FROM baselines WHERE id=?", (baseline_id,)) as cur:
+                row = await cur.fetchone()
+                return self._row_to_baseline(row) if row else None
+
+    async def get_active_baseline(self, run_id: str):
+        await self._ensure_baselines_table()
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM baselines WHERE run_id=? AND is_active=1 LIMIT 1", (run_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return self._row_to_baseline(row) if row else None
+
+    async def list_baselines(self, run_id: str = "") -> list:
+        await self._ensure_baselines_table()
+        async with self._conn() as db:
+            q = "SELECT * FROM baselines" + (" WHERE run_id=?" if run_id else "")
+            async with db.execute(q, (run_id,) if run_id else ()) as cur:
+                rows = await cur.fetchall()
+                return [self._row_to_baseline(r) for r in rows]
+
+    def _row_to_baseline(self, row):
+        from brain.schemas import BaselineRecord, SoftwareLevel
+        import json as _json
+        return BaselineRecord(
+            id=row["id"], run_id=row["run_id"] or "",
+            baseline_name=row["baseline_name"] or "",
+            software_level=SoftwareLevel(row["software_level"]) if row["software_level"] else SoftwareLevel.NONE,
+            commit_hash=row["commit_hash"] or "",
+            issue_count=_json.loads(row["issue_count"] or "{}"),
+            score_snapshot=float(row["score_snapshot"] or 0),
+            file_hashes=_json.loads(row["file_hashes"] or "{}"),
+            approved_by=row["approved_by"] or "",
+            is_active=bool(row["is_active"]),
+        )
+
+    # Function staleness
+    async def upsert_staleness_mark(self, mark) -> None:
+        async with self._write() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS function_staleness (
+                    id TEXT PRIMARY KEY, file_path TEXT, function_name TEXT,
+                    line_start INTEGER, line_end INTEGER, stale_reason TEXT,
+                    stale_since TEXT, run_id TEXT
+                )
+            """)
+            await db.execute("""
+                INSERT OR REPLACE INTO function_staleness
+                    (id, file_path, function_name, line_start, line_end,
+                     stale_reason, stale_since, run_id)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                mark.id, mark.file_path, mark.function_name,
+                mark.line_start, mark.line_end, mark.stale_reason,
+                mark.stale_since.isoformat(), mark.run_id,
+            ))
+            await db.commit()
+
+    async def list_stale_functions(self, file_path: str = "", run_id: str = "") -> list:
+        from brain.schemas import FunctionStalenessMark
+        async with self._conn() as db:
+            try:
+                q = "SELECT * FROM function_staleness WHERE 1=1"
+                params: list = []
+                if file_path:
+                    q += " AND file_path=?"; params.append(file_path)
+                if run_id:
+                    q += " AND run_id=?"; params.append(run_id)
+                async with db.execute(q, params) as cur:
+                    rows = await cur.fetchall()
+                    return [FunctionStalenessMark(
+                        id=r["id"], file_path=r["file_path"],
+                        function_name=r["function_name"],
+                        line_start=r["line_start"] or 0,
+                        line_end=r["line_end"] or 0,
+                        stale_reason=r["stale_reason"] or "",
+                        run_id=r["run_id"] or "",
+                    ) for r in rows]
+            except Exception:
+                return []
+
+    async def clear_staleness_mark(self, file_path: str, function_name: str) -> None:
+        async with self._write() as db:
+            try:
+                await db.execute(
+                    "DELETE FROM function_staleness WHERE file_path=? AND function_name=?",
+                    (file_path, function_name),
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+    # Compliance findings — stub implementations (store as JSON blobs)
+    async def upsert_ldra_finding(self, finding) -> None:
+        await self._upsert_json_table("ldra_findings", finding.id, finding.model_dump_json())
+
+    async def list_ldra_findings(self, run_id: str = "", file_path: str = "") -> list:
+        from brain.schemas import LdraFinding
+        return await self._list_json_table("ldra_findings", LdraFinding)
+
+    async def upsert_polyspace_finding(self, finding) -> None:
+        await self._upsert_json_table("polyspace_findings", finding.id, finding.model_dump_json())
+
+    async def list_polyspace_findings(self, run_id: str = "") -> list:
+        from brain.schemas import PolyspaceFinding
+        return await self._list_json_table("polyspace_findings", PolyspaceFinding)
+
+    async def upsert_cbmc_result(self, result) -> None:
+        await self._upsert_json_table("cbmc_results", result.id, result.model_dump_json())
+
+    async def get_cbmc_result(self, result_id: str):
+        from brain.schemas import CbmcVerificationResult
+        return await self._get_json_table("cbmc_results", result_id, CbmcVerificationResult)
+
+    async def upsert_rtm_entry(self, entry) -> None:
+        await self._upsert_json_table("rtm_entries", entry.id, entry.model_dump_json())
+
+    async def get_rtm_for_issue(self, issue_id: str):
+        from brain.schemas import RequirementTraceability
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT data FROM rtm_entries WHERE data LIKE ?",
+                    (f'%{issue_id}%',)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return RequirementTraceability.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    async def list_rtm_entries(self, run_id: str = "") -> list:
+        from brain.schemas import RequirementTraceability
+        return await self._list_json_table("rtm_entries", RequirementTraceability)
+
+    async def upsert_independence_record(self, record) -> None:
+        await self._upsert_json_table("independence_records", record.id, record.model_dump_json())
+
+    async def get_independence_record(self, fix_attempt_id: str):
+        from brain.schemas import ReviewerIndependenceRecord
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT data FROM independence_records WHERE data LIKE ?",
+                    (f'%{fix_attempt_id}%',)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return ReviewerIndependenceRecord.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    async def upsert_sas(self, sas) -> None:
+        await self._upsert_json_table("sas_records", sas.id, sas.model_dump_json())
+
+    async def get_sas(self, run_id: str):
+        from brain.schemas import SoftwareAccomplishmentSummary
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT data FROM sas_records WHERE data LIKE ?",
+                    (f'%{run_id}%',)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return SoftwareAccomplishmentSummary.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    async def upsert_sci(self, sci) -> None:
+        await self._upsert_json_table("sci_records", sci.id, sci.model_dump_json())
+
+    async def get_sci(self, baseline_id: str):
+        from brain.schemas import SoftwareConfigurationIndex
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT data FROM sci_records WHERE data LIKE ?",
+                    (f'%{baseline_id}%',)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return SoftwareConfigurationIndex.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    # Generic JSON blob table helpers
+    async def _upsert_json_table(self, table: str, id_: str, data: str) -> None:
+        async with self._write() as db:
+            await db.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, data TEXT)
+            """)
+            await db.execute(
+                f"INSERT OR REPLACE INTO {table} (id, data) VALUES (?,?)",
+                (id_, data),
+            )
+            await db.commit()
+
+    async def _get_json_table(self, table: str, id_: str, model_class):
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    f"SELECT data FROM {table} WHERE id=?", (id_,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return model_class.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    async def _list_json_table(self, table: str, model_class) -> list:
+        async with self._conn() as db:
+            try:
+                async with db.execute(f"SELECT data FROM {table}") as cur:
+                    rows = await cur.fetchall()
+                    result = []
+                    for row in rows:
+                        try:
+                            result.append(model_class.model_validate_json(row["data"]))
+                        except Exception:
+                            pass
+                    return result
+            except Exception:
+                return []
+
+    async def update_issue_status(
+        self, issue_id: str, status: str, reason: str = ""
+    ) -> None:
+        async with self._write() as db:
+            await db.execute(
+                "UPDATE issues SET status=? WHERE id=?", (status, issue_id)
+            )
+            await db.commit()
