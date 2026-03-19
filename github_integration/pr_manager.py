@@ -1,162 +1,66 @@
+"""github_integration/pr_manager.py — GitHub PR manager for Rhodawk AI."""
 from __future__ import annotations
-
-import asyncio
-import logging
-from datetime import datetime, timezone
+import asyncio, json, logging, urllib.request, urllib.error
 from pathlib import Path
-
-from github import Github, GithubException
-from github.Repository import Repository
-
-from brain.schemas import FixAttempt
-
 log = logging.getLogger(__name__)
 
 
 class PRManager:
-
     def __init__(
         self,
-        token: str,
-        repo_url: str,
+        token:        str,
+        repo_url:     str,
+        base_branch:  str = "main",
         branch_prefix: str = "stabilizer",
-        base_branch: str = "main",
     ) -> None:
-        self._gh = Github(token)
-        self._repo_url = repo_url
+        self.token         = token
+        self.repo_url      = repo_url.rstrip("/")
+        self.base_branch   = base_branch
         self.branch_prefix = branch_prefix
-        self.base_branch = base_branch
-        self._repo: Repository | None = None
+        parts              = self.repo_url.split("/")
+        self.owner         = parts[-2] if len(parts) >= 2 else ""
+        self.repo          = parts[-1] if len(parts) >= 1 else ""
 
-    def _get_repo(self) -> Repository:
-        if self._repo is None:
-            url = self._repo_url.replace("https://", "").replace("http://", "")
-            if url.startswith("github.com/"):
-                url = url[len("github.com/"):]
-            url = url.rstrip("/").removesuffix(".git")
-            self._repo = self._gh.get_repo(url)
-        return self._repo
-
-    async def create_pr_for_fix(
+    async def create_pr(
         self,
-        attempt: FixAttempt,
-        run_id: str,
-        cycle: int,
-        repo_root: Path,
+        branch_name: str,
+        files:       list[tuple[str, str]],
+        title:       str,
+        body:        str,
     ) -> str:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None,
-            self._create_pr_sync,
-            attempt, run_id, cycle, repo_root,
+            None, self._create_pr_sync, branch_name, files, title, body
         )
 
     def _create_pr_sync(
-        self,
-        attempt: FixAttempt,
-        run_id: str,
-        cycle: int,
-        repo_root: Path,
+        self, branch_name: str, files: list[tuple[str, str]],
+        title: str, body: str
     ) -> str:
-        repo = self._get_repo()
-        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
-        branch_name = f"{self.branch_prefix}/run-{run_id[:8]}-cycle-{cycle}-{ts}"
-
-        base_ref = repo.get_git_ref(f"heads/{self.base_branch}")
-        base_sha = base_ref.object.sha
-
+        if not self.token or not self.owner:
+            return ""
         try:
-            repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base_sha)
-            log.info(f"Created branch: {branch_name}")
-        except GithubException as exc:
-            if "already exists" in str(exc):
-                log.warning(f"Branch {branch_name} already exists, proceeding")
-            else:
-                raise
-
-        for ff in attempt.fixed_files:
-            self._commit_file(repo, branch_name, ff.path, ff.content, ff.changes_made)
-
-        pr_body = self._build_pr_body(attempt, run_id, cycle)
-        pr = repo.create_pull(
-            title=f"[RHODAWK AI CODE STABILIZER] Cycle {cycle} — Fix {len(attempt.issue_ids)} issue(s)",
-            body=pr_body,
-            head=branch_name,
-            base=self.base_branch,
-            draft=False,
-        )
-
-        try:
-            repo.get_label("rhodawk-ai-code-stabilizer")
-        except GithubException:
-            repo.create_label("rhodawk-ai-code-stabilizer", "0075ca", "RHODAWK AI CODE STABILIZER automated fix")
-        try:
-            pr.add_to_labels("rhodawk-ai-code-stabilizer")
-        except Exception:
-            pass
-
-        log.info(f"PR created: {pr.html_url}")
-        return pr.html_url
-
-    def _commit_file(
-        self,
-        repo: Repository,
-        branch: str,
-        path: str,
-        content: str,
-        message_suffix: str,
-    ) -> None:
-        commit_message = (
-            f"fix(rhodawk-ai-code-stabilizer): {path}\n\n"
-            f"{message_suffix[:500]}\n\n"
-            "Automated fix by RHODAWK AI CODE STABILIZER autonomous stabilizer."
-        )
-        try:
-            existing = repo.get_contents(path, ref=branch)
-            repo.update_file(
-                path=path,
-                message=commit_message,
-                content=content,
-                sha=existing.sha,  # type: ignore[union-attr]
-                branch=branch,
+            api_url = (
+                f"https://api.github.com/repos/{self.owner}/{self.repo}/pulls"
             )
-        except GithubException as exc:
-            if exc.status == 404:
-                repo.create_file(
-                    path=path,
-                    message=commit_message,
-                    content=content,
-                    branch=branch,
-                )
-            else:
-                raise
-
-    def _build_pr_body(self, attempt: FixAttempt, run_id: str, cycle: int) -> str:
-        files_changed = "\n".join(
-            f"- `{ff.path}` (+{ff.line_count}/-{ff.original_line_count} lines, {ff.diff_summary})"
-            for ff in attempt.fixed_files
-        )
-        issues_fixed = "\n".join(f"- {iid}" for iid in attempt.issue_ids)
-        changes = "\n".join(
-            f"**{ff.path}**: {ff.changes_made}" for ff in attempt.fixed_files
-        )
-        ts = datetime.now(tz=timezone.utc).isoformat()
-        return (
-            f"## RHODAWK AI CODE STABILIZER Autonomous Stabilizer Fix\n\n"
-            f"**Run ID:** `{run_id}`  \n"
-            f"**Cycle:** {cycle}  \n"
-            f"**Fix Attempt:** `{attempt.id}`  \n"
-            f"**Timestamp:** {ts}\n\n"
-            f"---\n\n"
-            f"### Issues Resolved\n{issues_fixed}\n\n"
-            f"### Files Changed\n{files_changed}\n\n"
-            f"### Changes Made\n{changes}\n\n"
-            f"---\n\n"
-            f"### Automated Review\n"
-            f"Score: {attempt.reviewer_confidence:.2f}  \n"
-            f"Verdict: {attempt.reviewer_verdict.value if attempt.reviewer_verdict else 'N/A'}  \n"
-            f"Notes: {attempt.reviewer_reason or 'None'}\n\n"
-            f"---\n\n"
-            f"> ⚠️ Generated by RHODAWK AI CODE STABILIZER. Review carefully before merging.\n"
-            f"> Load-bearing files require manual review.\n"
-        )
+            payload = json.dumps({
+                "title": title, "body": body,
+                "head": branch_name, "base": self.base_branch,
+            }).encode()
+            req = urllib.request.Request(
+                api_url, data=payload, method="POST",
+                headers={
+                    "Authorization": f"token {self.token}",
+                    "Content-Type":  "application/json",
+                    "Accept":        "application/vnd.github.v3+json",
+                    "User-Agent":    "Rhodawk-AI/2.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                pr_url = data.get("html_url", "")
+                log.info(f"[pr_manager] PR created: {pr_url}")
+                return pr_url
+        except Exception as exc:
+            log.error(f"[pr_manager] PR creation failed: {exc}")
+            return ""
