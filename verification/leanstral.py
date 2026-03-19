@@ -38,10 +38,16 @@ def _try_lean4_proof(property_name: str, code: str) -> dict:
     """Attempt a real lean --check proof. Returns {} if lean not installed."""
     if not _lean4_available():
         return {}
+    # NOTE: This produces a trivially-true proof stub only.
+    # Real property encoding requires a hand-authored Lean 4 specification
+    # for each property.  This stub is useful only as a "lean binary present"
+    # smoke-test, not as DO-178C formal evidence.
+    safe_name = property_name.replace('-','_').replace('.','_').replace(':','_')
     lean_src = (
         f"-- Rhodawk AI: property={property_name}\n"
-        f"theorem {property_name.replace('-','_').replace('.','_').replace(':','_')}"
-        f" : True := trivial\n"
+        f"-- STUB: Trivial proof — not a real property verification.\n"
+        f"-- Replace with domain-specific Lean 4 specification for DO-178C evidence.\n"
+        f"theorem {safe_name}_stub : True := trivial\n"
     )
     try:
         with tempfile.NamedTemporaryFile(
@@ -85,7 +91,7 @@ async def llm_reason_property(
         from swarm.autogen_agents import FormalVerifyConversation
         effective_model = model or os.environ.get(
             "RHODAWK_REASONING_MODEL",
-            "openrouter/mistralai/devstral-small",   # FIX: was phantom devstral-2
+            "openrouter/mistralai/devstral-small",   # real model — devstral-2 was phantom
         )
         raw = await FormalVerifyConversation.run(
             property_name=property_name, code=code, model=effective_model,
