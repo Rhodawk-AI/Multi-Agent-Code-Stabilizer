@@ -5,15 +5,15 @@ Tiered model router for Rhodawk AI.
 
 Strategy
 ─────────
-Tier 1 (LOCAL)  — IBM Granite 4.0-H-Tiny (7B, 1B active) via Ollama.
+Tier 1 (LOCAL)  — IBM Granite Code 3B/8B (released, available on Ollama hub).
                   Used for: file ops, simple codegen, triage, validation.
                   Cost: $0.00.  Target: ≥90% of all calls.
 
-Tier 2 (LOCAL)  — IBM Granite 4.0-H-Small (32B, 9B active) via Ollama.
+Tier 2 (LOCAL)  — Qwen 2.5-Coder 32B / DeepSeek-Coder v2 via Ollama.
                   Used for: heavier reasoning, multi-file fixes.
                   Cost: $0.00.
 
-Tier 3 (CLOUD)  — Llama 4 / Devstral 2 / GPT-5.3 Codex via OpenRouter.
+Tier 3 (CLOUD)  — Llama 4 Scout / Devstral Small via OpenRouter.
                   Used for: deep reasoning, large context (>64k tokens).
                   Cost: cloud API rates.  Triggered only when needed.
 
