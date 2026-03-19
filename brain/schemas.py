@@ -200,11 +200,12 @@ class FormalVerificationStatus(str, Enum):
 
 
 class TestRunStatus(str, Enum):
-    PASSED  = "PASSED"
-    FAILED  = "FAILED"
-    ERROR   = "ERROR"
-    SKIPPED = "SKIPPED"
-    PARTIAL = "PARTIAL"
+    PASSED   = "PASSED"
+    FAILED   = "FAILED"
+    ERROR    = "ERROR"
+    SKIPPED  = "SKIPPED"
+    PARTIAL  = "PARTIAL"
+    NO_TESTS = "NO_TESTS"   # no test suite detected — probe returns True
 
 
 class ComplianceStandard(str, Enum):

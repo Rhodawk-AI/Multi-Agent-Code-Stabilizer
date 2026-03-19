@@ -23,6 +23,7 @@ from typing import Any
 from brain.schemas import (
     AuditRun, AuditScore, AuditTrailEntry,
     BaselineRecord, CbmcVerificationResult,
+    ConvergenceRecord,
     EscalationRecord, EscalationStatus,
     FileChunkRecord, FileRecord,
     FixAttempt, FormalVerificationResult,
@@ -274,3 +275,28 @@ class BrainStorage(ABC):
 
     @abstractmethod
     async def get_sci(self, baseline_id: str) -> SoftwareConfigurationIndex | None: ...
+
+    # ── CONVERGENCE (multi-cycle loop) ─────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:
+        """Persist a convergence check result for audit trail and resume logic."""
+        ...
+
+    @abstractmethod
+    async def list_convergence_records(
+        self, run_id: str
+    ) -> list["ConvergenceRecord"]:
+        """Return all convergence records for a run, ordered by cycle ascending."""
+        ...
+
+    # ── LLM SESSION LOGGING ────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def log_llm_session(self, session: dict) -> None:
+        """
+        Persist an LLM call record for cost tracking and reproducibility.
+        The session dict contains: run_id, agent_type, model, prompt_tokens,
+        completion_tokens, cost_usd, duration_ms, success, error.
+        """
+        ...

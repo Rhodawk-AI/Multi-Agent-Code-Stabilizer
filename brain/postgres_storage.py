@@ -722,3 +722,59 @@ def get_storage(db_path: str = ".stabilizer/brain.db") -> BrainStorage:
     async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list:
         if self._fallback: return await self._fallback.list_audit_trail(run_id, limit)
         return []
+
+    # ── CONVERGENCE ────────────────────────────────────────────────────────────
+
+    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:  # type: ignore[override]
+        from brain.schemas import ConvergenceRecord as _CR
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.upsert_convergence_record(record)
+            return
+        try:
+            async with AsyncSession(self._engine) as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO convergence_records (id, run_id, data)
+                        VALUES (:id, :run_id, :data::jsonb)
+                        ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
+                        """
+                    ),
+                    {"id": record.id, "run_id": record.run_id,
+                     "data": record.model_dump_json()},
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(f"upsert_convergence_record failed: {exc}")
+            if self._fallback:
+                await self._fallback.upsert_convergence_record(record)
+
+    async def list_convergence_records(self, run_id: str) -> list["ConvergenceRecord"]:  # type: ignore[override]
+        from brain.schemas import ConvergenceRecord as _CR
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.list_convergence_records(run_id)
+            return []
+        try:
+            async with AsyncSession(self._engine) as session:
+                result = await session.execute(
+                    text(
+                        "SELECT data FROM convergence_records "
+                        "WHERE run_id = :run_id ORDER BY ctid ASC"
+                    ),
+                    {"run_id": run_id},
+                )
+                rows = result.fetchall()
+            out = []
+            for row in rows:
+                try:
+                    out.append(_CR.model_validate_json(row[0] if isinstance(row[0], str) else str(row[0])))
+                except Exception:
+                    pass
+            return out
+        except Exception as exc:
+            log.warning(f"list_convergence_records failed: {exc}")
+            if self._fallback:
+                return await self._fallback.list_convergence_records(run_id)
+            return []

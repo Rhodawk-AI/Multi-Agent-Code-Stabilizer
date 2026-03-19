@@ -1660,3 +1660,41 @@ class SQLiteBrainStorage(BrainStorage):
                 "UPDATE issues SET status=? WHERE id=?", (status, issue_id)
             )
             await db.commit()
+
+    # ── CONVERGENCE ────────────────────────────────────────────────────────────
+
+    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:  # type: ignore[override]
+        from brain.schemas import ConvergenceRecord as _CR
+        async with self._write() as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS convergence_records "
+                "(id TEXT PRIMARY KEY, run_id TEXT, data TEXT)"
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO convergence_records (id, run_id, data) VALUES (?,?,?)",
+                (record.id, record.run_id, record.model_dump_json()),
+            )
+            await db.commit()
+
+    async def list_convergence_records(self, run_id: str) -> list["ConvergenceRecord"]:  # type: ignore[override]
+        from brain.schemas import ConvergenceRecord as _CR
+        async with self._read() as db:
+            try:
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS convergence_records "
+                    "(id TEXT PRIMARY KEY, run_id TEXT, data TEXT)"
+                )
+                async with db.execute(
+                    "SELECT data FROM convergence_records WHERE run_id=? ORDER BY rowid ASC",
+                    (run_id,),
+                ) as cur:
+                    rows = await cur.fetchall()
+                result = []
+                for row in rows:
+                    try:
+                        result.append(_CR.model_validate_json(row["data"]))
+                    except Exception:
+                        pass
+                return result
+            except Exception:
+                return []
