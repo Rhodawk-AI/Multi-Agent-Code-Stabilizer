@@ -1,39 +1,80 @@
+"""
+scripts/run_one_cycle.py
+========================
+Smoke-runs a single stabilisation cycle for CI / local validation.
+
+Usage
+-----
+    python scripts/run_one_cycle.py --repo-root /path/to/repo [--sqlite]
+
+Exit codes
+----------
+    0   cycle completed (STABILIZED or BASELINE_PENDING)
+    1   cycle failed or regressed
+    2   configuration error (missing capability)
+"""
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import typer
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from orchestrator.controller import StabilizerConfig, StabilizerController
-from brain.schemas import AutonomyLevel
+app = typer.Typer(add_completion=False)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
 
-async def main(repo_path: Path, repo_url: str) -> None:
+@app.command()
+def main(
+    repo_root: Path = typer.Option(..., help="Absolute path to the repository root"),
+    repo_url:  str  = typer.Option("file://local", help="Repository URL (for PR creation)"),
+    sqlite:    bool = typer.Option(False, "--sqlite", help="Use SQLite (dev only)"),
+    max_cycles: int = typer.Option(1, help="Number of stabilisation cycles to run"),
+    domain:    str  = typer.Option("general", help="Domain mode: general|military|aerospace|medical"),
+    dry_run:   bool = typer.Option(False, "--dry-run", help="Read + audit only, no fixes or commits"),
+) -> None:
+    """Single-cycle smoke runner for Rhodawk AI Code Stabilizer."""
+    from orchestrator.controller import StabilizerConfig, StabilizerController
+    from brain.schemas import AutonomyLevel, DomainMode
+
+    domain_map = {
+        "general":   DomainMode.GENERAL,
+        "military":  DomainMode.MILITARY,
+        "aerospace": DomainMode.AEROSPACE,
+        "medical":   DomainMode.MEDICAL,
+        "nuclear":   DomainMode.NUCLEAR,
+    }
+    domain_mode = domain_map.get(domain.lower(), DomainMode.GENERAL)
+
     cfg = StabilizerConfig(
         repo_url=repo_url,
-        repo_root=repo_path,
-        master_prompt_path=repo_path / "config" / "prompts" / "base.md",
-        github_token=os.getenv("GITHUB_TOKEN", ""),
-        primary_model=os.getenv("RHODAWK_AI_CODE_STABILIZER_MODEL", "claude-sonnet-4-20250514"),
-        max_cycles=1,
-        cost_ceiling_usd=10.0,
-        auto_commit=False,
-        autonomy_level=AutonomyLevel.PROPOSE_ONLY,
+        repo_root=repo_root,
+        use_sqlite=sqlite,
+        max_cycles=max_cycles,
+        auto_commit=not dry_run,
+        autonomy_level=AutonomyLevel.READ_ONLY if dry_run else AutonomyLevel.AUTO_FIX,
+        domain_mode=domain_mode,
     )
     ctrl = StabilizerController(cfg)
-    await ctrl.initialise()
-    status = await ctrl.stabilize()
-    print(f"Cycle complete. Status: {status.value}")
+
+    async def _run() -> int:
+        from brain.schemas import RunStatus
+        try:
+            await ctrl.initialise()
+            status = await ctrl.stabilize()
+            if status in (RunStatus.STABILIZED, RunStatus.BASELINE_PENDING):
+                typer.echo(f"✅  {status.value}")
+                return 0
+            typer.echo(f"❌  {status.value}", err=True)
+            return 1
+        except Exception as exc:
+            typer.echo(f"💥  {exc}", err=True)
+            return 2
+
+    sys.exit(asyncio.run(_run()))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python scripts/run_one_cycle.py /path/to/repo https://github.com/owner/repo")
-        sys.exit(1)
-    asyncio.run(main(Path(sys.argv[1]), sys.argv[2]))
+    app()
