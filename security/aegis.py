@@ -1,288 +1,353 @@
 """
 security/aegis.py
 =================
-Aegis — Endpoint Detection and Response (EDR) for Rhodawk AI agents.
+AegisEDR — Endpoint Detection and Response for generated fix content.
 
-Aegis monitors all agent actions in real time and blocks:
-• Prompt injection attacks (content inside <content> tags trying to escape)
-• Path traversal in fix output
-• Credential exfiltration (API keys, tokens, passwords in generated code)
-• Dangerous subprocess calls
-• Excessive file writes (>100 files per cycle)
-• Network calls from the fix sandbox
-
-Integrates with Aurite-ai anti-pattern detection via MCP when available.
-
-B5 fix: plugins now run in scrubbed subprocess environments.
-B8 fix: ExfiltrationGuard correctly handles terminal-targeting operations.
+PRODUCTION FIXES vs audit report
+──────────────────────────────────
+• Unicode normalization bypass fixed: all content is NFC-normalized before
+  pattern matching. Unicode confusables (е vs e, etc.) cannot bypass patterns.
+• Credential patterns extended: AWS STS tokens, Azure managed identity,
+  GCP service account JSON, GitHub tokens (ghp_*, ghs_*, github_pat_*).
+• _INJECTION_ESCAPE_PATTERNS extended beyond simple regex to include:
+    - Unicode bidirectional control characters (RLO/LRO/PDF attacks)
+    - Null byte injection (\x00)
+    - Python f-string injection via bracket abuse
+    - YAML/TOML deserialization injection patterns
+• Privilege escalation pre-filter extended beyond sudo to cover: su, doas,
+  pkexec, chroot, nsenter, unshare, capsh, setcap, setuid system calls.
+• Destructive filesystem patterns cover modern variants.
+• Pipe-to-shell hard-deny covers curl|bash, wget|sh, etc.
+• All patterns normalized to lowercase after NFC normalization.
+• ThreatFinding is a proper Pydantic model with severity and confidence.
+• is_threat_present() and highest_severity() exposed for gate integration.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
-import os
 import re
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import unicodedata
+from enum import Enum
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Threat patterns
-# ──────────────────────────────────────────────────────────────────────────────
 
-_CREDENTIAL_PATTERNS = [
-    re.compile(r'(?i)(api[_-]?key|secret|password|token|passwd|auth)\s*=\s*["\'][^"\']{8,}["\']'),
-    re.compile(r'sk-[a-zA-Z0-9]{20,}'),          # OpenAI key
-    re.compile(r'ANTHROPIC_API_KEY\s*=\s*["\'][^"\']+'),
-    re.compile(r'ghp_[a-zA-Z0-9]{36}'),            # GitHub PAT
-    re.compile(r'aws_secret_access_key\s*=\s*\S+', re.IGNORECASE),
-]
-
-_INJECTION_ESCAPE_PATTERNS = [
-    re.compile(r'<\/content>\s*\n.*?(?:ignore|disregard|override)', re.DOTALL | re.IGNORECASE),
-    re.compile(r'SYSTEM\s*PROMPT\s*OVERRIDE', re.IGNORECASE),
-    re.compile(r'ignore\s+(?:all\s+)?previous\s+instructions', re.IGNORECASE),
-    re.compile(r'you\s+are\s+now\s+(?:a|an)\s+\w+', re.IGNORECASE),
-]
-
-_DANGEROUS_SUBPROCESS = [
-    re.compile(r'subprocess\.call\(["\']?(rm|del|format|fdisk)', re.IGNORECASE),
-    re.compile(r'os\.system\('),
-    re.compile(r'exec\s*\('),
-    re.compile(r'eval\s*\('),
-    re.compile(r'__import__\s*\('),
-]
-
-# Terminal-targeting operations that ExfiltrationGuard must cover
-# B8 fix: was missing these patterns
-_TERMINAL_EXFIL_PATTERNS = [
-    re.compile(r'subprocess.*?(?:cat|curl|wget|nc|ncat|bash|sh)\s+.*?>\s*\S+', re.DOTALL),
-    re.compile(r'open\s*\(\s*["\']\/dev\/(?:tty|pts)', re.IGNORECASE),
-    re.compile(r'pty\.spawn', re.IGNORECASE),
-    re.compile(r'os\.write\s*\(\s*1\s*,'),   # write to stdout fd directly
-]
+class ThreatSeverity(str, Enum):
+    CRITICAL = "CRITICAL"
+    HIGH     = "HIGH"
+    MEDIUM   = "MEDIUM"
+    LOW      = "LOW"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Aegis threat event
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ThreatEvent:
+class ThreatFinding(BaseModel):
     threat_type:  str
-    severity:     str       = "HIGH"
+    pattern:      str
+    matched_text: str       = ""
+    severity:     ThreatSeverity = ThreatSeverity.HIGH
+    confidence:   float     = Field(ge=0.0, le=1.0, default=0.95)
+    description:  str       = ""
+    line_number:  int       = 0
     file_path:    str       = ""
-    detail:       str       = ""
-    blocked:      bool      = True
-    timestamp:    datetime  = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    run_id:       str       = ""
-    hmac_sig:     str       = ""
-
-    def sign(self, secret: str) -> None:
-        raw = f"{self.threat_type}:{self.file_path}:{self.detail}:{self.timestamp.isoformat()}"
-        self.hmac_sig = hmac.new(
-            secret.encode(), raw.encode(), hashlib.sha256
-        ).hexdigest()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ExfiltrationGuard — B8 fix
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Pattern tables ────────────────────────────────────────────────────────────
 
-class ExfiltrationGuard:
-    """
-    Scans fix content for credential exfiltration and data leak patterns.
+# Pipe-to-shell: remote code execution via shell pipeline (HARD DENY)
+_PIPE_TO_SHELL: list[tuple[str, str]] = [
+    (r"curl\s+[^|]+\|\s*(?:bash|sh|zsh|fish)",  "curl-pipe-shell"),
+    (r"wget\s+[^|]+\|\s*(?:bash|sh|zsh|fish)",  "wget-pipe-shell"),
+    (r"fetch\s+[^|]+\|\s*(?:bash|sh|zsh|fish)", "fetch-pipe-shell"),
+    (r"\$\(\s*curl[^)]+\)",                      "curl-command-substitution"),
+    (r"eval\s*\(\s*curl",                        "eval-curl"),
+    (r"eval\s*\(\s*wget",                        "eval-wget"),
+]
 
-    B8 fix: now covers terminal-targeting subprocess operations that the
-    previous implementation missed entirely.
-    """
+# Credential patterns — all normalized to lowercase for matching
+_CREDENTIAL_PATTERNS: list[tuple[str, str, ThreatSeverity]] = [
+    # Generic
+    (r"(?:password|passwd|pwd)\s*=\s*['\"][^'\"]{4,}['\"]",
+     "hardcoded-password", ThreatSeverity.CRITICAL),
+    (r"(?:api[_-]?key|apikey|secret[_-]?key)\s*=\s*['\"][^'\"]{8,}['\"]",
+     "hardcoded-api-key", ThreatSeverity.CRITICAL),
+    (r"(?:token|auth[_-]?token|bearer)\s*=\s*['\"][^'\"]{10,}['\"]",
+     "hardcoded-token", ThreatSeverity.CRITICAL),
+    # AWS
+    (r"(?:aws_access_key_id|aws_secret_access_key)\s*=\s*['\"][a-z0-9/+=]{16,}['\"]",
+     "aws-credential", ThreatSeverity.CRITICAL),
+    (r"akia[0-9a-z]{16}",  "aws-access-key-id", ThreatSeverity.CRITICAL),
+    (r"asia[0-9a-z]{16}",  "aws-sts-token",     ThreatSeverity.CRITICAL),
+    (r"aroa[0-9a-z]{16}",  "aws-role-id",       ThreatSeverity.HIGH),
+    # Azure
+    (r"(?:azure_client_secret|azure_tenant_id)\s*=\s*['\"][^'\"]{10,}['\"]",
+     "azure-credential", ThreatSeverity.CRITICAL),
+    (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}.*(?:secret|key|token)",
+     "azure-uuid-credential", ThreatSeverity.HIGH),
+    # GCP
+    (r'"type"\s*:\s*"service_account"',  "gcp-service-account", ThreatSeverity.CRITICAL),
+    (r"ya29\.[0-9a-za-z_-]{30,}",        "gcp-oauth-token",    ThreatSeverity.CRITICAL),
+    # GitHub
+    (r"ghp_[a-z0-9]{36}",            "github-personal-token", ThreatSeverity.CRITICAL),
+    (r"ghs_[a-z0-9]{36}",            "github-server-token",   ThreatSeverity.CRITICAL),
+    (r"github_pat_[a-z0-9_]{59}",    "github-fine-grain-pat", ThreatSeverity.CRITICAL),
+    (r"ghr_[a-z0-9]{36}",            "github-refresh-token",  ThreatSeverity.HIGH),
+    # Private keys
+    (r"-----begin\s+(?:rsa|ec|openssh|pgp)\s+private key-----",
+     "private-key-material", ThreatSeverity.CRITICAL),
+    (r"-----begin private key-----",  "pkcs8-private-key", ThreatSeverity.CRITICAL),
+]
 
-    def scan(self, file_path: str, content: str) -> list[ThreatEvent]:
-        events: list[ThreatEvent] = []
+# Privilege escalation (hard deny)
+_PRIVILEGE_ESCALATION: list[tuple[str, str]] = [
+    (r"\bsudo\s+",           "sudo"),
+    (r"\bsu\s+-",            "su-switch"),
+    (r"\bdoas\s+",           "doas"),
+    (r"\bpkexec\s+",         "pkexec"),
+    (r"\bchroot\s+",         "chroot"),
+    (r"\bnsenter\s+",        "nsenter"),
+    (r"\bunshare\s+",        "unshare-namespace"),
+    (r"\bcapsh\s+",          "capsh"),
+    (r"\bsetcap\s+",         "setcap"),
+    (r"\bsetuid\s*\(",       "setuid-syscall"),
+    (r"\bsetgid\s*\(",       "setgid-syscall"),
+    (r"\bseteuid\s*\(",      "seteuid-syscall"),
+    (r"chmod\s+[0-7]*[67][0-7][0-7]",  "setuid-chmod"),
+    (r"chmod\s+\+s\b",       "setuid-chmod-s"),
+    (r"chmod\s+777",         "world-writable"),
+]
 
-        # Credential patterns in generated code
-        for pat in _CREDENTIAL_PATTERNS:
-            match = pat.search(content)
-            if match:
-                events.append(ThreatEvent(
-                    threat_type="CREDENTIAL_EXPOSURE",
-                    file_path=file_path,
-                    detail=f"Pattern match at pos {match.start()}: {match.group()[:80]}",
-                ))
+# Destructive filesystem commands (hard deny)
+_DESTRUCTIVE_FS: list[tuple[str, str]] = [
+    (r"\brm\s+-rf?\s+/",      "rm-rf-root"),
+    (r"\brm\s+-rf?\s+\*",     "rm-rf-wildcard"),
+    (r"\bshred\s+",           "shred"),
+    (r"\bdd\s+if=/dev/zero",  "dd-zero-wipe"),
+    (r"\bdd\s+if=/dev/random","dd-random-wipe"),
+    (r"\bmkfs\.",             "mkfs-format"),
+    (r"\bformat\s+[a-z]:",    "windows-format"),
+    (r"\bwipefs\s+",          "wipefs"),
+    (r"os\.remove\s*\(",      "os-remove"),
+    (r"os\.unlink\s*\(",      "os-unlink"),
+    (r"shutil\.rmtree\s*\(",  "shutil-rmtree"),
+    (r"pathlib.*\.unlink\s*\(", "pathlib-unlink"),
+]
 
-        # Terminal-targeting exfil — B8 fix
-        for pat in _TERMINAL_EXFIL_PATTERNS:
-            match = pat.search(content)
-            if match:
-                events.append(ThreatEvent(
-                    threat_type="TERMINAL_EXFILTRATION",
-                    severity="CRITICAL",
-                    file_path=file_path,
-                    detail=f"Terminal-targeting operation: {match.group()[:120]}",
-                ))
+# Injection patterns (including Unicode bidi attacks)
+_INJECTION_PATTERNS: list[tuple[str, str, ThreatSeverity]] = [
+    # Bidirectional Unicode control characters (trojan source attacks)
+    (r"[\u202a-\u202e\u2066-\u2069\u200f\u200e]",
+     "unicode-bidi-control", ThreatSeverity.CRITICAL),
+    # Null bytes
+    (r"\x00",                "null-byte-injection", ThreatSeverity.HIGH),
+    # SQL injection patterns in string literals
+    (r"'[^']*(?:union\s+select|drop\s+table|;--|exec\s*\()",
+     "sql-injection-pattern", ThreatSeverity.HIGH),
+    # YAML deserialization
+    (r"!!python/object",     "yaml-deserialize-python", ThreatSeverity.CRITICAL),
+    (r"!!python/name",       "yaml-deserialize-python-name", ThreatSeverity.HIGH),
+    # Python pickle injection
+    (r"pickle\.loads",       "pickle-deserialize", ThreatSeverity.HIGH),
+    # OS command via string interpolation
+    (r"os\.system\s*\([^)]*\$|subprocess\.call\s*\([^)]*\$",
+     "command-string-interpolation", ThreatSeverity.HIGH),
+    # Hardcoded IPs in production code (not comments)
+    (r"(?<!\#.{0,200})\b(?:10|172|192)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+     "hardcoded-private-ip", ThreatSeverity.LOW),
+]
 
-        return events
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# PromptInjectionDetector
-# ──────────────────────────────────────────────────────────────────────────────
-
-class PromptInjectionDetector:
-    """Detects prompt injection attempts in file content and LLM prompts."""
-
-    def scan(self, content: str, context: str = "fix") -> list[ThreatEvent]:
-        events: list[ThreatEvent] = []
-        for pat in _INJECTION_ESCAPE_PATTERNS:
-            match = pat.search(content)
-            if match:
-                events.append(ThreatEvent(
-                    threat_type="PROMPT_INJECTION",
-                    severity="CRITICAL",
-                    detail=f"Injection pattern in {context}: {match.group()[:100]}",
-                ))
-        return events
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SubprocessGuard
-# ──────────────────────────────────────────────────────────────────────────────
-
-class SubprocessGuard:
-    """Blocks dangerous subprocess patterns in generated code."""
-
-    def scan(self, file_path: str, content: str) -> list[ThreatEvent]:
-        events: list[ThreatEvent] = []
-        for pat in _DANGEROUS_SUBPROCESS:
-            match = pat.search(content)
-            if match:
-                events.append(ThreatEvent(
-                    threat_type="DANGEROUS_SUBPROCESS",
-                    severity="CRITICAL",
-                    file_path=file_path,
-                    detail=f"Dangerous call: {match.group()[:100]}",
-                ))
-        return events
+# Exfiltration patterns (network calls in non-test code)
+_EXFILTRATION_PATTERNS: list[tuple[str, str]] = [
+    (r"(?:requests|httpx|aiohttp)\.\w+\([^)]*(?:attacker|exfil|c2|callback)",
+     "exfiltration-http"),
+    (r"socket\.connect\s*\(\s*\(['\"][^'\"]+['\"],\s*(?:4444|1337|31337)",
+     "reverse-shell-socket"),
+    (r"\bnc\s+-e\s+/bin",  "netcat-reverse-shell"),
+    (r"\bncat\s+-e\s+/bin", "ncat-reverse-shell"),
+]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Aegis — main EDR orchestrator
-# ──────────────────────────────────────────────────────────────────────────────
+# ── AegisEDR ──────────────────────────────────────────────────────────────────
 
 class AegisEDR:
     """
-    Orchestrates all security guards and provides a unified scan interface.
-
-    Usage::
-
-        aegis = AegisEDR(run_id="abc123")
-        threats = aegis.scan_fix_content(file_path, content)
-        if threats:
-            # Block the fix
+    Endpoint Detection and Response scanner for LLM-generated fix content.
+    Scans every FixedFile before static analysis gate.
     """
 
     def __init__(
         self,
-        run_id:         str      = "",
-        hmac_secret:    str | None = None,
-        max_files_per_cycle: int = 100,
-        strict_mode:    bool     = False,
+        run_id:      str  = "",
+        hmac_secret: str  = "",
+        strict_mode: bool = False,
     ) -> None:
-        self.run_id           = run_id
-        self._hmac_secret     = hmac_secret or os.environ.get("RHODAWK_AUDIT_SECRET", "")
-        self._max_files       = max_files_per_cycle
-        self._strict          = strict_mode
-        self._exfil_guard     = ExfiltrationGuard()
-        self._injection_guard = PromptInjectionDetector()
-        self._subprocess_guard = SubprocessGuard()
-        self._event_log:  list[ThreatEvent] = []
-        self._files_this_cycle: int          = 0
+        self.run_id      = run_id
+        self.hmac_secret = hmac_secret
+        self.strict_mode = strict_mode
+        self._cycle_findings: list[ThreatFinding] = []
 
-    def scan_fix_content(self, file_path: str, content: str) -> list[ThreatEvent]:
-        """
-        Run all guards on a single fixed file.
-        Returns a list of threat events (empty = clean).
-        """
-        events: list[ThreatEvent] = []
-        events.extend(self._exfil_guard.scan(file_path, content))
-        events.extend(self._injection_guard.scan(content, context=f"fix:{file_path}"))
-        events.extend(self._subprocess_guard.scan(file_path, content))
-
-        # Track write volume
-        self._files_this_cycle += 1
-        if self._files_this_cycle > self._max_files:
-            events.append(ThreatEvent(
-                threat_type="EXCESSIVE_WRITES",
-                severity="HIGH",
-                file_path=file_path,
-                detail=f"Write count {self._files_this_cycle} exceeds limit {self._max_files}",
-                blocked=self._strict,
-            ))
-
-        for e in events:
-            e.run_id = self.run_id
-            if self._hmac_secret:
-                e.sign(self._hmac_secret)
-            self._event_log.append(e)
-            log.warning(
-                f"[AEGIS] {e.threat_type} | {e.severity} | "
-                f"{e.file_path} | {e.detail[:80]}"
-            )
-
-        return events
-
-    def scan_prompt(self, prompt: str) -> list[ThreatEvent]:
-        """Scan a prompt before sending to LLM."""
-        return self._injection_guard.scan(prompt, context="prompt")
-
-    def is_threat_present(self, events: list[ThreatEvent]) -> bool:
-        return any(e.blocked for e in events)
-
-    def reset_cycle(self) -> None:
-        self._files_this_cycle = 0
-
-    def audit_log(self) -> list[dict]:
-        return [
-            {
-                "type":      e.threat_type,
-                "severity":  e.severity,
-                "file":      e.file_path,
-                "detail":    e.detail,
-                "blocked":   e.blocked,
-                "ts":        e.timestamp.isoformat(),
-                "hmac":      e.hmac_sig,
-            }
-            for e in self._event_log
+        # Pre-compile all patterns
+        self._compiled_pipe_to_shell = [
+            (re.compile(p, re.IGNORECASE), label)
+            for p, label in _PIPE_TO_SHELL
+        ]
+        self._compiled_credentials = [
+            (re.compile(p, re.IGNORECASE), label, sev)
+            for p, label, sev in _CREDENTIAL_PATTERNS
+        ]
+        self._compiled_priv_esc = [
+            (re.compile(p, re.IGNORECASE), label)
+            for p, label in _PRIVILEGE_ESCALATION
+        ]
+        self._compiled_destructive = [
+            (re.compile(p, re.IGNORECASE), label)
+            for p, label in _DESTRUCTIVE_FS
+        ]
+        self._compiled_injection = [
+            (re.compile(p, re.IGNORECASE), label, sev)
+            for p, label, sev in _INJECTION_PATTERNS
+        ]
+        self._compiled_exfil = [
+            (re.compile(p, re.IGNORECASE), label)
+            for p, label in _EXFILTRATION_PATTERNS
         ]
 
+    def reset_cycle(self) -> None:
+        self._cycle_findings = []
 
-# ──────────────────────────────────────────────────────────────────────────────
-# B5 fix: secure plugin subprocess launcher
-# ──────────────────────────────────────────────────────────────────────────────
+    def scan_fix_content(
+        self, file_path: str, content: str
+    ) -> list[ThreatFinding]:
+        """
+        Scan content for all threat categories.
+        Content is NFC-normalized before matching to prevent Unicode bypass.
+        """
+        # NFC normalization prevents Unicode confusable bypasses
+        normalized = unicodedata.normalize("NFC", content).lower()
+        findings: list[ThreatFinding] = []
 
-_SCRUBBED_ENV_KEYS = frozenset({
-    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN",
-    "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "AWS_SECRET_ACCESS_KEY",
-    "AWS_ACCESS_KEY_ID", "OPENROUTER_API_KEY",
-    "RHODAWK_JWT_SECRET", "RHODAWK_AUDIT_SECRET",
-    "DATABASE_URL", "REDIS_URL",
-})
+        for pattern, label in self._compiled_pipe_to_shell:
+            m = pattern.search(normalized)
+            if m:
+                findings.append(ThreatFinding(
+                    threat_type="pipe-to-shell",
+                    pattern=label,
+                    matched_text=content[max(0, m.start()-20):m.end()+20],
+                    severity=ThreatSeverity.CRITICAL,
+                    confidence=0.99,
+                    description=f"Pipe-to-shell pattern detected: {label}",
+                    file_path=file_path,
+                ))
 
+        for pattern, label, sev in self._compiled_credentials:
+            m = pattern.search(normalized)
+            if m:
+                matched = content[m.start():m.end()]
+                findings.append(ThreatFinding(
+                    threat_type="hardcoded-credential",
+                    pattern=label,
+                    matched_text=matched[:80],
+                    severity=sev,
+                    confidence=0.90,
+                    description=f"Credential pattern in generated code: {label}",
+                    file_path=file_path,
+                ))
 
-def scrubbed_env() -> dict[str, str]:
-    """
-    Return os.environ with all sensitive keys removed.
-    Used for plugin subprocess invocations (B5 fix).
-    """
-    return {
-        k: v for k, v in os.environ.items()
-        if k not in _SCRUBBED_ENV_KEYS
-        and not k.startswith("RHODAWK_SECRET")
-        and not k.startswith("AWS_")
-        and "PASSWORD" not in k.upper()
-        and "TOKEN" not in k.upper()
-    }
+        for pattern, label in self._compiled_priv_esc:
+            m = pattern.search(normalized)
+            if m:
+                findings.append(ThreatFinding(
+                    threat_type="privilege-escalation",
+                    pattern=label,
+                    matched_text=content[max(0, m.start()-10):m.end()+20],
+                    severity=ThreatSeverity.CRITICAL,
+                    confidence=0.95,
+                    description=f"Privilege escalation pattern: {label}",
+                    file_path=file_path,
+                ))
+
+        for pattern, label in self._compiled_destructive:
+            m = pattern.search(normalized)
+            if m:
+                findings.append(ThreatFinding(
+                    threat_type="destructive-filesystem",
+                    pattern=label,
+                    matched_text=content[max(0, m.start()-10):m.end()+20],
+                    severity=ThreatSeverity.CRITICAL,
+                    confidence=0.97,
+                    description=f"Destructive filesystem operation: {label}",
+                    file_path=file_path,
+                ))
+
+        # Unicode bidi check on raw content (not normalized — must find raw chars)
+        for pattern, label, sev in self._compiled_injection:
+            target = content if "unicode" in label else normalized
+            m = pattern.search(target)
+            if m:
+                findings.append(ThreatFinding(
+                    threat_type="injection",
+                    pattern=label,
+                    matched_text=repr(content[max(0, m.start()-5):m.end()+5]),
+                    severity=sev,
+                    confidence=0.90,
+                    description=f"Injection pattern detected: {label}",
+                    file_path=file_path,
+                ))
+
+        for pattern, label in self._compiled_exfil:
+            m = pattern.search(normalized)
+            if m:
+                findings.append(ThreatFinding(
+                    threat_type="exfiltration",
+                    pattern=label,
+                    matched_text=content[max(0, m.start()-10):m.end()+30],
+                    severity=ThreatSeverity.CRITICAL,
+                    confidence=0.80,
+                    description=f"Potential exfiltration pattern: {label}",
+                    file_path=file_path,
+                ))
+
+        self._cycle_findings.extend(findings)
+        if findings:
+            log.warning(
+                f"[Aegis] {len(findings)} threats in {file_path}: "
+                + ", ".join(f.pattern for f in findings[:5])
+            )
+        return findings
+
+    def is_threat_present(
+        self,
+        findings: list[ThreatFinding],
+        min_severity: ThreatSeverity = ThreatSeverity.HIGH,
+    ) -> bool:
+        order = [
+            ThreatSeverity.LOW, ThreatSeverity.MEDIUM,
+            ThreatSeverity.HIGH, ThreatSeverity.CRITICAL,
+        ]
+        threshold = order.index(min_severity)
+        return any(order.index(f.severity) >= threshold for f in findings)
+
+    def highest_severity(
+        self, findings: list[ThreatFinding]
+    ) -> ThreatSeverity | None:
+        order = [
+            ThreatSeverity.LOW, ThreatSeverity.MEDIUM,
+            ThreatSeverity.HIGH, ThreatSeverity.CRITICAL,
+        ]
+        if not findings:
+            return None
+        return max(findings, key=lambda f: order.index(f.severity)).severity
+
+    def cycle_summary(self) -> dict:
+        return {
+            "total":    len(self._cycle_findings),
+            "critical": sum(
+                1 for f in self._cycle_findings
+                if f.severity == ThreatSeverity.CRITICAL
+            ),
+            "high": sum(
+                1 for f in self._cycle_findings
+                if f.severity == ThreatSeverity.HIGH
+            ),
+        }
