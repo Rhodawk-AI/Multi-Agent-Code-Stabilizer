@@ -99,37 +99,48 @@ class MCPManager:
         return f"Content-Length: {len(body)}\r\n\r\n".encode() + body
 
     def _lsp_read_response(self, proc: Any, target_id: int, timeout_s: int = 8) -> Any:
-        """Read clangd stdout until a response with id==target_id is found."""
-        import signal
-        def _alarm(s, f): raise TimeoutError
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.alarm(timeout_s)
+        """
+        Read clangd stdout until a response with id==target_id is found.
+
+        Uses select() instead of SIGALRM so this method is safe to call
+        from threads (run_in_executor).  SIGALRM is process-wide and fires
+        during unrelated asyncio operations when used inside a thread pool.
+        """
+        import select as _select
+
+        deadline = __import__("time").monotonic() + timeout_s
         buf = b""
-        try:
-            while True:
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\r\n\r\n" in buf:
-                    header, rest = buf.split(b"\r\n\r\n", 1)
-                    for h in header.decode(errors="replace").splitlines():
-                        if h.lower().startswith("content-length:"):
+        while True:
+            remaining = deadline - __import__("time").monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = _select.select([proc.stdout], [], [], min(remaining, 1.0))
+            if not ready:
+                continue
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\r\n\r\n" in buf:
+                header, rest = buf.split(b"\r\n\r\n", 1)
+                length = 0
+                for h in header.decode(errors="replace").splitlines():
+                    if h.lower().startswith("content-length:"):
+                        try:
                             length = int(h.split(":", 1)[1].strip())
-                            if len(rest) >= length:
-                                body = rest[:length]
-                                buf  = rest[length:]
-                                try:
-                                    obj = json.loads(body)
-                                    if obj.get("id") == target_id:
-                                        return obj.get("result")
-                                except Exception:
-                                    pass
-                            break
-        except TimeoutError:
-            pass
-        finally:
-            signal.alarm(0)
+                        except ValueError:
+                            pass
+                if length and len(rest) >= length:
+                    body = rest[:length]
+                    buf  = rest[length:]
+                    try:
+                        obj = json.loads(body)
+                        if obj.get("id") == target_id:
+                            return obj.get("result")
+                    except Exception:
+                        pass
+                else:
+                    break  # wait for more data
         return None
 
     def _clangd_callers(self, symbol: str, file_path: str) -> list[dict]:
@@ -196,17 +207,84 @@ class MCPManager:
             return []
 
     def _clangd_callees(self, symbol: str) -> list[dict]:
-        # Find a file containing the symbol, then query outgoing calls
-        for ext in (".c", ".cpp", ".cc", ".h", ".hpp"):
-            for p in self.repo_root.rglob(f"*{ext}"):
-                try:
-                    if symbol in p.read_text(encoding="utf-8", errors="replace"):
-                        return self._clangd_callers(
-                            symbol, str(p.relative_to(self.repo_root))
-                        )
-                except Exception:
-                    continue
-        return []
+        """
+        Outgoing calls for symbol via clangd callHierarchy/outgoingCalls.
+
+        FIX: previous implementation did an O(n) rglob over the entire repo
+        to find a file containing the symbol, then re-used _clangd_callers
+        (which queries *incoming* calls — wrong direction anyway).
+
+        Correct approach:
+          1. Use workspace/symbol to locate the definition precisely.
+          2. prepareCallHierarchy on the definition location.
+          3. callHierarchy/outgoingCalls on the prepared item.
+        """
+        compile_commands = self.repo_root / "compile_commands.json"
+        if not compile_commands.exists():
+            return []
+
+        try:
+            from security.aegis import scrubbed_env
+
+            sym_results = self._clangd_symbol_query(symbol)
+            if not sym_results:
+                return []
+
+            # Use the first definition hit
+            defn = sym_results[0]
+            abs_file = defn.get("file", "")
+            line_no  = defn.get("line", 0)
+            char_no  = defn.get("character", 0)
+
+            if not abs_file:
+                return []
+
+            proc = subprocess.Popen(
+                ["clangd", f"--compile-commands-dir={self.repo_root}"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=scrubbed_env(),
+            )
+            for msg in [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "processId": os.getpid(), "rootUri": f"file://{self.repo_root}",
+                    "capabilities": {}, "initializationOptions": {
+                        "compilationDatabasePath": str(self.repo_root)}}},
+                {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+                {"jsonrpc": "2.0", "id": 2,
+                 "method": "textDocument/prepareCallHierarchy",
+                 "params": {"textDocument": {"uri": f"file://{abs_file}"},
+                            "position": {"line": line_no, "character": char_no}}},
+            ]:
+                proc.stdin.write(self._lsp_frame(msg))
+            proc.stdin.flush()
+
+            items = self._lsp_read_response(proc, 2) or []
+            results: list[dict] = []
+            if items:
+                proc.stdin.write(self._lsp_frame({
+                    "jsonrpc": "2.0", "id": 3,
+                    "method": "callHierarchy/outgoingCalls",
+                    "params": {"item": items[0]},
+                }))
+                proc.stdin.flush()
+                calls = self._lsp_read_response(proc, 3) or []
+                for call in calls:
+                    to_item = call.get("to", {})
+                    uri     = to_item.get("uri", "")
+                    rng     = to_item.get("range", {}).get("start", {})
+                    results.append({
+                        "file":     uri.replace("file://", ""),
+                        "function": to_item.get("name", ""),
+                        "line":     str(rng.get("line", 0)),
+                    })
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return results
+        except Exception as exc:
+            log.debug(f"clangd_callees({symbol}): {exc}")
+            return []
 
     def _cscope_callers(self, symbol: str, file_path: str) -> list[dict]:
         if not self._cscope_available:
