@@ -1,24 +1,43 @@
 version: "3.9"
 
 services:
-  rhodawk-ai-code-stabilizer:
+  rhodawk-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - qdrant
+      - redis
+    environment:
+      - RHODAWK_DEV_AUTH=1
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+
+  rhodawk-worker:
     build: .
     env_file: .env
+    depends_on:
+      - redis
+    command: celery -A workers.celery_app worker --loglevel=info -Q read,fix,gate
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
     volumes:
-      - .:/app
-      - ./data:/app/data
-    working_dir: /app
-    command: ["rhodawk-ai-code-stabilizer", "--help"]
+      - qdrant_data:/qdrant/storage
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
-    volumes: ["redis_data:/data"]
+    ports:
+      - "6379:6379"
 
   ollama:
     image: ollama/ollama:latest
-    ports: ["11434:11434"]
-    volumes: ["ollama_data:/root/.ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
     deploy:
       resources:
         reservations:
@@ -27,6 +46,20 @@ services:
               count: all
               capabilities: [gpu]
 
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
-  redis_data:
-  ollama_data:
+  qdrant_data:
+  ollama_models:
