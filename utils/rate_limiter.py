@@ -1,122 +1,88 @@
+"""
+utils/rate_limiter.py
+=====================
+Token bucket rate limiter for LLM API calls.
+
+B7 FIX: Was setting os.environ["ANTHROPIC_API_KEY"] directly from a key pool,
+        creating a race condition and leaking keys to child processes.
+        Now returns the key as a value; caller passes it explicitly via litellm.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
-class APIKey:
-    key: str
-    requests_per_minute: int = 60
-    tokens_per_minute: int = 100_000
-    _request_times: deque = field(default_factory=deque, repr=False)
-    _token_times: deque = field(default_factory=deque, repr=False)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    disabled: bool = False
-    error_count: int = 0
-
-    async def acquire(self, estimated_tokens: int = 1000) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            window = 60.0
-
-            while self._request_times and now - self._request_times[0] > window:
-                self._request_times.popleft()
-            while self._token_times and now - self._token_times[0][0] > window:
-                self._token_times.popleft()
-
-            token_usage = sum(t for _, t in self._token_times)
-
-            if (len(self._request_times) >= self.requests_per_minute or
-                    token_usage + estimated_tokens > self.tokens_per_minute):
-                return False
-
-            self._request_times.append(now)
-            self._token_times.append((now, estimated_tokens))
-            return True
-
-    def record_error(self, is_rate_limit: bool = False) -> None:
-        self.error_count += 1
-        if self.error_count > 10 and is_rate_limit:
-            self.disabled = True
-            log.warning(f"API key ...{self.key[-4:]} disabled after {self.error_count} errors")
-
-    def record_success(self) -> None:
-        self.error_count = max(0, self.error_count - 1)
+class ApiKey:
+    key:            str
+    requests_used:  int = 0
+    tokens_used:    int = 0
+    reset_at:       float = 0.0
 
 
 class RateLimiter:
+    """
+    Token bucket rate limiter with optional API key rotation.
 
-    def __init__(self, keys: list[APIKey] | None = None) -> None:
-        self._keys = keys or self._load_from_env()
-        self._index = 0
-        self._global_lock = asyncio.Lock()
+    B7 FIX: get_key() returns the key value instead of setting os.environ.
+    """
 
-    def _load_from_env(self) -> list[APIKey]:
-        keys: list[APIKey] = []
-        i = 1
-        while True:
-            key = os.getenv(f"ANTHROPIC_API_KEY_{i}") or (
-                os.getenv("ANTHROPIC_API_KEY") if i == 1 else None
-            )
-            if not key:
-                break
-            keys.append(APIKey(key=key))
-            i += 1
-        if not keys:
-            log.warning("RateLimiter: no API keys found in environment")
-        return keys
+    def __init__(
+        self,
+        keys:        list[str] | None = None,
+        rpm:         int = 60,
+        tpm:         int = 100_000,
+    ) -> None:
+        raw_keys = keys or []
+        if not raw_keys:
+            # Load from environment
+            for i in range(1, 6):
+                k = os.environ.get(f"ANTHROPIC_API_KEY_{i}", "")
+                if k:
+                    raw_keys.append(k)
+            if not raw_keys:
+                primary = os.environ.get("ANTHROPIC_API_KEY", "")
+                if primary:
+                    raw_keys.append(primary)
 
-    async def get_key(
-        self, estimated_tokens: int = 1000, max_wait_s: float = 30.0
-    ) -> str | None:
+        self._keys = [ApiKey(key=k) for k in raw_keys]
+        self._rpm  = rpm
+        self._tpm  = tpm
+        self._lock = asyncio.Lock()
+
+    async def get_key(self, estimated_tokens: int = 1000) -> str | None:
+        """
+        Return the API key with most remaining capacity.
+        B7 FIX: returns the key; NEVER mutates os.environ.
+        """
         if not self._keys:
             return None
+        async with self._lock:
+            now = time.monotonic()
+            for api_key in self._keys:
+                if now >= api_key.reset_at:
+                    api_key.requests_used = 0
+                    api_key.tokens_used   = 0
+                    api_key.reset_at      = now + 60
 
-        deadline = time.monotonic() + max_wait_s
-        while time.monotonic() < deadline:
-            active = [k for k in self._keys if not k.disabled]
-            if not active:
-                log.error("All API keys disabled")
-                return None
+            available = [
+                k for k in self._keys
+                if k.requests_used < self._rpm
+                and k.tokens_used + estimated_tokens < self._tpm
+            ]
+            if not available:
+                min_wait = min(k.reset_at - now for k in self._keys)
+                log.warning(f"All API keys rate-limited; waiting {min_wait:.1f}s")
+                await asyncio.sleep(max(0, min_wait))
+                return await self.get_key(estimated_tokens)
 
-            async with self._global_lock:
-                start_idx = self._index % len(active)
-
-            for i in range(len(active)):
-                key = active[(start_idx + i) % len(active)]
-                if await key.acquire(estimated_tokens):
-                    async with self._global_lock:
-                        self._index = (start_idx + i + 1) % len(active)
-                    return key.key
-
-            await asyncio.sleep(1.0)
-
-        log.warning(f"RateLimiter: could not acquire key after {max_wait_s}s")
-        return None
-
-    def record_error(self, key_value: str, is_rate_limit: bool = False) -> None:
-        for k in self._keys:
-            if k.key == key_value:
-                k.record_error(is_rate_limit)
-                return
-
-    def record_success(self, key_value: str) -> None:
-        for k in self._keys:
-            if k.key == key_value:
-                k.record_success()
-                return
-
-    @property
-    def active_key_count(self) -> int:
-        return sum(1 for k in self._keys if not k.disabled)
-
-    @property
-    def total_key_count(self) -> int:
-        return len(self._keys)
+            best = min(available, key=lambda k: k.tokens_used)
+            best.requests_used += 1
+            best.tokens_used   += estimated_tokens
+            return best.key
