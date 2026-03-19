@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: rhodawk
+    static_configs:
+      - targets: ["rhodawk-api:8000"]
+    metrics_path: /metrics
