@@ -85,7 +85,7 @@ class AuditTrailSigner:
             plain_hash = hashlib.sha256(payload.encode()).hexdigest()
             return f"{_UNSIGNED_PREFIX}{plain_hash}"
 
-        return hmac.new(
+        return hmac.HMAC(
             self._secret.encode("utf-8"),
             payload.encode("utf-8"),
             hashlib.sha256,
@@ -115,7 +115,7 @@ class AuditTrailSigner:
             )
             return False
 
-        expected = hmac.new(
+        expected = hmac.HMAC(
             self._secret.encode("utf-8"),
             payload.encode("utf-8"),
             hashlib.sha256,
