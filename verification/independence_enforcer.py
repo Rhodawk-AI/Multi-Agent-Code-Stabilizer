@@ -1,0 +1,257 @@
+"""
+verification/independence_enforcer.py
+=======================================
+Reviewer independence enforcement for DO-178C Section 6.3.4.
+
+AUDIT FIX: The review identified that FixerAgent and ReviewerAgent used the
+same primary_model. Two calls to the same model family are not independent —
+they share training distribution and systematic biases.
+
+DO-178C 6.3.4 states: "The software verification process activities shall be
+performed by a person or tool that is independent of the developer of the
+software being verified." For LLM-based systems, independence means the
+reviewer model must come from a different organization's training pipeline.
+
+This module:
+  • Extracts model family from model identifier strings
+  • Verifies fixer and reviewer are from different families
+  • Raises IndependenceViolationError in strict mode
+  • Provides MODEL_FAMILY_MAP for known model providers
+"""
+from __future__ import annotations
+
+import logging
+import re
+
+log = logging.getLogger(__name__)
+
+
+class IndependenceViolationError(RuntimeError):
+    """
+    Raised when the reviewer and fixer models are from the same family.
+    In strict mode (military/aerospace/nuclear), this blocks the pipeline.
+    """
+
+
+# Canonical model family map.
+# Maps model identifier prefixes/patterns to a normalized family name.
+# Organization = unit of independence (different company = independent).
+MODEL_FAMILY_MAP: dict[str, str] = {
+    # Anthropic
+    "claude":              "anthropic",
+    "anthropic":           "anthropic",
+    # Meta / Llama
+    "llama":               "meta",
+    "meta-llama":          "meta",
+    "meta/llama":          "meta",
+    "codellama":           "meta",
+    # Mistral AI
+    "mistral":             "mistral",
+    "devstral":            "mistral",
+    "mixtral":             "mistral",
+    "mistralai":           "mistral",
+    # IBM / Granite
+    "granite":             "ibm",
+    "ibm":                 "ibm",
+    "ibm/granite":         "ibm",
+    # Alibaba / Qwen
+    "qwen":                "alibaba",
+    "alibaba":             "alibaba",
+    # Google / Gemini
+    "gemini":              "google",
+    "google":              "google",
+    "palm":                "google",
+    # OpenAI
+    "gpt":                 "openai",
+    "o1":                  "openai",
+    "o3":                  "openai",
+    "text-davinci":        "openai",
+    # DeepSeek
+    "deepseek":            "deepseek",
+    # Cohere
+    "command":             "cohere",
+    "cohere":              "cohere",
+    # Microsoft / Phi
+    "phi":                 "microsoft",
+    "microsoft":           "microsoft",
+    # xAI
+    "grok":                "xai",
+    # Falcon (TII)
+    "falcon":              "tii",
+    # BigCode
+    "starcoder":           "bigcode",
+    # Stability AI
+    "stable":              "stability",
+    # Amazon
+    "titan":               "amazon",
+    "bedrock":             "amazon",
+    # 01.ai
+    "yi":                  "01ai",
+    # Nous Research
+    "hermes":              "nous",
+    "nous":                "nous",
+    # Unknown
+    "unknown":             "unknown",
+}
+
+# Provider prefixes that appear before the model name in LiteLLM identifiers
+_PROVIDER_PREFIXES = {
+    "ollama", "openrouter", "huggingface", "together", "anyscale",
+    "azure", "bedrock", "vertex", "sagemaker", "deepinfra", "perplexity",
+    "groq", "fireworks", "replicate", "baseten",
+}
+
+
+def extract_model_family(model_id: str) -> str:
+    """
+    Extract a normalized model family (provider organization) from a
+    LiteLLM-style model identifier string.
+
+    Examples
+    --------
+    >>> extract_model_family("ollama/granite4-small")
+    'ibm'
+    >>> extract_model_family("openrouter/meta-llama/llama-4")
+    'meta'
+    >>> extract_model_family("claude-sonnet-4-20250514")
+    'anthropic'
+    >>> extract_model_family("qwen2.5-coder:32b")
+    'alibaba'
+    """
+    if not model_id:
+        return "unknown"
+
+    # Normalise: lowercase, strip version tags
+    m = model_id.lower().strip()
+    # Remove provider prefix (ollama/, openrouter/, etc.)
+    for prefix in sorted(_PROVIDER_PREFIXES, key=len, reverse=True):
+        if m.startswith(prefix + "/"):
+            m = m[len(prefix) + 1:]
+            break
+
+    # Check longest-first match against family map
+    for pattern, family in sorted(MODEL_FAMILY_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+        if m.startswith(pattern) or re.search(r'\b' + re.escape(pattern) + r'\b', m):
+            return family
+
+    return "unknown"
+
+
+class IndependenceEnforcer:
+    """
+    Verifies that the reviewer model comes from a different organization
+    than the fixer model.
+
+    Parameters
+    ----------
+    fixer_model:
+        LiteLLM-style model identifier used by FixerAgent.
+    reviewer_model:
+        LiteLLM-style model identifier used by ReviewerAgent.
+    strict:
+        If True, raises IndependenceViolationError on violation.
+        If False, logs an error and continues (development mode only).
+    """
+
+    def __init__(
+        self,
+        fixer_model: str,
+        reviewer_model: str,
+        strict: bool = False,
+    ) -> None:
+        self.fixer_model    = fixer_model
+        self.reviewer_model = reviewer_model
+        self.fixer_family   = extract_model_family(fixer_model)
+        self.reviewer_family = extract_model_family(reviewer_model)
+        self.strict         = strict
+
+        self._log_initial_check()
+
+    def _log_initial_check(self) -> None:
+        same = self.fixer_family == self.reviewer_family
+        if same:
+            msg = (
+                f"IndependenceEnforcer: fixer ({self.fixer_model!r} → family "
+                f"'{self.fixer_family}') and reviewer ({self.reviewer_model!r} → "
+                f"family '{self.reviewer_family}') are the SAME model family. "
+                "DO-178C 6.3.4 requires reviewer independence."
+            )
+            if self.strict:
+                # Raise immediately at construction in strict mode
+                raise IndependenceViolationError(msg)
+            else:
+                log.error(msg)
+        else:
+            log.info(
+                f"IndependenceEnforcer: fixer={self.fixer_family!r} "
+                f"reviewer={self.reviewer_family!r} ✓ independent"
+            )
+
+    def is_independent(self) -> bool:
+        """Return True if fixer and reviewer are from different families."""
+        return self.fixer_family != self.reviewer_family
+
+    def verify_or_raise(self, context: str = "") -> None:
+        """
+        Check independence and raise IndependenceViolationError if violated.
+        Call this at the start of each fix phase.
+        """
+        if not self.is_independent():
+            msg = (
+                f"DO-178C 6.3.4 Independence Violation: "
+                f"fixer_family={self.fixer_family!r} == "
+                f"reviewer_family={self.reviewer_family!r}"
+                + (f" (context: {context})" if context else "")
+            )
+            if self.strict:
+                raise IndependenceViolationError(msg)
+            else:
+                log.error(msg)
+
+    def verify_pair(
+        self,
+        fix_model: str,
+        review_model: str,
+        strict: bool | None = None,
+    ) -> bool:
+        """
+        Verify a specific fixer/reviewer pair.
+        Returns True if independent, raises/logs if not.
+        """
+        ff = extract_model_family(fix_model)
+        rf = extract_model_family(review_model)
+        if ff == rf:
+            msg = (
+                f"Independence check failed: fix_model={fix_model!r} "
+                f"(family={ff!r}) == review_model={review_model!r} "
+                f"(family={rf!r})"
+            )
+            use_strict = strict if strict is not None else self.strict
+            if use_strict:
+                raise IndependenceViolationError(msg)
+            log.error(msg)
+            return False
+        return True
+
+    @staticmethod
+    def suggest_reviewer(fixer_model: str) -> list[str]:
+        """
+        Suggest reviewer models that are independent of the given fixer model.
+        Returns a priority-ordered list of suggestions.
+        """
+        fixer_family = extract_model_family(fixer_model)
+        # Preferred reviewers from different families
+        candidates = [
+            ("meta-llama",    "meta",      "ollama/llama3.3:70b"),
+            ("alibaba",       "alibaba",   "ollama/qwen2.5-coder:32b"),
+            ("mistral",       "mistral",   "openrouter/mistralai/devstral-2"),
+            ("anthropic",     "anthropic", "claude-sonnet-4-20250514"),
+            ("ibm",           "ibm",       "ollama/granite4-small"),
+            ("google",        "google",    "gemini-1.5-pro"),
+            ("openai",        "openai",    "gpt-4o"),
+        ]
+        return [
+            model
+            for (_, family, model) in candidates
+            if family != fixer_family
+        ]
