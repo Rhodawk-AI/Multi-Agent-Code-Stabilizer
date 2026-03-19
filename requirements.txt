@@ -26,7 +26,6 @@ crewai>=0.80.0
 pyautogen>=0.3.0
 
 # Agent skills
-smolagents>=1.0.0
 
 # Data validation
 pydantic>=2.7.0
@@ -57,6 +56,7 @@ passlib[bcrypt]>=1.7.4
 
 # Metrics
 prometheus-client>=0.20.0
+langsmith>=0.1.0
 opentelemetry-api>=1.24.0
 opentelemetry-sdk>=1.24.0
 
@@ -103,8 +103,10 @@ mcp>=1.0.0
 # SBOM
 cyclonedx-python-lib>=7.0.0
 
-# Benchmark
+# Benchmark / SWE-bench evaluator
 datasets>=2.19.0
+evaluate>=0.4.0
+docker>=7.0.0
 
 # Prompt testing
 pyyaml>=6.0.0

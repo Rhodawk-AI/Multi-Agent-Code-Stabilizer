@@ -12,7 +12,7 @@
 │  State Machine   │  (Security,      │  (Conversational      │
 │                  │   SWE-bench)     │   coordination)       │
 └──────────────────┴──────────────────┴───────────────────────┘
-           ↕ DeerFlow Workflow Orchestration
+           ↕ DeerFlow Workflow Orchestration (bespoke async DAG — not Prefect)
 ┌─────────────────────────────────────────────────────────────┐
 │                Tiered Model Router                           │
 │  Tier1: Granite 4.0-H-Tiny (7B/1B)  — local, $0.00        │
@@ -23,17 +23,23 @@
            ↕                    ↕
 ┌──────────────────┐  ┌──────────────────────────────────────┐
 │  HelixDB         │  │  ToolHive MCP Layer                  │
-│  (Qdrant shards) │  │  MiroFish | Semgrep | CVE | SBOM     │
-│  10M+ lines      │  │  Jujutsu  | Aurite  | Promptfoo      │
+│  (Qdrant-backed) │  │  cppcheck | Semgrep | CVE | SBOM     │
+│  10M+ lines      │  │  Jujutsu  | Swarm Health | Promptfoo  │
 └──────────────────┘  └──────────────────────────────────────┘
            ↕
 ┌─────────────────────────────────────────────────────────────┐
-│  Aegis EDR + Leanstral (Lean4) Formal Verification          │
+│  Aegis EDR + Z3/CBMC Formal Verification                    │
 │  Prometheus Metrics | JWT Auth | HMAC Audit Trail           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Benchmark Targets
+
+> **Model Note:** Granite 4.0-H-Tiny/Small referenced in earlier documentation
+> are unreleased as of this writing. The router uses `granite-code:3b` and
+> `granite-code:8b` (real, available on Ollama hub). Update `models/router.py`
+> when Granite 4.0 ships.
+
 
 | Benchmark          | Target    | Baseline (Claude Code) |
 |--------------------|-----------|------------------------|
@@ -92,7 +98,7 @@ rhodawk-bench run --limit 50
 auth/            JWT middleware + token factory
 metrics/         Prometheus instrumentation
 models/          Tiered model router (local→cloud)
-swarm/           LangGraph + CrewAI + DeerFlow
+swarm/           DeerFlow (bespoke DAG) + CrewAI + AutoGen
 verification/    Leanstral (Lean4) + Z3 formal verification
 memory/          HelixDB (Qdrant graph+vector)
 security/        Aegis EDR (exploit + injection detection)
