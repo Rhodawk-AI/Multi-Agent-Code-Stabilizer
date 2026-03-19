@@ -103,11 +103,13 @@ class TestRunnerAgent(BaseAgent):
         # C/C++ — make test
         if (self.repo_root / "Makefile").exists():
             return self._run_make_test()
-        return TestRunResult(status=TestRunStatus.SKIPPED)
+        return TestRunResult(status=TestRunStatus.NO_TESTS)
 
     def _run_pytest(self, changed_files: list[str]) -> TestRunResult:
+        import tempfile as _tf
+        _report_path = _tf.mktemp(suffix="_pytest.json")
         cmd = ["pytest", "--tb=short", "-q", "--json-report",
-               "--json-report-file=/tmp/pytest_report.json"]
+               f"--json-report-file={_report_path}"]
         # Run only tests related to changed files when possible
         if changed_files:
             py_changed = [f for f in changed_files if f.endswith(".py")]
@@ -125,7 +127,7 @@ class TestRunnerAgent(BaseAgent):
             passed = failed = errors = skipped = 0
             coverage = 0.0
             try:
-                report = json.loads(Path("/tmp/pytest_report.json").read_text())
+                report = json.loads(Path(_report_path).read_text())
                 summary = report.get("summary", {})
                 passed  = summary.get("passed", 0)
                 failed  = summary.get("failed", 0)
@@ -148,7 +150,7 @@ class TestRunnerAgent(BaseAgent):
             # FIX: populate coverage_pct from pytest-cov JSON if available
             try:
                 import json as _json
-                cov_file = Path("/tmp/pytest_report.json")
+                cov_file = Path(_report_path)
                 if cov_file.exists():
                     rpt = _json.loads(cov_file.read_text())
                     pct = rpt.get("coverage", {}).get("totals", {}).get("percent_covered", 0.0)

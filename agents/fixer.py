@@ -292,14 +292,45 @@ class FixerAgent(BaseAgent):
         )
         vector_context = await self._get_vector_context(issues)
 
-        if needs_patch:
-            result = await self._generate_patch_fix(
-                issue_summary, file_context, vector_context, model, file_paths
+        # ── Execution-feedback loop (max 3 rounds) ───────────────────────────
+        # Generate candidate, run scoped tests, feed failures back to LLM.
+        # This is the primary driver of SWE-bench performance improvement.
+        MAX_FEEDBACK_ROUNDS = 3
+        last_result = None
+        last_test_output: str = ""
+
+        for feedback_round in range(1, MAX_FEEDBACK_ROUNDS + 1):
+            prompt_extra = ""
+            if last_test_output:
+                prompt_extra = (
+                    f"\n\n## Previous Attempt Failed — Test Output\n"
+                    f"Your previous fix was applied but the following tests failed.\n"
+                    f"Analyze the failures and produce a corrected patch.\n\n"
+                    f"```\n{last_test_output[:3000]}\n```\n"
+                )
+
+            if needs_patch:
+                last_result = await self._generate_patch_fix(
+                    issue_summary + prompt_extra,
+                    file_context, vector_context, model, file_paths,
+                )
+            else:
+                last_result = await self._generate_full_fix(
+                    issue_summary + prompt_extra,
+                    file_context, vector_context, model, file_paths,
+                )
+
+            test_passed, last_test_output = await self._probe_candidate(
+                last_result, file_contents, file_paths,
             )
-        else:
-            result = await self._generate_full_fix(
-                issue_summary, file_context, vector_context, model, file_paths
+            self.log.info(
+                f"[Fixer] feedback_round={feedback_round}/{MAX_FEEDBACK_ROUNDS} "
+                f"test_passed={test_passed}"
             )
+            if test_passed:
+                break
+
+        result = last_result
 
         # Build FixAttempt
         fixed_files: list[FixedFile] = []
@@ -368,6 +399,104 @@ class FixerAgent(BaseAgent):
         return fix
 
     # ── LLM generation ────────────────────────────────────────────────────────
+
+    # ── Execution probe ──────────────────────────────────────────────────────
+
+    async def _probe_candidate(
+        self,
+        result: Any,
+        original_contents: dict[str, str],
+        file_paths: list[str],
+    ) -> tuple[bool, str]:
+        """
+        Apply the candidate fix to temp copies and run scoped tests.
+        Returns (test_passed: bool, test_output: str).
+
+        If no test runner is available or repo_root is unknown, returns
+        (True, "") so the fix proceeds without blocking on infra absence.
+        """
+        if not self.repo_root:
+            return True, ""
+
+        import tempfile, shutil as _shutil
+
+        tmp_dir = None
+        try:
+            # Create a minimal scratch tree with only the affected files
+            tmp_dir = tempfile.mkdtemp(prefix="rhodawk_probe_")
+            tmp_root = Path(tmp_dir)
+
+            for fp in file_paths:
+                dest = tmp_root / fp
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                original = original_contents.get(fp, "")
+                dest.write_text(original, encoding="utf-8")
+
+            # Apply the candidate patch
+            if isinstance(result, PatchResponse):
+                for pfr in result.patched_files:
+                    dest = tmp_root / pfr.path
+                    if dest.exists() and pfr.patch:
+                        import subprocess as _sp
+                        r = _sp.run(
+                            ["patch", "--forward", "-p0", str(dest)],
+                            input=pfr.patch, capture_output=True,
+                            text=True, timeout=30,
+                        )
+                        if r.returncode != 0:
+                            return False, f"patch apply failed: {r.stderr[:500]}"
+            elif isinstance(result, FixResponse):
+                for ffr in result.fixed_files:
+                    dest = tmp_root / ffr.path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(ffr.content, encoding="utf-8")
+
+            # Run tests scoped to changed files
+            from agents.test_runner import TestRunnerAgent
+            from brain.schemas import FixAttempt, FixedFile, PatchMode
+            import hashlib as _hl
+
+            probe_fixed_files = [
+                FixedFile(
+                    path=fp,
+                    content=(tmp_root / fp).read_text(encoding="utf-8", errors="replace")
+                    if (tmp_root / fp).exists() else "",
+                    patch="",
+                    patch_mode=PatchMode.FULL_FILE,
+                    changes_made="probe",
+                    diff_summary="probe",
+                )
+                for fp in file_paths
+            ]
+            probe_fix = FixAttempt(
+                run_id=self.run_id,
+                issue_ids=[],
+                fixed_files=probe_fixed_files,
+                fixer_model=self.config.model if self.config else "",
+            )
+
+            tr = TestRunnerAgent(
+                storage=self.storage,
+                run_id=self.run_id,
+                repo_root=tmp_root,
+                config=self.config,
+            )
+            tres = await tr.run_after_fix(probe_fix)
+
+            from brain.schemas import TestRunStatus
+            passed = tres.status in (TestRunStatus.PASSED, TestRunStatus.NO_TESTS)
+            output = f"passed={tres.passed} failed={tres.failed}\n{tres.output[:2000]}"
+            return passed, output
+
+        except Exception as exc:
+            self.log.debug(f"_probe_candidate failed (non-fatal): {exc}")
+            return True, ""  # fail-open: don't block if probe infra is broken
+        finally:
+            if tmp_dir:
+                try:
+                    _shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
     async def _generate_full_fix(
         self,
