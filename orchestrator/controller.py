@@ -73,6 +73,13 @@ from metrics.prometheus_exporter import (
 )
 from metrics.langsmith_tracer import LangSmithTracer
 
+# ── Antagonist additions ──────────────────────────────────────────────────────
+from agents.test_generator      import TestGeneratorAgent
+from agents.mutation_verifier   import MutationVerifierAgent
+from brain.hybrid_retriever     import HybridRetriever
+from context.repo_map           import get_repo_map
+from memory.fix_memory          import get_fix_memory
+
 log = logging.getLogger(__name__)
 
 # Files larger than this threshold use UNIFIED_DIFF mode (surgical patches)
@@ -149,6 +156,25 @@ class StabilizerConfig(BaseModel):
     cert_enabled:        bool          = True
     jsf_enabled:         bool          = False   # JSF++ — only when explicitly needed
 
+    # ── Antagonist additions ─────────────────────────────────────────────────
+    # Model
+    primary_model:       str           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+    vllm_base_url:       str           = "http://localhost:8000/v1"
+    # Repo-map
+    repo_map_enabled:    bool          = True
+    repo_map_max_tokens: int           = 2048
+    # Hybrid retrieval
+    hybrid_retrieval_enabled: bool     = True
+    # Test generation
+    test_gen_enabled:    bool          = True
+    pynguin_timeout_s:   int           = 60
+    use_hypothesis:      bool          = True
+    # Mutation testing
+    mutation_testing_enabled: bool     = False   # opt-in; slow
+    mutation_score_threshold: float | None = None  # None = domain default
+    # Fix memory (Algorithm Distillation)
+    fix_memory_enabled:  bool          = True
+
     model_config = {"arbitrary_types_allowed": True}
 
 
@@ -197,6 +223,10 @@ class StabilizerController:
         # ── Inter-phase state (FIX: was missing — caused silent pipeline break) ──
         self._last_audit_issues:    list = []   # set by run_audit_phase()
         self._last_approved_issues: list = []   # set by run_consensus_phase()
+        # ── Antagonist subsystems ─────────────────────────────────────────────
+        self._hybrid_retriever: HybridRetriever | None = None
+        self._repo_map:         Any | None             = None
+        self._fix_memory:       Any | None             = None
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -302,6 +332,9 @@ class StabilizerController:
             }),
         )
 
+        # 12. Antagonist subsystems ─────────────────────────────────────────────
+        await self._init_antagonist()
+
         ACTIVE_RUNS.inc()
         self._langsmith.start_run(
             run_id=self.run.id,
@@ -362,6 +395,60 @@ class StabilizerController:
                 qdrant_url=self.config.qdrant_url,
             )
             self.vector_brain.initialise()
+
+    async def _init_antagonist(self) -> None:
+        """
+        Initialise the four Antagonist subsystems.
+        All failures are non-fatal — the core pipeline continues without them.
+        """
+        # 1. Hybrid retriever (BM25 + dense)
+        if self.config.hybrid_retrieval_enabled:
+            try:
+                self._hybrid_retriever = HybridRetriever(
+                    qdrant_url=self.config.qdrant_url,
+                    collection="rhodawk_chunks",
+                    vector_brain=self.vector_brain,
+                )
+                self._hybrid_retriever.initialise()
+            except Exception as exc:
+                self.log.warning(f"HybridRetriever init failed: {exc}")
+                self._hybrid_retriever = None
+
+        # 2. Repo-map
+        if self.config.repo_map_enabled:
+            try:
+                self._repo_map = get_repo_map(self.config.repo_root)
+            except Exception as exc:
+                self.log.warning(f"RepoMap init failed: {exc}")
+                self._repo_map = None
+
+        # 3. Fix memory (Algorithm Distillation)
+        if self.config.fix_memory_enabled:
+            try:
+                data_dir = self.config.repo_root / ".stabilizer"
+                self._fix_memory = get_fix_memory(
+                    repo_url=self.config.repo_url,
+                    qdrant_url=self.config.qdrant_url,
+                    data_dir=data_dir,
+                )
+            except Exception as exc:
+                self.log.warning(f"FixMemory init failed: {exc}")
+                self._fix_memory = None
+
+        # 4. Configure vLLM routing for LiteLLM
+        try:
+            from models.router import get_router
+            router = get_router()
+            router.configure_litellm_for_vllm()
+        except Exception as exc:
+            self.log.debug(f"vLLM LiteLLM config: {exc}")
+
+        self.log.info(
+            f"Antagonist subsystems: "
+            f"hybrid_retriever={self._hybrid_retriever is not None} "
+            f"repo_map={self._repo_map is not None} "
+            f"fix_memory={self._fix_memory is not None}"
+        )
 
     # ── Main entry point ───────────────────────────────────────────────────────
 
@@ -516,6 +603,8 @@ class StabilizerController:
             concurrency=self.config.concurrency,
             chunk_concurrency=self.config.chunk_concurrency,
             vector_brain=self.vector_brain,
+            hybrid_retriever=self._hybrid_retriever,
+            repo_map=self._repo_map,
         )
         await reader.run(force_reread=force_reread)
         await self._trail(
@@ -550,6 +639,14 @@ class StabilizerController:
 
     async def run_fix_phase(self, issues: list[Issue]) -> None:
         await self._phase_fix(issues)
+
+    async def run_test_gen_phase(self) -> None:
+        """Generate tests for all gate-pending fixes (Antagonist Addition 4)."""
+        await self._phase_test_gen()
+
+    async def run_mutation_phase(self) -> None:
+        """Run mutation testing gate (Antagonist Addition 6)."""
+        await self._phase_mutation()
 
     async def run_review_phase(self) -> None:
         await self._phase_review()
@@ -671,6 +768,9 @@ class StabilizerController:
             graph_engine=self.graph_engine if self.config.graph_enabled else None,
             vector_brain=self.vector_brain,
             surgical_patch_threshold=SURGICAL_PATCH_THRESHOLD,
+            repo_map=self._repo_map,
+            hybrid_retriever=self._hybrid_retriever,
+            fix_memory=self._fix_memory,
         )
         fixes = await fixer.run()
         for f in fixes:
@@ -689,6 +789,109 @@ class StabilizerController:
                 f.fixer_model_family = self._independence_enforcer.fixer_family
                 await self.storage.upsert_fix(f)
             record_fix("generated")
+
+    # ── Test generation phase (Antagonist) ────────────────────────────────────
+
+    async def _phase_test_gen(self) -> dict[str, list[str]]:
+        """
+        Generate unit tests for every gate-pending fix.
+
+        Runs TestGeneratorAgent between the fix phase and the review phase.
+        Generated test paths are stored on the FixAttempt record for use by
+        MutationVerifierAgent and the RTM exporter.
+
+        Returns a mapping of fix_id → list[test_file_paths].
+        """
+        if not self.config.test_gen_enabled:
+            return {}
+        assert self.run and self.storage
+
+        fixes = [
+            f for f in await self.storage.list_fixes()
+            if f.gate_passed is None and f.committed_at is None
+        ]
+        if not fixes:
+            return {}
+
+        agent = TestGeneratorAgent(
+            storage=self.storage,
+            run_id=self.run.id,
+            config=_agent_cfg(self.config, self.run.id),
+            mcp_manager=self.mcp,
+            repo_root=self.config.repo_root,
+            pynguin_timeout=self.config.pynguin_timeout_s,
+            use_hypothesis=self.config.use_hypothesis,
+        )
+
+        results: dict[str, list[str]] = {}
+        for fix in fixes:
+            try:
+                paths = await agent.run(fix)
+                results[fix.id] = paths
+                if paths:
+                    self.log.info(
+                        f"[TestGen] {len(paths)} test file(s) generated "
+                        f"for fix {fix.id[:12]}: {paths[:3]}"
+                    )
+            except Exception as exc:
+                self.log.warning(f"[TestGen] Failed for fix {fix.id[:12]}: {exc}")
+
+        await self._trail(
+            "TEST_GEN_PHASE_COMPLETE", self.run.id, "run",
+            after=f"{sum(len(v) for v in results.values())} test files",
+        )
+        return results
+
+    # ── Mutation testing phase (Antagonist) ────────────────────────────────────
+
+    async def _phase_mutation(self) -> None:
+        """
+        Run mutmut against all Python files in gate-pending fixes.
+
+        Blocks commit on any fix whose mutation score falls below the domain
+        threshold.  Requires Python + mutmut>=2.5.0.  Non-Python files are
+        skipped silently.
+        """
+        if not self.config.mutation_testing_enabled:
+            return
+        assert self.run and self.storage
+
+        fixes = [
+            f for f in await self.storage.list_fixes()
+            if f.gate_passed is None and f.committed_at is None
+        ]
+        if not fixes:
+            return
+
+        agent = MutationVerifierAgent(
+            storage=self.storage,
+            run_id=self.run.id,
+            config=_agent_cfg(self.config, self.run.id),
+            repo_root=self.config.repo_root,
+            domain_mode=self.config.domain_mode,
+            score_threshold=self.config.mutation_score_threshold,
+        )
+
+        for fix in fixes:
+            test_paths = getattr(fix, "generated_test_paths", None) or []
+            try:
+                results = await agent.run(fix, test_paths=test_paths)
+                if results:
+                    scores = ", ".join(
+                        f"{r.file_path}:{r.mutation_score:.1f}%" for r in results
+                    )
+                    self.log.info(
+                        f"[Mutation] fix {fix.id[:12]}: {scores}"
+                    )
+            except Exception as exc:
+                self.log.warning(
+                    f"[Mutation] Failed for fix {fix.id[:12]}: {exc}"
+                )
+
+        await self._trail(
+            "MUTATION_PHASE_COMPLETE", self.run.id, "run",
+            after="mutation scores recorded",
+        )
 
     # ── Review phase ───────────────────────────────────────────────────────────
 
