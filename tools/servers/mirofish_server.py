@@ -1,13 +1,15 @@
 """
 tools/servers/mirofish_server.py
 =================================
-MiroFish deep static analysis MCP server.
+C/C++ deep static analysis MCP server — wraps cppcheck + clang-tidy.
 
-MiroFish (https://github.com/thoughtworks/miro-fish) provides deep static
-analysis for C/C++ codebases with focus on memory safety, buffer overflows,
-and MISRA-C compliance.
+PREVIOUS PHANTOM: "MiroFish" (https://github.com/thoughtworks/miro-fish)
+does not exist as a real ThoughtWorks project or installable binary.
+The canonical implementation here uses cppcheck and clang-tidy directly,
+which are real, installable, production-grade tools.
 
-When MiroFish binary is not available, falls back to cppcheck + clang-tidy.
+The MIROFISH_BINARY env-var hook is retained for forward-compatibility
+if a future tool by that name is ever released.
 
 Tools exposed
 ──────────────

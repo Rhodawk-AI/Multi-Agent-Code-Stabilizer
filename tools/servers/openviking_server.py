@@ -1,12 +1,14 @@
 """
 tools/servers/openviking_server.py
 ===================================
-OpenViking vector database MCP server for Rhodawk AI.
+Vector memory MCP server — wraps Qdrant (via HelixDB) for Rhodawk AI.
 
-OpenViking (https://github.com/lalalune/open-viking) is a vector database
-optimised for agent memory with semantic search.
+PREVIOUS PHANTOM: "OpenViking" (https://github.com/lalalune/open-viking)
+is not a real installable Python package.  The canonical backend is
+Qdrant via the HelixDB adapter.  The `import open_viking` hook is
+retained for forward-compatibility only.
 
-This server wraps OpenViking (or Qdrant as a compatible backend) as an
+This server wraps the real Qdrant/HelixDB stack and exposes it as an
 MCP tool providing:
 • store     — persist a code chunk with embedding
 • search    — semantic nearest-neighbour search

@@ -1,10 +1,12 @@
 """
 tools/servers/antigravity_server.py
 =====================================
-Antigravity Awesome Skills MCP server for Rhodawk AI.
+Security skills MCP server — Rhodawk AI built-in.
 
-Integrates niche agent skills from:
-https://github.com/nickvdyck/awesome-skills  (security, cryptography, etc.)
+PREVIOUS PHANTOM: "Antigravity Awesome Skills" and the URL
+https://github.com/nickvdyck/awesome-skills do not exist as a real
+publishable package.  All implementations below are Rhodawk-native.
+No external dependency is required for any tool in this server.
 
 Skills exposed
 ───────────────

@@ -1,11 +1,15 @@
 """
-tools/servers/aurite_server.py
-===============================
-Aurite-ai agent verifier MCP server.
+tools/servers/swarm_health_server.py (was: aurite_server.py)
+=============================================================
+Swarm health monitor MCP server — Rhodawk AI built-in.
 
-https://github.com/aurite-ai/aurite
+PREVIOUS PHANTOM: "Aurite-ai" was referenced as an external package
+(https://github.com/aurite-ai/aurite) that does not exist.  This module
+is entirely Rhodawk-native code.  The `import aurite` attempt is kept
+for forward-compatibility if a real aurite package is ever published,
+but the built-in detectors are the canonical implementation.
 
-Aurite-ai scans multi-agent swarms for anti-patterns including:
+Detects multi-agent swarm anti-patterns:
 • Agent loops (infinite retry cycles)
 • Hallucination cascades (agents agreeing on wrong answers)
 • Cost spirals (exponential API spending)
@@ -37,17 +41,15 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Try native Aurite first
+# Optional native aurite package — forward-compatible hook.
+# Falls back to built-in detectors which are the canonical implementation.
 _AURITE_NATIVE = False
 try:
     import aurite  # type: ignore[import]
     _AURITE_NATIVE = True
-    log.info("Aurite-ai native client available")
+    log.info("aurite native client available")
 except ImportError:
-    log.info(
-        "aurite-ai not installed — using built-in pattern detection. "
-        "Install: pip install aurite-ai"
-    )
+    pass  # Built-in detectors handle all cases — no warning needed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
