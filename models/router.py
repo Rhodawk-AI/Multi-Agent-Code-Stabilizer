@@ -41,51 +41,55 @@ class ModelTier(str, Enum):
 
 
 # Model identifiers (litellm-compatible)
+# FIX: Removed phantom model identifiers:
+#   - "openrouter/openai/gpt-5.3-codex" — GPT-5.3 Codex does not exist
+#   - "ollama/granite4-tiny" / "ollama/granite4-small" — IBM Granite 4.0 is not
+#     yet public on Ollama hub; using correct granite-code tags until GA release
 _TIER_MODELS: dict[ModelTier, list[str]] = {
     ModelTier.LOCAL_TINY:   [
-        "ollama/granite4-tiny",
-        "ollama/granite4:1b",
-        "ollama/qwen2.5-coder:1.5b",   # fallback if Granite not pulled
+        "ollama/granite-code:3b",        # IBM Granite Code 3B — available now
+        "ollama/qwen2.5-coder:1.5b",     # fallback if Granite not pulled
+        "ollama/phi3:mini",
     ],
     ModelTier.LOCAL_SMALL:  [
-        "ollama/granite4-small",
-        "ollama/granite4:9b",
+        "ollama/granite-code:8b",        # IBM Granite Code 8B
         "ollama/qwen2.5-coder:32b",
+        "ollama/deepseek-coder-v2:16b",
     ],
     ModelTier.CLOUD_OSS:    [
-        "openrouter/meta-llama/llama-4",
-        "openrouter/mistralai/devstral-2",
+        "openrouter/meta-llama/llama-4-scout",
+        "openrouter/mistralai/devstral-small",
         "openrouter/deepseek/deepseek-coder-v2-0724",
     ],
     ModelTier.CLOUD_CODEX:  [
-        "openrouter/openai/gpt-5.3-codex",
-        "openrouter/openai/o3",
+        "openrouter/openai/o3",          # o3 is real and available
+        "openrouter/openai/gpt-4o",
         "gpt-4o",
     ],
     ModelTier.CLOUD_CLAUDE: [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
         "claude-haiku-4-5-20251001",
     ],
 }
 
 # Cost map: (input_per_1k, output_per_1k) in USD
 _COST_MAP: dict[str, tuple[float, float]] = {
-    "ollama/granite4-tiny":                (0.0,    0.0),
-    "ollama/granite4:1b":                  (0.0,    0.0),
-    "ollama/granite4-small":               (0.0,    0.0),
-    "ollama/granite4:9b":                  (0.0,    0.0),
-    "ollama/qwen2.5-coder:1.5b":           (0.0,    0.0),
-    "ollama/qwen2.5-coder:32b":            (0.0,    0.0),
-    "openrouter/meta-llama/llama-4":       (0.00018, 0.00090),
-    "openrouter/mistralai/devstral-2":     (0.00020, 0.00080),
-    "openrouter/deepseek/deepseek-coder-v2-0724": (0.00014, 0.00028),
-    "openrouter/openai/gpt-5.3-codex":    (0.00300, 0.01200),
-    "openrouter/openai/o3":               (0.00500, 0.02000),
-    "gpt-4o":                              (0.00500, 0.01500),
-    "claude-sonnet-4-20250514":            (0.00300, 0.01500),
-    "claude-opus-4-20250514":              (0.01500, 0.07500),
-    "claude-haiku-4-5-20251001":           (0.00025, 0.00125),
+    "ollama/granite-code:3b":                    (0.0,     0.0),
+    "ollama/granite-code:8b":                    (0.0,     0.0),
+    "ollama/qwen2.5-coder:1.5b":                 (0.0,     0.0),
+    "ollama/qwen2.5-coder:32b":                  (0.0,     0.0),
+    "ollama/deepseek-coder-v2:16b":              (0.0,     0.0),
+    "ollama/phi3:mini":                          (0.0,     0.0),
+    "openrouter/meta-llama/llama-4-scout":       (0.00018, 0.00090),
+    "openrouter/mistralai/devstral-small":       (0.00020, 0.00080),
+    "openrouter/deepseek/deepseek-coder-v2-0724":(0.00014, 0.00028),
+    "openrouter/openai/o3":                      (0.00500, 0.02000),
+    "openrouter/openai/gpt-4o":                  (0.00500, 0.01500),
+    "gpt-4o":                                    (0.00500, 0.01500),
+    "claude-sonnet-4-6":                         (0.00300, 0.01500),
+    "claude-opus-4-6":                           (0.01500, 0.07500),
+    "claude-haiku-4-5-20251001":                 (0.00025, 0.00125),
 }
 
 # Task complexity → preferred tier
