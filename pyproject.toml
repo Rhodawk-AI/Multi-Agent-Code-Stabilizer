@@ -1,11 +1,3 @@
-
-# ── PHANTOM MODEL NOTE ────────────────────────────────────────────────────────
-# The cover letter for this project referenced "IBM Granite 4.0-H-Tiny" and
-# "IBM Granite 4.0-H-Small" (Mamba-Transformer hybrid).  These models were
-# NOT released as of this writing.  The model router uses the real, available
-# models: ollama/granite-code:3b and ollama/granite-code:8b.
-# When Granite 4.0 ships, update models/router.py _TIER_MODELS accordingly.
-# ─────────────────────────────────────────────────────────────────────────────
 [build-system]
 requires      = ["pdm-backend"]
 build-backend = "pdm.backend"
