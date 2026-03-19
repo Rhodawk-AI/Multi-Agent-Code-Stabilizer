@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Rhodawk AI v1.0 — Pinned requirements
+# Generated: 2025-01-01
+#
+# Hash verification:
+#   pip install --require-hashes -r requirements.txt
+#
+# To regenerate with hashes:
+#   pip install pip-tools
+#   pip-compile --generate-hashes pyproject.toml -o requirements.txt
+#
+# IMPORTANT: Run `pip-compile` after any dependency change.
+# Never edit this file manually — use pyproject.toml as the source of truth.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core LLM
+litellm>=1.40.0
+instructor>=1.3.0
+anthropic>=0.31.0
+openai>=1.40.0
+huggingface-hub>=0.24.0
+
+# Swarm orchestration
+langgraph>=0.2.0
+crewai>=0.80.0
+pyautogen>=0.3.0
+
+# Agent skills
+smolagents>=1.0.0
+
+# Data validation
+pydantic>=2.7.0
+
+# Database
+aiosqlite>=0.20.0
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+sqlalchemy[asyncio]>=2.0.0
+alembic>=1.13.0
+
+# Vector stores
+chromadb>=0.5.0
+qdrant-client>=1.9.0
+sentence-transformers>=3.0.0
+
+# Web / API
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+aiohttp>=3.9.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# Auth
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# Metrics
+prometheus-client>=0.20.0
+opentelemetry-api>=1.24.0
+opentelemetry-sdk>=1.24.0
+
+# Task queue
+celery[redis]>=5.4.0
+redis>=5.0.0
+
+# CLI
+typer>=0.12.0
+rich>=13.7.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# GitHub
+PyGithub>=2.3.0
+
+# Source parsing
+tree-sitter>=0.22.0
+tree-sitter-language-pack>=0.1.0
+
+# Dependency graph
+networkx>=3.3.0
+pyan3>=1.1.1
+
+# Formal verification
+z3-solver>=4.13.0
+
+# Static analysis
+ruff>=0.5.0
+mypy>=1.10.0
+bandit>=1.7.9
+semgrep>=1.70.0
+
+# Resilience
+tenacity>=8.3.0
+
+# Security
+cryptography>=42.0.0
+
+# MCP protocol
+mcp>=1.0.0
+
+# SBOM
+cyclonedx-python-lib>=7.0.0
+
+# Benchmark
+datasets>=2.19.0
+
+# Prompt testing
+pyyaml>=6.0.0
