@@ -1,19 +1,19 @@
 """
 memory/openviking.py
 ====================
-OpenViking vector database integration for Rhodawk AI.
+Vector memory adapter for Rhodawk AI.
 
-OpenViking (https://github.com/lalalune/open-viking) is a high-performance
-vector store designed for agent memory with:
-• Persistent storage
-• HNSW indexing
-• Metadata filtering
-• Namespace isolation
+PREVIOUS PHANTOM: "OpenViking" (https://github.com/lalalune/open-viking)
+is not a real installable Python package.  The canonical backend is
+Qdrant via the HelixDB adapter.  The `import open_viking` attempt is a
+forward-compatibility hook only — the HelixDB/Qdrant path is always the
+production path.
 
 This module provides a clean Python interface that:
-1. Uses the native OpenViking client if available
-2. Falls back to our HelixDB (Qdrant) implementation
-3. Provides the same API in both cases
+1. Attempts native open_viking client if ever published (forward-compat)
+2. Falls back to HelixDB (Qdrant-backed) — the real production backend
+3. Falls back to in-memory store for testing
+4. Provides the same API in all cases
 
 Usage::
 
