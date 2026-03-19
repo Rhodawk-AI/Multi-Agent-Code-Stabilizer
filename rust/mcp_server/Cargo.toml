@@ -1,0 +1,31 @@
+[package]
+name        = "rhodawk-mcp-server"
+version     = "1.0.0"
+edition     = "2021"
+description = "High-performance MCP server for static analysis — Rhodawk AI"
+authors     = ["Rhodawk AI Contributors"]
+license     = "MIT"
+
+[[bin]]
+name = "rhodawk-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { version = "1",  features = ["full"] }
+serde       = { version = "1",  features = ["derive"] }
+serde_json  = "1"
+anyhow      = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap        = { version = "4",  features = ["derive"] }
+# Static analysis
+tree-sitter = "0.22"
+regex       = "1"
+# MCP stdio protocol
+tokio-util  = "0.7"
+
+[profile.release]
+opt-level   = 3
+lto         = true
+codegen-units = 1
+strip       = true
