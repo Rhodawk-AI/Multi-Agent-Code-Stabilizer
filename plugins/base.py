@@ -1,117 +1,100 @@
+"""
+plugins/base.py — B5/B6 fix: scrubbed subprocess env, validated plugin paths.
+"""
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import logging
+import subprocess
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-
-from brain.schemas import ExecutorType, Issue, IssueStatus, Severity
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class PluginIssue:
-    severity: Severity
-    description: str
-    line: int = 0
-    line_end: int = 0
-    section: str = ""
-    fix_requires_files: list[str] = field(default_factory=list)
+class PluginResult:
+    def __init__(self, plugin_name: str, issues: list[dict], warnings: list[str], error: str = "") -> None:
+        self.plugin_name = plugin_name
+        self.issues   = issues
+        self.warnings = warnings
+        self.error    = error
+        self.passed   = not error and all(i.get("severity","") not in ("CRITICAL","HIGH") for i in issues)
 
 
-class AuditPlugin(ABC):
+class BasePlugin(ABC):
     name: str = "unnamed_plugin"
     description: str = ""
-    version: str = "1.0.0"
-    languages: list[str] = []
+    version: str = "0.0.1"
+
+    def __init__(self, repo_root: Path | None = None) -> None:
+        self.repo_root = repo_root
+        self.log = logging.getLogger(f"rhodawk.plugin.{self.name}")
 
     @abstractmethod
-    async def audit_file(
-        self, path: str, content: str, language: str
-    ) -> list[PluginIssue]: ...
+    async def run(self, file_path: str, content: str) -> PluginResult: ...
 
-    async def on_run_start(self, run_id: str, repo_root: str) -> None:
-        pass
+    def run_subprocess(self, cmd: list[str], input_data: str | None = None,
+                       timeout: int = 30, cwd: str | None = None) -> subprocess.CompletedProcess:
+        # B5 FIX: import scrubbed_env here to avoid circular import at module level
+        from security.aegis import scrubbed_env
+        env = scrubbed_env()
+        return subprocess.run(cmd, input=input_data, capture_output=True, text=True,
+                              timeout=timeout, env=env,
+                              cwd=cwd or (str(self.repo_root) if self.repo_root else None))
 
-    async def on_run_complete(self, run_id: str, total_issues: int) -> None:
-        pass
+    @staticmethod
+    def validate_plugin_path(path: Path, allowed_dirs: list[Path]) -> bool:
+        resolved = path.resolve()
+        return any(resolved.is_relative_to(d.resolve()) for d in allowed_dirs)
 
-    def should_audit(self, language: str) -> bool:
-        return not self.languages or language in self.languages
 
+class PluginLoader:
+    def __init__(self, plugin_paths: list[Path], allowed_roots: list[Path] | None = None) -> None:
+        self._paths   = plugin_paths
+        self._allowed = allowed_roots or plugin_paths
+        self._plugins: dict[str, BasePlugin] = {}
 
-class PluginManager:
+    def load_all(self, repo_root: Path | None = None) -> dict[str, BasePlugin]:
+        for plugin_dir in self._paths:
+            if not plugin_dir.is_dir():
+                continue
+            for py_file in plugin_dir.glob("*.py"):
+                if py_file.name.startswith("_"):
+                    continue
+                if not BasePlugin.validate_plugin_path(py_file, self._allowed):
+                    log.warning(f"Plugin rejected (outside allowed dirs): {py_file}")
+                    continue
+                try:
+                    plugin = self._load_plugin_file(py_file, repo_root)
+                    if plugin:
+                        self._plugins[plugin.name] = plugin
+                        log.info(f"Loaded plugin: {plugin.name} v{plugin.version}")
+                except Exception as exc:
+                    log.error(f"Failed to load plugin {py_file}: {exc}")
+        return self._plugins
 
-    def __init__(self) -> None:
-        self._plugins: list[AuditPlugin] = []
-        self._builtin_loaded = False
-
-    def load_from_path(self, plugin_path: Path) -> AuditPlugin | None:
-        try:
-            spec = importlib.util.spec_from_file_location("plugin", str(plugin_path))
-            if not spec or not spec.loader:
-                return None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)  # type: ignore[union-attr]
-            for _name, obj in inspect.getmembers(module, inspect.isclass):
-                if issubclass(obj, AuditPlugin) and obj is not AuditPlugin:
-                    instance = obj()
-                    self._plugins.append(instance)
-                    log.info(f"Loaded plugin: {instance.name} v{instance.version}")
-                    return instance
-        except Exception as exc:
-            log.error(f"Failed to load plugin from {plugin_path}: {exc}")
+    @staticmethod
+    def _load_plugin_file(path: Path, repo_root: Path | None) -> BasePlugin | None:
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        if not spec or not spec.loader:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if isinstance(attr, type) and issubclass(attr, BasePlugin) and attr is not BasePlugin:
+                return attr(repo_root=repo_root)
         return None
 
-    def load_builtin_plugins(self) -> None:
-        if self._builtin_loaded:
-            return
-        builtins_dir = Path(__file__).parent / "builtins"
-        if builtins_dir.exists():
-            for plugin_file in builtins_dir.glob("*.py"):
-                if not plugin_file.name.startswith("_"):
-                    self.load_from_path(plugin_file)
-        self._builtin_loaded = True
-
-    async def run_all(
-        self,
-        file_path: str,
-        content: str,
-        language: str,
-        run_id: str,
-    ) -> list[Issue]:
-        issues: list[Issue] = []
-        for plugin in self._plugins:
-            if not plugin.should_audit(language):
-                continue
-            try:
-                plugin_issues = await plugin.audit_file(file_path, content, language)
-                for pi in plugin_issues:
-                    issues.append(Issue(
-                        run_id=run_id,
-                        severity=pi.severity,
-                        file_path=file_path,
-                        line_start=pi.line,
-                        line_end=pi.line_end or pi.line,
-                        executor_type=ExecutorType.GENERAL,
-                        master_prompt_section=f"[Plugin: {plugin.name}] {pi.section}",
-                        description=pi.description,
-                        fix_requires_files=pi.fix_requires_files or [file_path],
-                        status=IssueStatus.OPEN,
-                        created_at=datetime.now(tz=timezone.utc),
-                    ))
-            except Exception as exc:
-                log.warning(f"Plugin {plugin.name} failed on {file_path}: {exc}")
-        return issues
-
-    @property
-    def plugin_count(self) -> int:
-        return len(self._plugins)
-
-    @property
-    def plugin_names(self) -> list[str]:
-        return [p.name for p in self._plugins]
+    async def run_all(self, file_path: str, content: str) -> list[PluginResult]:
+        import asyncio
+        tasks = [p.run(file_path, content) for p in self._plugins.values()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[PluginResult] = []
+        for name, r in zip(self._plugins.keys(), results):
+            if isinstance(r, Exception):
+                out.append(PluginResult(name, [], [], str(r)))
+            else:
+                out.append(r)
+        return out
