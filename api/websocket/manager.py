@@ -1,71 +1,78 @@
+"""
+api/websocket/manager.py
+========================
+WebSocket connection manager with JWT authentication (B9 fix).
+"""
 from __future__ import annotations
-
-import asyncio
-import json
-import logging
+import asyncio, json, logging
 from datetime import datetime, timezone
-from typing import Any
-
-from fastapi import WebSocket
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from auth.jwt_middleware import ws_auth, TokenData
 
 log = logging.getLogger(__name__)
+router = APIRouter()
 
 
 class ConnectionManager:
-
-    def __init__(self) -> None:
+    def __init__(self):
         self._connections: dict[str, list[WebSocket]] = {}
-        self._lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket, run_id: str) -> None:
-        await websocket.accept()
-        async with self._lock:
-            self._connections.setdefault(run_id, []).append(websocket)
-        log.debug(f"WS connected: run={run_id[:8]} total={self._count()}")
+    async def connect(self, run_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self._connections.setdefault(run_id, []).append(ws)
+        log.info(f"WS: client connected to run {run_id[:8]}")
 
-    def disconnect(self, websocket: WebSocket, run_id: str) -> None:
-        bucket = self._connections.get(run_id, [])
-        if websocket in bucket:
-            bucket.remove(websocket)
-        if not bucket:
-            self._connections.pop(run_id, None)
-        log.debug(f"WS disconnected: run={run_id[:8]}")
+    def disconnect(self, run_id: str, ws: WebSocket) -> None:
+        conns = self._connections.get(run_id, [])
+        if ws in conns:
+            conns.remove(ws)
 
-    async def broadcast(self, run_id: str, event_type: str, data: Any) -> None:
-        payload = json.dumps({
-            "event": event_type,
-            "run_id": run_id,
-            "ts": datetime.now(tz=timezone.utc).isoformat(),
-            "data": data,
-        })
-        dead: list[WebSocket] = []
-        for ws in list(self._connections.get(run_id, [])):
+    async def broadcast(self, run_id: str, payload: dict) -> None:
+        conns = list(self._connections.get(run_id, []))
+        dead = []
+        for ws in conns:
             try:
-                await ws.send_text(payload)
+                await ws.send_text(json.dumps(payload, default=str))
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.disconnect(ws, run_id)
+            self.disconnect(run_id, ws)
 
-    async def broadcast_all(self, event_type: str, data: Any) -> None:
+    async def broadcast_all(self, payload: dict) -> None:
         for run_id in list(self._connections.keys()):
-            await self.broadcast(run_id, event_type, data)
+            await self.broadcast(run_id, payload)
 
-    async def disconnect_all(self) -> None:
-        async with self._lock:
-            for run_id, sockets in list(self._connections.items()):
-                for ws in sockets:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-            self._connections.clear()
 
-    def active_runs(self) -> list[str]:
-        return list(self._connections.keys())
+manager = ConnectionManager()
 
-    def connection_count(self, run_id: str) -> int:
-        return len(self._connections.get(run_id, []))
 
-    def _count(self) -> int:
-        return sum(len(v) for v in self._connections.values())
+@router.websocket("/ws/runs/{run_id}")
+async def websocket_run_events(
+    run_id: str,
+    websocket: WebSocket,
+):
+    # B9 FIX: authenticate before accepting the WebSocket connection
+    try:
+        token_data: TokenData = await ws_auth(websocket)
+    except Exception:
+        return  # ws_auth already closed the connection
+
+    await manager.connect(run_id, websocket)
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "connected",
+            "run_id": run_id,
+            "user": token_data.sub,
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+        }))
+        while True:
+            # Keep alive — actual events are pushed via manager.broadcast()
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                if data == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "heartbeat"}))
+    except WebSocketDisconnect:
+        manager.disconnect(run_id, websocket)
+        log.info(f"WS: client disconnected from run {run_id[:8]}")
