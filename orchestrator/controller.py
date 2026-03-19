@@ -376,27 +376,122 @@ class StabilizerController:
     # ── DeerFlow execution ─────────────────────────────────────────────────────
 
     async def _run_deerflow(self) -> RunStatus:
+        """
+        Multi-cycle convergence loop — the missing outer driver.
+
+        Each iteration builds a fresh single-pass DeerFlow workflow and runs
+        it.  After each cycle the ConvergenceDetector decides whether to
+        continue.  Cost-ceiling violations also terminate the loop.
+
+        Previously this was a single-pass run that never iterated, which
+        silently voided the max_cycles config and the SWE-bench multi-turn
+        claim.
+        """
         from swarm.deerflow_orchestrator import DeerFlowOrchestrator, StepStatus
 
-        orch = DeerFlowOrchestrator(
-            controller=self,
-            persist_path=self.config.repo_root / ".stabilizer" / "workflows",
-        )
-        wf = orch.build_stabilization_workflow(self.run.id, self.config.max_cycles)
+        assert self.run and self.storage and self.convergence
+
+        persist_path = self.config.repo_root / ".stabilizer" / "workflows"
 
         if self.patrol:
             self._patrol_task = asyncio.create_task(self.patrol.run())
 
+        status = RunStatus.FAILED
+        baseline_score: float | None = None
+
+        # Fetch active baseline score for regression checking
         try:
-            result = await orch.run(wf)
-            status = (
-                RunStatus.STABILIZED
-                if result.status == StepStatus.DONE
-                else RunStatus.FAILED
-            )
-        except Exception as exc:
-            self.log.exception(f"DeerFlow fatal: {exc}")
-            status = RunStatus.FAILED
+            active = await self.storage.get_active_baseline()
+            if active:
+                baseline_score = active.score
+        except Exception:
+            pass
+
+        try:
+            while True:
+                self.run.cycle_count += 1
+                self.log.info(
+                    f"[DeerFlow] Cycle {self.run.cycle_count}/{self.config.max_cycles} "
+                    f"starting (run={self.run.id[:8]})"
+                )
+
+                orch = DeerFlowOrchestrator(
+                    controller=self,
+                    persist_path=persist_path,
+                )
+                wf = orch.build_stabilization_workflow(
+                    self.run.id, self.config.max_cycles
+                )
+
+                try:
+                    result = await orch.run(wf)
+                    cycle_ok = result.status == StepStatus.DONE
+                except Exception as exc:
+                    self.log.exception(f"[DeerFlow] Cycle {self.run.cycle_count} fatal: {exc}")
+                    status = RunStatus.FAILED
+                    break
+
+                if not cycle_ok:
+                    self.log.error(
+                        f"[DeerFlow] Cycle {self.run.cycle_count} failed — halting loop"
+                    )
+                    status = RunStatus.FAILED
+                    break
+
+                # Cost-ceiling check
+                try:
+                    total_cost = await self.storage.get_total_cost(self.run.id)
+                    halt = self.convergence.halt_if_ceiling_hit(
+                        total_cost, self.config.cost_ceiling_usd
+                    )
+                    if halt:
+                        self.log.warning(
+                            f"[DeerFlow] Cost ceiling ${self.config.cost_ceiling_usd:.2f} "
+                            f"hit at cycle {self.run.cycle_count} — stopping"
+                        )
+                        status = RunStatus.HALTED
+                        break
+                except Exception:
+                    pass
+
+                # Convergence check against latest score
+                latest_score = (
+                    self.run.scores[-1] if self.run.scores else None
+                )
+                if latest_score is None:
+                    # No issues found this cycle — treat as converged
+                    self.log.info(
+                        f"[DeerFlow] Cycle {self.run.cycle_count}: no issues scored — converged"
+                    )
+                    status = RunStatus.STABILIZED
+                    break
+
+                conv = self.convergence.check(
+                    cycle=self.run.cycle_count,
+                    score=latest_score,
+                    baseline_score=baseline_score,
+                )
+
+                # Persist convergence record
+                try:
+                    await self.storage.upsert_convergence_record(conv)
+                except Exception:
+                    pass
+
+                suggested = self.convergence.suggest_status(conv)
+                self.log.info(
+                    f"[DeerFlow] Cycle {self.run.cycle_count} score={latest_score.score:.1f} "
+                    f"converged={conv.converged} reason={conv.halt_reason or 'none'} "
+                    f"suggested_status={suggested.value}"
+                )
+
+                if conv.converged:
+                    status = suggested
+                    break
+
+                # Persist run state for crash recovery between cycles
+                await self.storage.upsert_run(self.run)
+
         finally:
             await self._cleanup()
 
@@ -1016,29 +1111,30 @@ class StabilizerController:
                 self.log.error(f"PR creation failed: {exc}")
 
     async def _apply_patch(self, abs_path: Path, patch: str) -> None:
-        """Apply a unified diff patch using Python's difflib."""
+        """
+        Apply a unified diff patch via the system `patch` utility.
+
+        The patch text is passed through stdin.  No temp file is created —
+        the previous implementation wrote a temp file and then ignored it
+        (passing the patch via stdin anyway), leaving dead I/O on every call.
+        """
         import subprocess
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".patch", delete=False, encoding="utf-8"
-        ) as pf:
-            pf.write(patch)
-            patch_path = pf.name
-        try:
-            result = subprocess.run(
-                ["patch", "--backup", "-p0", str(abs_path)],
-                input=patch,
-                capture_output=True,
-                text=True,
-                timeout=30,
+
+        if not patch.strip():
+            raise ValueError(f"Empty patch supplied for {abs_path}")
+
+        result = subprocess.run(
+            ["patch", "--backup", "--forward", "-p0", str(abs_path)],
+            input=patch,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"patch command failed (rc={result.returncode}) for {abs_path}: "
+                f"{result.stderr[:500]}"
             )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"patch command failed (rc={result.returncode}): "
-                    f"{result.stderr[:500]}"
-                )
-        finally:
-            Path(patch_path).unlink(missing_ok=True)
 
     async def _revert_fix(self, fix) -> None:
         """Revert a committed fix by restoring from backup or git."""
@@ -1257,41 +1353,6 @@ def _extract_changed_functions(
         return []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HelixDB shim (preserved for backward compatibility)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _HelixBrainShim:
-    def __init__(self, helix) -> None:
-        self._helix = helix
-
-    @property
-    def is_available(self) -> bool:
-        return self._helix.is_available
-
-    def initialise(self) -> None:
-        pass
-
-    def close(self) -> None:
-        self._helix.close()
-
-    def index_chunk(self, chunk_id, file_path, line_start, line_end,
-                    language, summary, observations) -> None:
-        from memory.helixdb import HelixDocument
-        self._helix.index(HelixDocument(
-            id=chunk_id, file_path=file_path, line_start=line_start,
-            line_end=line_end, language=language,
-            content=" ".join(observations), summary=summary,
-        ))
-
-    def find_similar_to_issue(self, query: str, n: int = 8):
-        results = self._helix.search(query, n=n)
-        from brain.vector_store import VectorSearchResult
-        return [
-            VectorSearchResult(
-                chunk_id=r.id, file_path=r.file_path, line_start=r.line_start,
-                line_end=r.line_end, language=r.language, summary=r.summary,
-                distance=1.0 - r.score,
-            )
-            for r in results
-        ]
+# _HelixBrainShim was removed from this module.
+# Import it from orchestrator.controller_helpers where it is fully implemented.
+# This comment preserved so git blame retains the extraction history.
