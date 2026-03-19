@@ -1,60 +1,75 @@
-"""workers/tasks.py — Celery tasks for distributed stabilization."""
+"""
+workers/tasks.py — Celery task definitions for Rhodawk AI Code Stabilizer.
+
+PRODUCTION FIXES:
+• Celery workers use PostgreSQL broker/backend (not Redis-only) for
+  distributed deployment correctness.
+• Each task creates its own storage connection (no shared SQLite state).
+• task_acks_late=True ensures at-least-once delivery on worker crash.
+"""
 from __future__ import annotations
-
-import asyncio
-import logging
-
+import asyncio, logging, os
 log = logging.getLogger(__name__)
 
 try:
     from workers.celery_app import celery_app
 
-    if celery_app:
-
-        @celery_app.task(name="workers.tasks.read_file_task", bind=True, max_retries=3)
-        def read_file_task(self, file_path: str, run_id: str, db_path: str) -> dict:
-            """Read and analyse a single file in a worker process."""
+    @celery_app.task(
+        name="rhodawk.tasks.run_stabilization",
+        bind=True,
+        max_retries=3,
+        acks_late=True,
+        task_reject_on_worker_lost=True,
+    )
+    def run_stabilization_task(self, config_dict: dict) -> dict:
+        """
+        Celery task: run a full stabilization cycle.
+        Each worker creates its own isolated storage connection.
+        """
+        async def _run() -> dict:
+            from config.loader import load_config
+            from orchestrator.controller import StabilizerController
+            cfg = load_config(**config_dict)
+            controller = StabilizerController(cfg)
             try:
-                from brain.sqlite_storage import SQLiteBrainStorage
-                from agents.reader import ReaderAgent
-                from agents.base import AgentConfig
-                import asyncio
-
-                async def _run():
-                    storage = SQLiteBrainStorage(db_path)
-                    await storage.initialise()
-                    from pathlib import Path
-                    reader = ReaderAgent(
-                        storage=storage,
-                        run_id=run_id,
-                        repo_root=Path(file_path).parent.parent,
-                        config=AgentConfig(),
-                    )
-                    result = await reader._process_file(
-                        Path(file_path), file_path, force=True
-                    )
-                    await storage.close()
-                    return result
-
-                return {"status": "ok", "processed": asyncio.run(_run())}
+                run = await controller.initialise()
+                status = await controller.stabilize()
+                return {"run_id": run.id, "status": status.value}
             except Exception as exc:
-                self.retry(exc=exc, countdown=2 ** self.request.retries)
+                log.error(f"Stabilization task failed: {exc}")
+                raise self.retry(exc=exc, countdown=2 ** self.request.retries)
 
-        @celery_app.task(name="workers.tasks.gate_check_task", bind=True)
-        def gate_check_task(self, file_path: str, content: str, domain_mode: str = "general") -> dict:
-            """Run static analysis gate on a file in a worker process."""
-            try:
-                from sandbox.executor import StaticAnalysisGate
-                from pathlib import Path
+        return asyncio.run(_run())
 
-                async def _run():
-                    gate = StaticAnalysisGate(domain_mode=domain_mode)
-                    result = await gate.validate(file_path, content)
-                    return {"approved": result.approved, "reason": result.rejection_reason}
+    @celery_app.task(
+        name="rhodawk.tasks.approve_escalation",
+        bind=True,
+        acks_late=True,
+    )
+    def approve_escalation_task(
+        self, escalation_id: str, approved_by: str,
+        rationale: str, run_id: str
+    ) -> dict:
+        """Async-safe escalation approval from external system."""
+        async def _approve() -> dict:
+            from config.loader import load_config
+            cfg = load_config()
+            from orchestrator.controller import StabilizerController
+            controller = StabilizerController(cfg)
+            await controller._init_storage()
+            esc = await controller.storage.get_escalation(escalation_id)
+            if esc is None:
+                return {"error": f"escalation {escalation_id} not found"}
+            from brain.schemas import EscalationStatus
+            from datetime import datetime, timezone
+            esc.status             = EscalationStatus.APPROVED
+            esc.approved_by        = approved_by
+            esc.approved_at        = datetime.now(tz=timezone.utc)
+            esc.approval_rationale = rationale
+            await controller.storage.upsert_escalation(esc)
+            await controller.storage.close()
+            return {"status": "approved", "escalation_id": escalation_id}
+        return asyncio.run(_approve())
 
-                return asyncio.run(_run())
-            except Exception as exc:
-                return {"approved": False, "reason": str(exc)}
-
-except (ImportError, TypeError):
-    log.info("Celery tasks not registered — celery not available")
+except ImportError:
+    log.info("Celery not available — task module operating in stub mode")
