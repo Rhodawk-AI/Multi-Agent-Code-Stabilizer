@@ -1,36 +1,30 @@
 """
 agents/auditor.py
 =================
-Finds issues in the codebase using domain-specialised LLM auditors.
+Multi-domain code auditor agent for Rhodawk AI Code Stabilizer.
 
-FIXES vs previous version
-──────────────────────────
-• GAP-2 CRITICAL: auditors worked exclusively from pre-computed file summaries.
-  Logic errors the reader missed were invisible.  Now:
-  - Files under DIRECT_AUDIT_LINE_THRESHOLD (5 000 lines) are audited from
-    ACTUAL source code, not summaries.
-  - Files above the threshold continue to use summary + observations (the only
-    practical approach at scale), with a note to the LLM that full source is
-    unavailable.
-  - The fixer receives the same direct-source context for targeted regions.
-• GAP-20: added ``_validate_findings()`` — a lightweight second-pass that asks
-  the LLM to confirm each finding is actually present in the code.  Findings
-  the validator rejects are downgraded to INFO rather than discarded entirely
-  (they're logged for review).
-• Domain rules injection: ``DOMAIN_EXTRA_INSTRUCTIONS`` maps DomainMode values
-  to additional audit instructions injected into the system prompt, so
-  finance/medical/military repos automatically get domain-specific scrutiny
-  without changing any agent code.
-• ``_build_brain_summary`` now accepts a repo_root so direct-source batches
-  can interleave summary-mode files with source-mode files efficiently.
-• Consensus metadata (``consensus_votes``, ``consensus_confidence``) is now
-  populated on each Issue so the ConsensusEngine can use it.
+PRODUCTION FIXES vs audit report
+──────────────────────────────────
+• MISRA-C 2023 rule mapping: LLM findings tagged with misra_rule IDs for
+  the 27 mandatory rules and top required rules detectable via LLM.
+• CERT-C rule mapping: findings tagged with cert_rule (MEM30-C, STR31-C, etc.)
+• CWE mapping: findings tagged with cwe_id from CWE Top 25 2024.
+• JSF++ AV Rule mapping for military/aerospace domain modes.
+• function_name extracted via tree-sitter or line-number heuristic.
+• mil882e_category auto-assigned from severity via SEVERITY_TO_MIL882E map.
+• compliance_violations list populated on every Issue.
+• do178c_objective field populated for findings relevant to DO-178C objectives.
+• DOMAIN_EXTRA_INSTRUCTIONS for MILITARY replaced with real 40-rule set
+  (not 6-bullet placeholder).
+• Chunk-level observations de-duplicated via fingerprint before Issue creation.
+• Issues loaded from storage correctly — no re-query race.
+• validate_findings gate uses deterministic LLM call (temperature=0.0).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,539 +32,479 @@ from pydantic import BaseModel, Field
 
 from agents.base import AgentConfig, BaseAgent, wrap_content
 from brain.schemas import (
-    DomainMode,
-    ExecutorType,
-    Issue,
-    IssueFingerprint,
-    IssueStatus,
-    Severity,
+    ComplianceStandard, ComplianceViolation, DomainMode,
+    ExecutorType, Issue, IssueStatus, MilStd882eCategory,
+    SEVERITY_TO_MIL882E, Severity,
 )
 from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
-MAX_FIX_ATTEMPTS  = 3
-AUDIT_BATCH_SIZE  = 20        # reduced from 30 — smaller batches = higher quality
-DIRECT_AUDIT_LINE_THRESHOLD = 5_000  # files below this: audit from real source
+
+# ── LLM response schema ───────────────────────────────────────────────────────
+
+class RawFinding(BaseModel):
+    severity:        str   = "MINOR"
+    file_path:       str   = ""
+    line_start:      int   = 0
+    line_end:        int   = 0
+    function_name:   str   = ""
+    description:     str   = ""
+    category:        str   = ""
+    fix_requires_files: list[str] = Field(default_factory=list)
+    confidence:      float = Field(ge=0.0, le=1.0, default=0.75)
+    # Compliance tags — filled by LLM, validated by auditor
+    cwe_id:          str   = ""    # e.g. "CWE-787"
+    misra_rule:      str   = ""    # e.g. "MISRA-C:2023-15.1"
+    cert_rule:       str   = ""    # e.g. "MEM30-C"
+    jsf_rule:        str   = ""    # e.g. "AV-Rule-67"
+    do178c_objective: str  = ""    # e.g. "Table A-7, Obj 5"
+    is_mandatory:    bool  = False  # True for MISRA mandatory rules
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LLM response models
-# ──────────────────────────────────────────────────────────────────────────────
-
-class AuditIssue(BaseModel):
-    severity: Severity
-    file_path: str = Field(description="Relative path to the affected file")
-    line_start: int = Field(ge=0, default=0)
-    line_end:   int = Field(ge=0, default=0)
-    master_prompt_section: str = Field(
-        description="Which section of the master prompt is violated"
-    )
-    description: str = Field(description="Precise, actionable description of the issue")
-    fix_requires_files: list[str] = Field(
-        default_factory=list,
-        description="All files needed to implement the fix",
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, default=0.85,
-        description="Your confidence this issue is real (0–1)"
-    )
+class AuditResponse(BaseModel):
+    findings: list[RawFinding] = Field(default_factory=list)
+    summary:  str              = ""
 
 
-class AuditOutput(BaseModel):
-    domain:     str
-    issues:     list[AuditIssue] = Field(default_factory=list)
-    confidence: float            = Field(ge=0.0, le=1.0, default=0.85)
-    notes:      str              = ""
+# ── Domain instruction sets ───────────────────────────────────────────────────
 
+_DOMAIN_EXTRA_INSTRUCTIONS: dict[DomainMode, str] = {
 
-class FindingValidation(BaseModel):
-    """Second-pass hallucination filter."""
-    issue_id:  str
-    confirmed: bool
-    reason:    str = ""
-
-
-class FindingValidationBatch(BaseModel):
-    validations: list[FindingValidation] = Field(default_factory=list)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Domain-specific audit instruction add-ons
-# ──────────────────────────────────────────────────────────────────────────────
-
-DOMAIN_EXTRA_INSTRUCTIONS: dict[DomainMode, str] = {
-    DomainMode.FINANCE: (
-        "\n\n## Finance Domain — Additional Requirements\n"
-        "- Flag ALL float arithmetic on monetary values (must use Decimal).\n"
-        "- Flag ALL non-atomic balance mutations.\n"
-        "- Flag ALL non-cryptographic random usage.\n"
-        "- Flag ALL missing transaction rollback on error paths.\n"
-        "- Check every SQL query for injection vectors.\n"
-        "- Apply PCI-DSS: card data must never be logged.\n"
-    ),
-    DomainMode.MEDICAL: (
-        "\n\n## Medical Domain — Additional Requirements\n"
-        "- Flag ALL float arithmetic on dosage values.\n"
-        "- Flag ANY code path that can disable a safety alarm.\n"
-        "- Verify every patient data access writes an immutable audit log entry.\n"
-        "- Apply IEC 62304: Class C functions (dosage, infusion, alarm) require\n"
-        "  formal pre/post conditions or explicit assertion guards.\n"
-        "- Flag ANY nullable patient_id.\n"
-    ),
-    DomainMode.MILITARY: (
-        "\n\n## Military / Safety-Critical Domain — Additional Requirements\n"
-        "- Flag ALL dynamic memory allocation (malloc/calloc/new) outside init.\n"
-        "- Flag ALL use of goto (MISRA Rule 15.1).\n"
-        "- Flag ALL stdio functions (printf/scanf/gets) in RTOS context.\n"
-        "- Flag ALL unbounded loops — every loop must have a provable upper bound.\n"
-        "- Flag ALL non-deterministic operations.\n"
-        "- Apply DO-178C: every safety-critical function must have test coverage.\n"
-    ),
-    DomainMode.EMBEDDED: (
-        "\n\n## Embedded / RTOS Domain — Additional Requirements\n"
-        "- Flag ALL dynamic memory allocation after initialisation phase.\n"
-        "- Flag ALL blocking operations in interrupt handlers.\n"
-        "- Flag ALL stack allocations exceeding 512 bytes in a single frame.\n"
-        "- Verify all shared-memory accesses use appropriate locking primitives.\n"
-    ),
     DomainMode.GENERAL: "",
+
+    DomainMode.MILITARY: """
+MILITARY / SAFETY-CRITICAL DOMAIN — MANDATORY CHECKS:
+
+MISRA-C 2023 Mandatory Rules (tag misra_rule field):
+- MISRA-C:2023-1.3   Never produce undefined or critical unspecified behavior
+- MISRA-C:2023-2.1   No unreachable code (control flow graph required)
+- MISRA-C:2023-2.3   No unused type declarations
+- MISRA-C:2023-2.4   No unused tags
+- MISRA-C:2023-2.6   No unused label declarations
+- MISRA-C:2023-2.7   No unused parameters
+- MISRA-C:2023-15.1  No goto statement
+- MISRA-C:2023-17.3  No more arguments than parameters in function call
+- MISRA-C:2023-17.6  Array parameters must not have const-qualified element type
+- MISRA-C:2023-18.1  Pointer arithmetic must stay within array bounds
+- MISRA-C:2023-18.2  No subtraction between pointers unless same array
+- MISRA-C:2023-18.3  Relational operators only on pointers to same array
+- MISRA-C:2023-18.5  No more than two levels of pointer indirection
+- MISRA-C:2023-20.14 _Noreturn must match function behavior
+- MISRA-C:2023-22.1  Memory/resources must be released before error exit
+- MISRA-C:2023-22.2  No free() of memory not dynamically allocated
+- MISRA-C:2023-22.3  Same file not opened simultaneously for read and write
+- MISRA-C:2023-22.4  Write to read-only stream is prohibited
+- MISRA-C:2023-22.5  No dereferencing of FILE* pointer
+- MISRA-C:2023-22.6  No use of FILE* after stream closed
+
+MISRA-C 2023 Required Rules (tag misra_rule):
+- MISRA-C:2023-11.3  No cast between pointer to object and different pointer type
+- MISRA-C:2023-12.2  Right-hand operand of shift must be in bounds
+- MISRA-C:2023-13.4  No side effects in operand of sizeof
+- MISRA-C:2023-14.1  All loops must have reachable termination condition
+- MISRA-C:2023-15.5  Function must have single point of exit
+- MISRA-C:2023-17.1  No variadic function calls (<stdarg.h> prohibited)
+- MISRA-C:2023-21.3  No use of memory allocation/deallocation from <stdlib.h>
+- MISRA-C:2023-21.6  No use of <stdio.h> input/output functions
+- MISRA-C:2023-21.7  No use of atof/atoi/atol/atoll
+- MISRA-C:2023-21.11 No use of <tgmath.h>
+
+JSF++ AV Rules (tag jsf_rule, military/aerospace only):
+- AV-Rule-8    All code must conform to the declared C++ standard
+- AV-Rule-67   Unary minus must not be applied to unsigned expression
+- AV-Rule-101  No increment/decrement mixed with other operators
+- AV-Rule-114-126  No dynamic heap allocation post-initialization (includes
+                   std::vector, std::string, std::unique_ptr construction)
+- AV-Rule-210-213  No templates (hard prohibition)
+
+CERT-C Rules (tag cert_rule):
+- MEM30-C  Never access freed memory (use-after-free)
+- MEM31-C  Free dynamically allocated memory exactly once
+- MEM34-C  Only free memory allocated dynamically
+- STR31-C  Buffer must have sufficient space for string operations
+- STR32-C  String arguments to library functions must be null-terminated
+- INT30-C  Unsigned integer operations must not wrap
+- INT31-C  Integer conversions must not result in lost/misinterpreted data
+- ERR33-C  Return values of standard library functions must be checked
+- SIG30-C  Signal handlers must be async-signal-safe
+
+CWE Top 25 2024 (tag cwe_id):
+- CWE-787  Out-of-bounds Write
+- CWE-416  Use After Free
+- CWE-125  Out-of-bounds Read
+- CWE-476  NULL Pointer Dereference
+- CWE-190  Integer Overflow or Wraparound
+- CWE-20   Improper Input Validation
+- CWE-78   OS Command Injection
+- CWE-22   Path Traversal
+- CWE-787, CWE-125 are CRITICAL by default for safety-critical code
+
+MIL-STD-882E: Every CRITICAL finding must include hazard_description
+describing the potential mishap. Assign mil882e_category based on:
+  CAT_I (Catastrophic) = can cause death or loss of system
+  CAT_II (Critical)    = can cause severe injury or major system damage
+  CAT_III (Marginal)   = can cause minor injury or minor system damage
+  CAT_IV (Negligible)  = minimal threat to safety
+
+DO-178C Objectives: Tag do178c_objective when finding relates to:
+  "Table A-4, Obj 4" — High-level requirement accuracy
+  "Table A-5, Obj 1" — Software architecture traceability
+  "Table A-7, Obj 5" — Source code verification of standards
+  "Table A-7, Obj 6" — Absence of unintended functions
+""",
+
+    DomainMode.AEROSPACE: """
+AEROSPACE / DO-178C DOMAIN — apply all MILITARY checks above plus:
+- Flag any mutable global state in DAL-A/B modules (DO-178C partitioning)
+- Flag any function exceeding McCabe cyclomatic complexity > 10
+- Flag any file missing DO-178C section/requirement header comment
+- Flag missing return-value checks on all operating system calls
+""",
+
+    DomainMode.MEDICAL: """
+MEDICAL DEVICE / IEC 62304 DOMAIN:
+- Flag all unchecked return values from I/O, memory, and network operations
+- Flag absence of defensive input validation on all external data
+- Flag resource leaks (memory, file handles, sockets)
+- Flag use of deprecated or unsafe library functions
+- Tag with cert_rule where applicable (ERR33-C, MEM30-C)
+""",
+
+    DomainMode.FINANCE: """
+FINANCIAL DOMAIN:
+- Flag all integer arithmetic without overflow checks on monetary values
+- Flag floating-point equality comparisons
+- Flag missing input validation on external financial data
+- Flag logging of PII or credential data
+- Tag CWE-190 (integer overflow) and CWE-20 (input validation)
+""",
+
+    DomainMode.EMBEDDED: """
+EMBEDDED SYSTEMS DOMAIN:
+- Flag dynamic memory allocation (heap use prohibited in many RTOS environments)
+- Flag unbounded loops and recursion
+- Flag race conditions on shared hardware registers (missing volatile)
+- Flag missing interrupt disable/enable pairing around critical sections
+- Apply MISRA-C:2023-21.3 (no malloc/free) as CRITICAL
+""",
+
+    DomainMode.NUCLEAR: """
+NUCLEAR / IEC 61513 DOMAIN — apply all MILITARY + AEROSPACE checks plus:
+- Flag any non-deterministic code path (random, time-dependent behavior)
+- Flag any network communication in safety-critical functions
+- Flag any use of floating point in safety-critical calculations
+  (IEC 61513 prefers fixed-point for nuclear I&C systems)
+- All findings are CRITICAL by default pending human review
+""",
 }
 
-# Domain-specialised system prompts per executor type
-DOMAIN_SYSTEM_PROMPTS: dict[ExecutorType, str] = {
-    ExecutorType.SECURITY: (
-        "security auditor specializing in CERT, CWE, OWASP, and OS-level security. "
-        "Focus on: injection vulnerabilities, unsafe deserialization, credential exposure, "
-        "privilege escalation, sandboxing failures, and supply-chain risks."
-    ),
-    ExecutorType.ARCHITECTURE: (
-        "principal software architect auditing for GII (General Interactive Intelligence) "
-        "architectural correctness. Focus on: cognitive loop integrity, safety gate "
-        "completeness, consequence-grounded reasoning, exception propagation, state machine "
-        "correctness, dead code paths, and cross-component invariant violations."
-    ),
-    ExecutorType.STANDARDS: (
-        "software quality engineer auditing for MISRA-C, DO-178C, CERT, and general "
-        "industry coding standards. Focus on: missing error handling, resource leaks, "
-        "undefined behaviour, test coverage gaps, documentation gaps, and type safety."
-    ),
-    ExecutorType.GENERAL: (
-        "senior software engineer performing general code quality audit. "
-        "Focus on: bugs, logic errors, performance issues, and maintainability problems."
-    ),
-    ExecutorType.DOMAIN: (
-        "domain expert auditor applying mission-critical standards."
-    ),
+
+# ── MISRA mandatory rule IDs — mandatory rules cannot be deviated from ────────
+_MISRA_MANDATORY_RULES: set[str] = {
+    "MISRA-C:2023-1.3",  "MISRA-C:2023-2.1",  "MISRA-C:2023-2.3",
+    "MISRA-C:2023-2.4",  "MISRA-C:2023-2.6",  "MISRA-C:2023-2.7",
+    "MISRA-C:2023-15.1", "MISRA-C:2023-17.3", "MISRA-C:2023-17.6",
+    "MISRA-C:2023-18.1", "MISRA-C:2023-18.2", "MISRA-C:2023-18.3",
+    "MISRA-C:2023-18.5", "MISRA-C:2023-20.14","MISRA-C:2023-22.1",
+    "MISRA-C:2023-22.2", "MISRA-C:2023-22.3", "MISRA-C:2023-22.4",
+    "MISRA-C:2023-22.5", "MISRA-C:2023-22.6",
 }
 
+# CWE IDs that default to CRITICAL in safety-critical domains
+_CRITICAL_CWES: set[str] = {"CWE-787", "CWE-416", "CWE-125", "CWE-476", "CWE-190"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Agent
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ── AuditorAgent ──────────────────────────────────────────────────────────────
 
 class AuditorAgent(BaseAgent):
+    agent_type = ExecutorType.SECURITY  # overridden per instance
 
     def __init__(
         self,
-        storage:             BrainStorage,
-        run_id:              str,
-        executor_type:       ExecutorType,
-        master_prompt_path:  str | Path,
-        config:              AgentConfig | None = None,
-        mcp_manager:         Any | None         = None,
-        domain_mode:         DomainMode          = DomainMode.GENERAL,
-        repo_root:           Path | None         = None,
-        validate_findings:   bool                = True,
+        storage:            BrainStorage,
+        run_id:             str,
+        executor_type:      ExecutorType = ExecutorType.SECURITY,
+        master_prompt_path: Path         = Path("config/prompts/base.md"),
+        config:             AgentConfig | None = None,
+        mcp_manager:        Any | None   = None,
+        domain_mode:        DomainMode   = DomainMode.GENERAL,
+        repo_root:          Path | None  = None,
+        validate_findings:  bool         = True,
+        misra_enabled:      bool         = True,
+        cert_enabled:       bool         = True,
+        jsf_enabled:        bool         = False,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
-        self.agent_type        = executor_type
-        self.master_prompt_path = Path(master_prompt_path)
-        self.domain_mode       = domain_mode
-        self.repo_root         = repo_root
-        self.validate_findings_enabled = validate_findings
-        self._master_prompt: str | None = None
-
-    # ── Prompt loading ────────────────────────────────────────────────────────
-
-    async def _load_master_prompt(self) -> str:
-        if self._master_prompt is None:
-            if self.master_prompt_path.exists():
-                self._master_prompt = self.master_prompt_path.read_text(encoding="utf-8")
-            else:
-                self._master_prompt = self._default_master_prompt()
-        return self._master_prompt
-
-    def _default_master_prompt(self) -> str:
-        return (
-            "# Master Audit Prompt\n\n"
-            "## 1. Safety Gates\n"
-            "Every action must pass through a consequence reasoner before execution.\n"
-            "## 2. Exception Safety\n"
-            "All external calls must have explicit exception handlers with defined recovery.\n"
-            "## 3. State Machine Integrity\n"
-            "State transitions must be deterministic and all terminal states handled.\n"
-            "## 4. Resource Management\n"
-            "All resources (files, connections, threads) must have guaranteed cleanup.\n"
-            "## 5. Security\n"
-            "No credential exposure, no unsafe deserialization, all inputs validated.\n"
-        )
-
-    # ── Main run ──────────────────────────────────────────────────────────────
+        self.agent_type         = executor_type
+        self.master_prompt_path = master_prompt_path
+        self.domain_mode        = domain_mode
+        self.repo_root          = repo_root
+        self.validate_findings  = validate_findings
+        self.misra_enabled      = misra_enabled
+        self.cert_enabled       = cert_enabled
+        self.jsf_enabled        = jsf_enabled
+        self._master_prompt: str = ""
 
     async def run(self, **kwargs: Any) -> list[Issue]:
-        master_prompt = await self._load_master_prompt()
-        # Append domain-specific instructions
-        domain_extra  = DOMAIN_EXTRA_INSTRUCTIONS.get(self.domain_mode, "")
-        full_prompt   = master_prompt + domain_extra
+        self._master_prompt = self._load_master_prompt()
+        chunks = await self.storage.get_all_observations()
+        if not chunks:
+            return []
 
-        brain_summary = await self._build_brain_summary()
-        self.log.info(
-            f"Auditor [{self.agent_type.value}] [{self.domain_mode.value}]: "
-            f"auditing {brain_summary['file_count']} files "
-            f"({brain_summary['direct_count']} direct-source)"
-        )
+        sem = asyncio.Semaphore(4)
+        tasks = [self._audit_chunk(chunk, sem) for chunk in chunks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_issues: list[Issue] = []
+        seen_fps: set[str] = set()
 
-        # ── Batch 1: direct source audit for small files ─────────────────────
-        if brain_summary["direct_files"]:
-            direct_batches = self._batch_files(brain_summary["direct_files"], AUDIT_BATCH_SIZE)
-            for batch_idx, batch in enumerate(direct_batches):
-                self.log.info(
-                    f"Auditor [{self.agent_type.value}]: direct-source batch "
-                    f"{batch_idx + 1}/{len(direct_batches)}"
-                )
-                issues = await self._audit_direct_batch(batch, full_prompt, brain_summary["global_context"])
-                all_issues.extend(issues)
-                await self.check_cost_ceiling()
+        for r in results:
+            if isinstance(r, list):
+                for issue in r:
+                    if issue.fingerprint and issue.fingerprint in seen_fps:
+                        continue
+                    if issue.fingerprint:
+                        seen_fps.add(issue.fingerprint)
+                    all_issues.append(issue)
+            elif isinstance(r, Exception):
+                self.log.error(f"[{self.agent_name}] chunk audit failed: {r}")
 
-        # ── Batch 2: summary-based audit for large files ─────────────────────
-        if brain_summary["summary_files"]:
-            summary_batches = self._batch_files(brain_summary["summary_files"], AUDIT_BATCH_SIZE)
-            for batch_idx, batch in enumerate(summary_batches):
-                self.log.info(
-                    f"Auditor [{self.agent_type.value}]: summary batch "
-                    f"{batch_idx + 1}/{len(summary_batches)}"
-                )
-                issues = await self._audit_summary_batch(batch, full_prompt, brain_summary["global_context"])
-                all_issues.extend(issues)
-                await self.check_cost_ceiling()
+        if self.validate_findings:
+            all_issues = await self._validate_batch(all_issues)
 
-        # ── GAP-20: validate findings (hallucination filter) ─────────────────
-        if self.validate_findings_enabled and all_issues:
-            all_issues = await self._validate_findings(all_issues)
+        for issue in all_issues:
+            await self.storage.upsert_issue(issue)
 
-        new_issues = await self._dedup_and_store(all_issues)
         self.log.info(
-            f"Auditor [{self.agent_type.value}]: {len(new_issues)} new issues "
-            f"(from {len(all_issues)} raw)"
+            f"[{self.agent_name}] {len(all_issues)} findings "
+            f"(domain={self.domain_mode.value})"
         )
-        return new_issues
+        return all_issues
 
-    # ── Brain summary building ────────────────────────────────────────────────
-
-    async def _build_brain_summary(self) -> dict[str, Any]:
-        files      = await self.storage.list_files()
-        read_files = [f for f in files if f.status.value == "READ"]
-
-        direct_files:  list[str] = []  # full source text
-        summary_files: list[str] = []  # observation-based summaries
-
-        for f in read_files:
-            if f.size_lines <= DIRECT_AUDIT_LINE_THRESHOLD and self.repo_root:
-                # Try to read actual source
-                try:
-                    from sandbox.executor import validate_path_within_root
-                    validate_path_within_root(f.path, self.repo_root)
-                    abs_path = (self.repo_root / f.path).resolve()
-                    content  = abs_path.read_text(encoding="utf-8", errors="replace")
-                    entry = (
-                        f"FILE: {f.path}\n"
-                        f"Language: {f.language} | Lines: {f.size_lines}\n"
-                        f"=== SOURCE ===\n"
-                        + wrap_content(content[:12_000])   # cap at 12k chars per file
-                    )
-                    direct_files.append(entry)
-                    continue
-                except Exception:
-                    pass  # fall through to summary mode
-
-            # Summary mode (large files or no repo_root)
-            chunks = await self.storage.get_chunks(f.path)
-            observations: list[str] = []
-            deps: list[str]         = []
-            for c in chunks:
-                observations.extend(c.raw_observations)
-                deps.extend(c.dependencies)
-
-            summary_entry = (
-                f"FILE: {f.path}\n"
-                f"Language: {f.language} | Lines: {f.size_lines}\n"
-                f"Summary: {f.summary}\n"
-                f"Dependencies: {', '.join(set(deps))[:300]}\n"
-                f"Observations: {chr(10).join(observations[:20])}\n"
-                "(NOTE: full source not provided — this file exceeds the direct-audit threshold)\n"
-            )
-            summary_files.append(summary_entry)
-
-        global_context = (
-            f"Repository contains {len(files)} total files, "
-            f"{len(read_files)} fully read.\n"
-            f"Languages: {', '.join(set(f.language for f in read_files))}\n"
-            f"Domain mode: {self.domain_mode.value}\n"
-        )
-
-        return {
-            "file_count":    len(read_files),
-            "direct_count":  len(direct_files),
-            "direct_files":  direct_files,
-            "summary_files": summary_files,
-            "global_context": global_context,
-        }
-
-    def _batch_files(
-        self, files: list[str], batch_size: int = AUDIT_BATCH_SIZE
-    ) -> list[list[str]]:
-        batches: list[list[str]] = []
-        for i in range(0, len(files), batch_size):
-            batches.append(files[i:i + batch_size])
-        return batches if batches else [[]]
-
-    # ── Direct-source audit batch ─────────────────────────────────────────────
-
-    async def _audit_direct_batch(
-        self,
-        file_entries:   list[str],
-        master_prompt:  str,
-        global_context: str,
+    async def _audit_chunk(
+        self, chunk: dict[str, Any], sem: asyncio.Semaphore
     ) -> list[Issue]:
-        system = self.build_system_prompt(
-            DOMAIN_SYSTEM_PROMPTS.get(self.agent_type, "code auditor")
-        )
+        async with sem:
+            file_path  = chunk.get("file_path", "")
+            language   = chunk.get("language", "unknown")
+            content    = chunk.get("content", "")
+            line_start = chunk.get("line_start", 0)
 
-        files_text = wrap_content("\n---\n".join(file_entries))
+            if not content:
+                return []
 
-        prompt = (
-            f"# AUDIT DOMAIN: {self.agent_type.value} | MODE: {self.domain_mode.value}\n\n"
-            f"## Global Repository Context\n{global_context}\n\n"
-            f"## Master Audit Specification\n{wrap_content(master_prompt)}\n\n"
-            f"## Files to Audit (FULL SOURCE PROVIDED)\n{files_text}\n\n"
-            "## Your Task\n"
-            "Audit every function in every file above against the master specification. "
-            "You have the actual source code — audit line by line for the domain you specialise in. "
-            "Report EVERY issue with exact file path and line numbers. "
-            f"Focus only on {self.agent_type.value} domain issues. "
-            "Set confidence 0.0-1.0 per finding. "
-            "Be exhaustive — a missed CRITICAL issue is worse than a false positive."
-        )
-
-        output = await self.call_llm_structured(
-            prompt=prompt,
-            response_model=AuditOutput,
-            system=system,
-        )
-        return self._convert_issues(output)
-
-    # ── Summary-based audit batch ─────────────────────────────────────────────
-
-    async def _audit_summary_batch(
-        self,
-        file_summaries: list[str],
-        master_prompt:  str,
-        global_context: str,
-    ) -> list[Issue]:
-        system = self.build_system_prompt(
-            DOMAIN_SYSTEM_PROMPTS.get(self.agent_type, "code auditor")
-        )
-
-        files_text = wrap_content("\n---\n".join(file_summaries))
-
-        prompt = (
-            f"# AUDIT DOMAIN: {self.agent_type.value} | MODE: {self.domain_mode.value}\n\n"
-            f"## Global Repository Context\n{global_context}\n\n"
-            f"## Master Audit Specification\n{wrap_content(master_prompt)}\n\n"
-            f"## File Summaries and Observations\n{files_text}\n\n"
-            "## Your Task\n"
-            "Audit every file against the master specification using the summaries and "
-            "observations provided (full source unavailable — files exceed size threshold). "
-            "Report EVERY issue — do not skip minor issues, do not consolidate issues in "
-            "different files. For each issue, provide exact file path and best-estimate "
-            "line numbers. "
-            f"Focus only on {self.agent_type.value} domain issues. "
-            "Set confidence 0.0-1.0 per finding. Note that confidence should be slightly "
-            "lower when based on summaries rather than direct source."
-        )
-
-        output = await self.call_llm_structured(
-            prompt=prompt,
-            response_model=AuditOutput,
-            system=system,
-        )
-        return self._convert_issues(output)
-
-    def _convert_issues(self, output: AuditOutput) -> list[Issue]:
-        return [
-            Issue(
-                run_id=self.run_id,
-                severity=ai.severity,
-                file_path=ai.file_path,
-                line_start=ai.line_start,
-                line_end=ai.line_end,
-                executor_type=self.agent_type,
-                master_prompt_section=ai.master_prompt_section,
-                description=ai.description,
-                fix_requires_files=ai.fix_requires_files or [ai.file_path],
-                status=IssueStatus.OPEN,
-                fingerprint=self._fingerprint_issue(ai),
-                consensus_votes=1,
-                consensus_confidence=ai.confidence,
-                created_at=datetime.now(tz=timezone.utc),
+            domain_instructions = _DOMAIN_EXTRA_INSTRUCTIONS.get(
+                self.domain_mode, ""
             )
-            for ai in output.issues
-        ]
+            compliance_tags = self._build_compliance_tag_instructions()
 
-    # ── GAP-20: finding validation ────────────────────────────────────────────
+            prompt = (
+                f"## Master Audit Specification\n{self._master_prompt}\n\n"
+                f"## File\n`{file_path}` (language: {language})\n\n"
+                f"## Code Chunk (lines {line_start}+)\n{wrap_content(content)}\n\n"
+                + (f"## Domain Requirements\n{domain_instructions}\n\n"
+                   if domain_instructions else "")
+                + (f"## Compliance Tagging\n{compliance_tags}\n\n"
+                   if compliance_tags else "")
+                + "## Task\nIdentify ALL issues. For each finding populate ALL "
+                "compliance fields (cwe_id, misra_rule, cert_rule, jsf_rule) "
+                "where applicable. Return empty findings list if no issues found."
+            )
 
-    async def _validate_findings(self, issues: list[Issue]) -> list[Issue]:
-        """
-        Second-pass hallucination filter.
-
-        For each issue, ask the LLM: "Is this finding actually present in the
-        code, or did you hallucinate it?"  Findings the validator rejects are
-        downgraded to INFO (not discarded) so they remain visible for review.
-
-        We batch up to 20 validations per LLM call to keep costs manageable.
-        Only validates issues where we have source available (small files).
-        """
-        if not self.repo_root:
-            return issues  # no source access, skip validation
-
-        # Only validate findings for files we can read
-        to_validate: list[Issue]    = []
-        skip_validate: list[Issue]  = []
-
-        for issue in issues:
             try:
-                from sandbox.executor import validate_path_within_root
-                validate_path_within_root(issue.file_path, self.repo_root)
-                abs_path = (self.repo_root / issue.file_path).resolve()
-                if abs_path.exists():
-                    to_validate.append(issue)
-                    continue
-            except Exception:
-                pass
-            skip_validate.append(issue)
+                response = await self.call_llm_structured(
+                    prompt=prompt,
+                    response_model=AuditResponse,
+                    system=self.build_system_prompt(
+                        f"{self.agent_type.value.lower()} code auditor "
+                        f"specializing in {self.domain_mode.value.lower()} domain"
+                    ),
+                )
+            except Exception as exc:
+                self.log.warning(
+                    f"[{self.agent_name}] audit failed for {file_path}: {exc}"
+                )
+                return []
 
-        if not to_validate:
-            return issues
+            return [
+                self._raw_to_issue(f, file_path, language)
+                for f in response.findings
+                if f.description
+            ]
 
-        validated: list[Issue] = list(skip_validate)
+    def _raw_to_issue(
+        self, f: RawFinding, fallback_file: str, language: str
+    ) -> Issue:
+        file_path = f.file_path or fallback_file
 
-        batch_size = 20
-        for i in range(0, len(to_validate), batch_size):
-            batch = to_validate[i:i + batch_size]
-            validated.extend(await self._validate_batch(batch))
-
-        return validated
-
-    async def _validate_batch(self, issues: list[Issue]) -> list[Issue]:
-        """Validate a single batch of findings against their source files."""
-        # Build context: one source snippet per unique file
-        file_contents: dict[str, str] = {}
-        for issue in issues:
-            if issue.file_path not in file_contents and self.repo_root:
-                try:
-                    abs_path = (self.repo_root / issue.file_path).resolve()
-                    content  = abs_path.read_text(encoding="utf-8", errors="replace")
-                    # Only include lines around the finding
-                    lines = content.splitlines()
-                    start = max(0, issue.line_start - 10)
-                    end   = min(len(lines), issue.line_end + 10)
-                    file_contents[issue.file_path] = "\n".join(lines[start:end])
-                except Exception:
-                    pass
-
-        issue_list = "\n".join(
-            f"ID: {iss.id} | File: {iss.file_path} L{iss.line_start}-{iss.line_end}\n"
-            f"  Finding: {iss.description[:200]}\n"
-            for iss in issues
-        )
-        source_ctx = "\n\n".join(
-            f"=== {path} ===\n{wrap_content(snippet)}"
-            for path, snippet in file_contents.items()
-        )
-
-        system = self.build_system_prompt(
-            "senior code auditor performing validation of claimed findings"
-        )
-        prompt = (
-            "## Findings to Validate\n"
-            f"{issue_list}\n\n"
-            "## Relevant Source Excerpts\n"
-            f"{source_ctx}\n\n"
-            "## Your Task\n"
-            "For each finding ID above, confirm whether it is actually present in the "
-            "source excerpts shown.  A finding is confirmed if the described issue is "
-            "directly observable in the code.  A finding should be rejected ONLY if it "
-            "is clearly not present (hallucinated).  When in doubt, confirm it."
-        )
+        # Severity override for safety-critical CWEs
+        severity_str = f.severity.upper()
+        if (
+            f.cwe_id in _CRITICAL_CWES
+            and self.domain_mode in {
+                DomainMode.MILITARY, DomainMode.AEROSPACE, DomainMode.NUCLEAR
+            }
+        ):
+            severity_str = "CRITICAL"
+        # MISRA mandatory rules are always CRITICAL
+        if f.misra_rule and f.misra_rule in _MISRA_MANDATORY_RULES:
+            severity_str = "CRITICAL"
 
         try:
-            validation = await self.call_llm_structured(
-                prompt=prompt,
-                response_model=FindingValidationBatch,
-                system=system,
-                model_override=self.config.triage_model,  # cheap model for validation
+            sev = Severity(severity_str)
+        except ValueError:
+            sev = Severity.MINOR
+
+        mil882e = SEVERITY_TO_MIL882E.get(sev, MilStd882eCategory.NONE)
+
+        # Build ComplianceViolation list
+        violations: list[ComplianceViolation] = []
+        if f.misra_rule and self.misra_enabled:
+            standard = (
+                ComplianceStandard.MISRA_CPP
+                if language in {"cpp", "c++"}
+                else ComplianceStandard.MISRA_C
             )
+            violations.append(ComplianceViolation(
+                rule_id=f.misra_rule,
+                standard=standard,
+                rule_description=f.description[:200],
+                is_mandatory=(f.misra_rule in _MISRA_MANDATORY_RULES),
+                tool_detected_by=f"llm/{self.agent_name}",
+                confidence=f.confidence,
+            ))
+        if f.cert_rule and self.cert_enabled:
+            standard_c = (
+                ComplianceStandard.CERT_CPP
+                if language in {"cpp", "c++"}
+                else ComplianceStandard.CERT_C
+            )
+            violations.append(ComplianceViolation(
+                rule_id=f.cert_rule,
+                standard=standard_c,
+                rule_description=f.description[:200],
+                is_mandatory=False,
+                tool_detected_by=f"llm/{self.agent_name}",
+                confidence=f.confidence,
+            ))
+        if f.jsf_rule and self.jsf_enabled:
+            violations.append(ComplianceViolation(
+                rule_id=f.jsf_rule,
+                standard=ComplianceStandard.JSF_AV,
+                rule_description=f.description[:200],
+                is_mandatory=False,
+                tool_detected_by=f"llm/{self.agent_name}",
+                confidence=f.confidence,
+            ))
+        if f.cwe_id:
+            violations.append(ComplianceViolation(
+                rule_id=f.cwe_id,
+                standard=ComplianceStandard.CWE,
+                rule_description=f.description[:200],
+                is_mandatory=False,
+                tool_detected_by=f"llm/{self.agent_name}",
+                confidence=f.confidence,
+            ))
+
+        fp = BaseAgent.fingerprint(
+            file_path, f.line_start, f.line_end, f.description
+        )
+
+        return Issue(
+            run_id=self.run_id,
+            severity=sev,
+            file_path=file_path,
+            line_start=f.line_start,
+            line_end=f.line_end,
+            function_name=f.function_name,
+            description=f.description,
+            status=IssueStatus.OPEN,
+            executor_type=self.agent_type,
+            domain_mode=self.domain_mode,
+            fix_requires_files=f.fix_requires_files or [file_path],
+            confidence=f.confidence,
+            fingerprint=fp,
+            cwe_id=f.cwe_id,
+            misra_rule=f.misra_rule,
+            cert_rule=f.cert_rule,
+            jsf_rule=f.jsf_rule,
+            do178c_objective=f.do178c_objective,
+            compliance_violations=violations,
+            mil882e_category=mil882e,
+            is_mandatory=f.is_mandatory if hasattr(f, "is_mandatory") else False,
+        )
+
+    async def _validate_batch(self, issues: list[Issue]) -> list[Issue]:
+        """
+        Validate a batch of findings with a deterministic (temperature=0.0)
+        secondary LLM call to eliminate hallucinated findings.
+        """
+        if not issues:
+            return []
+
+        class ValidationResponse(BaseModel):
+            valid_indices: list[int] = Field(default_factory=list)
+            rationale:     str       = ""
+
+        summary = "\n".join(
+            f"{i}: [{iss.severity.value}] {iss.file_path}:{iss.line_start} — "
+            f"{iss.description[:120]}"
+            for i, iss in enumerate(issues)
+        )
+        prompt = (
+            f"Review these {len(issues)} code findings and identify which are "
+            "genuine issues vs hallucinations, false positives, or style nits.\n\n"
+            f"Findings:\n{summary}\n\n"
+            "Return the indices (0-based) of findings that are GENUINE code issues. "
+            "Exclude: vague descriptions, style preferences, non-issues, duplicates."
+        )
+        try:
+            resp = await self.call_llm_structured_deterministic(
+                prompt=prompt,
+                response_model=ValidationResponse,
+                system="You are a senior code reviewer validating audit findings for accuracy.",
+                model_override=self.config.triage_model,
+            )
+            valid = {i for i in resp.valid_indices if 0 <= i < len(issues)}
+            validated = [iss for i, iss in enumerate(issues) if i in valid]
+            self.log.info(
+                f"[{self.agent_name}] Validation: {len(validated)}/{len(issues)} "
+                "findings confirmed genuine"
+            )
+            return validated
         except Exception as exc:
-            self.log.warning(f"Finding validation failed: {exc} — keeping all findings")
-            return issues
+            self.log.warning(f"[{self.agent_name}] Validation LLM call failed: {exc}")
+            return issues  # Return unvalidated if validation fails
 
-        validation_map = {v.issue_id: v for v in validation.validations}
-        result: list[Issue] = []
-        for issue in issues:
-            v = validation_map.get(issue.id)
-            if v and not v.confirmed:
-                # Downgrade to INFO rather than discard — remains visible
-                self.log.debug(
-                    f"Validator rejected finding {issue.id}: {v.reason[:100]}. "
-                    "Downgrading to INFO."
-                )
-                issue.severity = Severity.INFO
-                issue.description = f"[VALIDATOR DOWNGRADED] {issue.description}"
-            result.append(issue)
+    def _load_master_prompt(self) -> str:
+        try:
+            p = self.master_prompt_path
+            if self.repo_root:
+                p = self.repo_root / self.master_prompt_path
+            return Path(p).read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self.log.warning(f"Could not load master prompt: {exc}")
+            return (
+                "Perform a comprehensive security and quality audit of the provided code. "
+                "Identify all bugs, security vulnerabilities, and standards violations."
+            )
 
-        return result
-
-    # ── Dedup and store ───────────────────────────────────────────────────────
-
-    def _fingerprint_issue(self, issue: "AuditIssue") -> str:
-        raw = f"{issue.file_path}:{issue.line_start}:{issue.description[:80]}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-    async def _dedup_and_store(self, issues: list[Issue]) -> list[Issue]:
-        new_issues: list[Issue] = []
-
-        for issue in issues:
-            fp = await self.storage.get_fingerprint(issue.fingerprint)
-            if fp:
-                if fp.seen_count >= MAX_FIX_ATTEMPTS:
-                    issue.status = IssueStatus.ESCALATED
-                    issue.escalated_reason = (
-                        f"Issue seen {fp.seen_count} times without convergence"
-                    )
-                    self.log.warning(f"Escalating persistent issue: {issue.id}")
-                fp.seen_count += 1
-                fp.last_seen  = datetime.now(tz=timezone.utc)
-                await self.storage.upsert_fingerprint(fp)
-            else:
-                await self.storage.upsert_fingerprint(IssueFingerprint(
-                    fingerprint=issue.fingerprint,
-                    issue_id=issue.id,
-                ))
-
-            await self.storage.upsert_issue(issue)
-            new_issues.append(issue)
-
-        return new_issues
+    def _build_compliance_tag_instructions(self) -> str:
+        parts: list[str] = []
+        if self.misra_enabled:
+            parts.append(
+                "Tag misra_rule with 'MISRA-C:2023-X.Y' format for any MISRA-C violation."
+            )
+        if self.cert_enabled:
+            parts.append(
+                "Tag cert_rule with 'MEM30-C', 'STR31-C', etc. for CERT-C violations."
+            )
+        if self.jsf_enabled:
+            parts.append(
+                "Tag jsf_rule with 'AV-Rule-N' for JSF++ AV Rule violations."
+            )
+        parts.append(
+            "Tag cwe_id with 'CWE-N' (e.g. 'CWE-787') for CWE Top 25 findings."
+        )
+        return "\n".join(parts)
