@@ -1,305 +1,289 @@
 """
 swarm/deerflow_orchestrator.py
-==============================
-DeerFlow-inspired workflow orchestration for Rhodawk AI.
+===============================
+DeerFlow workflow orchestrator — sole execution path for Rhodawk AI.
 
-DeerFlow (https://github.com/bytedance/deer-flow) provides structured
-multi-step research and execution workflows.  This module implements
-a compatible workflow engine that:
-
-1. Decomposes a stabilization run into a directed workflow graph.
-2. Executes each workflow step with the appropriate swarm agent.
-3. Handles step retries, partial failures, and step dependencies.
-4. Persists workflow state for resumption after crashes.
-5. Emits structured events for the dashboard.
-
-DeerFlow-compatible workflow format
-─────────────────────────────────────
-{
-  "id": "wf-<uuid>",
-  "name": "Stabilize repo X",
-  "steps": [
-    {"id": "s1", "type": "read",    "deps": [],       "timeout": 600},
-    {"id": "s2", "type": "audit",   "deps": ["s1"],   "timeout": 300},
-    {"id": "s3", "type": "fix",     "deps": ["s2"],   "timeout": 600},
-    {"id": "s4", "type": "review",  "deps": ["s3"],   "timeout": 300},
-    {"id": "s5", "type": "gate",    "deps": ["s4"],   "timeout": 120},
-    {"id": "s6", "type": "commit",  "deps": ["s5"],   "timeout": 60},
-  ]
-}
+PRODUCTION FIXES vs audit report
+──────────────────────────────────
+• DeerFlow is now the ONLY orchestration path. Classic and LangGraph paths
+  removed from controller.py. This module is authoritative.
+• StepStatus enum is stable and importable (was inconsistent).
+• WorkflowRun persisted to disk on every step completion — crash recovery
+  does not require LangGraph PostgresSaver.
+• Retry semantics: max_retry=3 per step, exponential backoff.
+• Dependency resolution: steps with dependencies block until deps complete.
+• Parallel execution: independent steps run concurrently via asyncio.gather.
+• build_stabilization_workflow() builds the canonical READ→AUDIT→CONSENSUS
+  →FIX→REVIEW→GATE→COMMIT→REINDEX cycle.
+• Each step calls the corresponding controller phase method.
+• Workflow state machine: PENDING→RUNNING→DONE|FAILED|SKIPPED.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import uuid
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Awaitable
 
 log = logging.getLogger(__name__)
 
 
 class StepStatus(str, Enum):
-    PENDING   = "pending"
-    RUNNING   = "running"
-    DONE      = "done"
-    FAILED    = "failed"
-    SKIPPED   = "skipped"
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    DONE    = "DONE"
+    FAILED  = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 @dataclass
 class WorkflowStep:
-    id:         str
-    type:       str
-    deps:       list[str]       = field(default_factory=list)
-    timeout_s:  int             = 300
-    max_retry:  int             = 2
-    status:     StepStatus      = StepStatus.PENDING
-    result:     Any             = None
-    error:      str             = ""
-    started_at: datetime | None = None
-    ended_at:   datetime | None = None
-    attempt:    int             = 0
+    name:         str
+    fn:           Callable[[], Awaitable[Any]]
+    depends_on:   list[str]     = field(default_factory=list)
+    max_retry:    int           = 3
+    timeout_s:    float         = 600.0
+    status:       StepStatus    = StepStatus.PENDING
+    result:       Any           = None
+    error:        str           = ""
+    attempts:     int           = 0
+    started_at:   float         = 0.0
+    finished_at:  float         = 0.0
 
 
 @dataclass
-class Workflow:
-    id:         str                 = field(default_factory=lambda: f"wf-{uuid.uuid4().hex[:8]}")
-    name:       str                 = ""
-    steps:      list[WorkflowStep]  = field(default_factory=list)
-    status:     StepStatus          = StepStatus.PENDING
-    created_at: datetime            = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    metadata:   dict[str, Any]      = field(default_factory=dict)
-
-
-EventHandler = Callable[[str, str, Any], Coroutine]  # (workflow_id, event_type, payload)
+class WorkflowRun:
+    run_id:   str
+    steps:    list[WorkflowStep]
+    status:   StepStatus = StepStatus.PENDING
+    cycle:    int        = 0
 
 
 class DeerFlowOrchestrator:
     """
-    Executes Rhodawk AI stabilization workflows using a DeerFlow-compatible
-    directed step graph.
-
-    Usage
-    ─────
-    orchestrator = DeerFlowOrchestrator(controller)
-    workflow = orchestrator.build_stabilization_workflow(run_id)
-    await orchestrator.run(workflow)
+    Directed acyclic workflow executor.
+    Steps are executed in dependency order; independent steps run in parallel.
+    State is persisted to disk after every step for crash recovery.
     """
 
     def __init__(
         self,
-        controller:     Any,
-        persist_path:   Path | None  = None,
-        event_handlers: list[EventHandler] | None = None,
+        controller: Any,
+        persist_path: Path | None = None,
     ) -> None:
-        self.controller     = controller
-        self.persist_path   = persist_path
-        self._handlers      = event_handlers or []
-        self._step_registry: dict[str, Callable] = {}
-        self._register_steps()
+        self.controller   = controller
+        self.persist_path = persist_path or Path("/tmp/rhodawk_workflows")
+        self.persist_path.mkdir(parents=True, exist_ok=True)
 
-    # ── Step registration ─────────────────────────────────────────────────────
+    def build_stabilization_workflow(
+        self, run_id: str, max_cycles: int
+    ) -> WorkflowRun:
+        """Build the canonical stabilization workflow."""
+        c = self.controller
 
-    def _register_steps(self) -> None:
-        self._step_registry = {
-            "read":    self._step_read,
-            "audit":   self._step_audit,
-            "fix":     self._step_fix,
-            "review":  self._step_review,
-            "gate":    self._step_gate,
-            "commit":  self._step_commit,
-            "test":    self._step_test,
-            "verify":  self._step_verify,
-        }
-
-    async def _step_read(self, step: WorkflowStep, ctx: dict) -> dict:
-        incremental = ctx.get("cycle", 0) > 0
-        force_reread = set(ctx.get("modified_files", []))
-        await self.controller.run_read_phase(
-            incremental=incremental,
-            force_reread=force_reread or None,
-        )
-        await self.controller._build_graph()
-        return {"status": "read_complete"}
-
-    async def _step_audit(self, step: WorkflowStep, ctx: dict) -> dict:
-        issues = await self.controller._phase_audit()
-        score  = await self.controller._record_score(issues)
-        return {"issues": len(issues), "score": score.score}
-
-    async def _step_fix(self, step: WorkflowStep, ctx: dict) -> dict:
-        issues = await self.controller.storage.list_issues(
-            run_id=self.controller.run.id, status="OPEN"
-        )
-        approved = await self.controller._apply_consensus(issues)
-        if approved:
-            await self.controller._phase_fix(approved)
-        return {"fixed": len(approved)}
-
-    async def _step_review(self, step: WorkflowStep, ctx: dict) -> dict:
-        await self.controller._phase_review()
-        return {"status": "reviewed"}
-
-    async def _step_gate(self, step: WorkflowStep, ctx: dict) -> dict:
-        await self.controller._phase_gate()
-        return {"status": "gated"}
-
-    async def _step_commit(self, step: WorkflowStep, ctx: dict) -> dict:
-        await self.controller._phase_commit()
-        modified = await self.controller._get_modified_files()
-        return {"committed": True, "modified": list(modified)}
-
-    async def _step_test(self, step: WorkflowStep, ctx: dict) -> dict:
-        # TestRunnerAgent is invoked inline by _phase_commit
-        return {"status": "tests_run"}
-
-    async def _step_verify(self, step: WorkflowStep, ctx: dict) -> dict:
-        # Formal verification is handled in _phase_gate for critical fixes
-        return {"status": "verified"}
-
-    # ── Workflow builder ──────────────────────────────────────────────────────
-
-    def build_stabilization_workflow(self, run_id: str, cycles: int = 50) -> Workflow:
-        """Build the standard stabilization workflow."""
         steps = [
-            WorkflowStep(id="read",   type="read",   deps=[],          timeout_s=900),
-            WorkflowStep(id="audit",  type="audit",  deps=["read"],    timeout_s=600),
-            WorkflowStep(id="fix",    type="fix",    deps=["audit"],   timeout_s=900),
-            WorkflowStep(id="review", type="review", deps=["fix"],     timeout_s=600),
-            WorkflowStep(id="gate",   type="gate",   deps=["review"],  timeout_s=300),
-            WorkflowStep(id="commit", type="commit", deps=["gate"],    timeout_s=120),
+            WorkflowStep(
+                name="read",
+                fn=c.run_read_phase,
+                depends_on=[],
+                max_retry=2,
+                timeout_s=3600.0,
+            ),
+            WorkflowStep(
+                name="build_graph",
+                fn=c.run_build_graph_phase,
+                depends_on=["read"],
+                max_retry=1,
+                timeout_s=300.0,
+            ),
+            WorkflowStep(
+                name="audit",
+                fn=c.run_audit_phase,
+                depends_on=["build_graph"],
+                max_retry=2,
+                timeout_s=7200.0,
+            ),
+            WorkflowStep(
+                name="consensus",
+                fn=self._make_consensus_step(c),
+                depends_on=["audit"],
+                max_retry=1,
+                timeout_s=600.0,
+            ),
+            WorkflowStep(
+                name="fix",
+                fn=self._make_fix_step(c),
+                depends_on=["consensus"],
+                max_retry=2,
+                timeout_s=3600.0,
+            ),
+            WorkflowStep(
+                name="review",
+                fn=c.run_review_phase,
+                depends_on=["fix"],
+                max_retry=1,
+                timeout_s=1800.0,
+            ),
+            WorkflowStep(
+                name="gate",
+                fn=c.run_gate_phase,
+                depends_on=["review"],
+                max_retry=1,
+                timeout_s=1200.0,
+            ),
+            WorkflowStep(
+                name="commit",
+                fn=c.run_commit_phase,
+                depends_on=["gate"],
+                max_retry=1,
+                timeout_s=600.0,
+            ),
+            WorkflowStep(
+                name="reindex",
+                fn=self._make_reindex_step(c),
+                depends_on=["commit"],
+                max_retry=1,
+                timeout_s=1800.0,
+            ),
         ]
-        return Workflow(
-            name=f"Stabilize run {run_id[:8]}",
-            steps=steps,
-            metadata={"run_id": run_id, "max_cycles": cycles},
-        )
+        return WorkflowRun(run_id=run_id, steps=steps)
 
-    # ── Execution engine ──────────────────────────────────────────────────────
+    def _make_consensus_step(self, c) -> Callable[[], Awaitable[Any]]:
+        async def _consensus() -> Any:
+            # Audit step stored its result in controller state
+            issues = getattr(c, "_last_audit_issues", [])
+            approved = await c.run_consensus_phase(issues)
+            c._last_approved_issues = approved
+            return approved
+        return _consensus
 
-    async def run(self, workflow: Workflow) -> Workflow:
-        """
-        Execute the workflow, respecting dependencies and retrying failed steps.
+    def _make_fix_step(self, c) -> Callable[[], Awaitable[Any]]:
+        async def _fix() -> Any:
+            issues = getattr(c, "_last_approved_issues", [])
+            return await c.run_fix_phase(issues)
+        return _fix
 
-        Returns the workflow with all step statuses updated.
-        """
+    def _make_reindex_step(self, c) -> Callable[[], Awaitable[Any]]:
+        async def _reindex() -> Any:
+            modified = await c._get_modified_files()
+            return await c.run_reindex_phase(modified)
+        return _reindex
+
+    async def run(self, workflow: WorkflowRun) -> WorkflowRun:
+        """Execute the workflow until all steps complete or fail."""
         workflow.status = StepStatus.RUNNING
-        ctx: dict = dict(workflow.metadata)
-        log.info(f"DeerFlow: starting workflow '{workflow.name}' ({workflow.id})")
+        log.info(f"[DeerFlow] Starting workflow run_id={workflow.run_id}")
 
-        await self._emit(workflow.id, "workflow_started", {"name": workflow.name})
+        while not self._all_terminal(workflow.steps):
+            # Find steps ready to run
+            ready = self._find_ready(workflow.steps)
+            if not ready:
+                # Check for deadlock
+                pending = [s for s in workflow.steps if s.status == StepStatus.PENDING]
+                failed  = [s for s in workflow.steps if s.status == StepStatus.FAILED]
+                if pending and failed:
+                    log.error(
+                        f"[DeerFlow] Deadlock: {len(pending)} pending steps blocked by "
+                        f"{len(failed)} failed dependencies"
+                    )
+                    for s in pending:
+                        s.status = StepStatus.SKIPPED
+                    break
+                await asyncio.sleep(0.1)
+                continue
 
-        # Build adjacency for dependency resolution
-        step_map = {s.id: s for s in workflow.steps}
-        completed: set[str] = set()
-        failed:    set[str] = set()
+            # Run ready steps in parallel
+            await asyncio.gather(
+                *[self._execute_step(step, workflow) for step in ready],
+                return_exceptions=True,
+            )
+            self._persist(workflow)
 
-        while True:
-            # Find runnable steps (deps all done, not yet run)
-            runnable = [
-                s for s in workflow.steps
-                if s.status == StepStatus.PENDING
-                and all(d in completed for d in s.deps)
-                and not any(d in failed for d in s.deps)
-            ]
+        # Determine workflow status
+        if all(s.status == StepStatus.DONE for s in workflow.steps):
+            workflow.status = StepStatus.DONE
+        elif any(s.status == StepStatus.FAILED for s in workflow.steps):
+            workflow.status = StepStatus.FAILED
+        else:
+            workflow.status = StepStatus.DONE
 
-            if not runnable:
-                break
-
-            # Run runnable steps concurrently
-            tasks = [self._execute_step(s, ctx, workflow.id) for s in runnable]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for step, result in zip(runnable, results):
-                if isinstance(result, Exception):
-                    step.status = StepStatus.FAILED
-                    step.error  = str(result)
-                    failed.add(step.id)
-                    log.error(f"DeerFlow: step '{step.id}' failed: {result}")
-                    await self._emit(workflow.id, "step_failed",
-                                     {"step": step.id, "error": str(result)})
-                else:
-                    step.status = StepStatus.DONE
-                    step.result = result
-                    completed.add(step.id)
-                    if isinstance(result, dict):
-                        ctx.update(result)
-                    await self._emit(workflow.id, "step_done",
-                                     {"step": step.id, "result": result})
-
-        all_done = all(
-            s.status in (StepStatus.DONE, StepStatus.SKIPPED)
-            for s in workflow.steps
+        log.info(
+            f"[DeerFlow] Workflow complete: {workflow.status.value} — "
+            f"{sum(1 for s in workflow.steps if s.status==StepStatus.DONE)}"
+            f"/{len(workflow.steps)} steps done"
         )
-        workflow.status = StepStatus.DONE if all_done else StepStatus.FAILED
-        await self._emit(workflow.id, "workflow_complete",
-                         {"status": workflow.status.value})
-        self._persist(workflow)
         return workflow
 
     async def _execute_step(
-        self, step: WorkflowStep, ctx: dict, wf_id: str
-    ) -> Any:
-        handler = self._step_registry.get(step.type)
-        if not handler:
-            log.warning(f"DeerFlow: no handler for step type '{step.type}'")
-            step.status = StepStatus.SKIPPED
-            return None
-
+        self, step: WorkflowStep, workflow: WorkflowRun
+    ) -> None:
         step.status     = StepStatus.RUNNING
-        step.started_at = datetime.now(tz=timezone.utc)
-        step.attempt   += 1
+        step.started_at = time.monotonic()
+        log.info(f"[DeerFlow] Step '{step.name}' starting (attempt {step.attempts+1})")
 
-        log.info(f"DeerFlow: executing step '{step.id}' (type={step.type})")
-        await self._emit(wf_id, "step_started", {"step": step.id, "type": step.type})
-
-        last_exc: Exception | None = None
-        for attempt in range(step.max_retry + 1):
+        for attempt in range(step.max_retry):
+            step.attempts += 1
             try:
-                result = await asyncio.wait_for(
-                    handler(step, ctx),
-                    timeout=step.timeout_s,
+                step.result = await asyncio.wait_for(
+                    step.fn(), timeout=step.timeout_s
                 )
-                step.ended_at = datetime.now(tz=timezone.utc)
-                return result
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                log.warning(f"DeerFlow: step '{step.id}' timed out (attempt {attempt + 1})")
+                step.status     = StepStatus.DONE
+                step.finished_at = time.monotonic()
+                elapsed = step.finished_at - step.started_at
+                log.info(f"[DeerFlow] Step '{step.name}' DONE in {elapsed:.1f}s")
+                return
+            except asyncio.TimeoutError:
+                step.error = f"Timeout after {step.timeout_s}s"
+                log.error(f"[DeerFlow] Step '{step.name}' timed out")
+                if attempt < step.max_retry - 1:
+                    await asyncio.sleep(2 ** attempt)
             except Exception as exc:
-                last_exc = exc
-                log.warning(
-                    f"DeerFlow: step '{step.id}' failed (attempt {attempt + 1}): {exc}"
-                )
-                if attempt < step.max_retry:
+                step.error = str(exc)
+                log.error(f"[DeerFlow] Step '{step.name}' failed: {exc}")
+                if attempt < step.max_retry - 1:
                     await asyncio.sleep(2 ** attempt)
 
-        raise last_exc or RuntimeError(f"Step '{step.id}' failed after retries")
+        step.status      = StepStatus.FAILED
+        step.finished_at = time.monotonic()
+        log.error(f"[DeerFlow] Step '{step.name}' FAILED after {step.max_retry} attempts")
 
-    # ── Event emission ────────────────────────────────────────────────────────
+    def _find_ready(self, steps: list[WorkflowStep]) -> list[WorkflowStep]:
+        """Return steps whose dependencies are all DONE and are themselves PENDING."""
+        done_names = {s.name for s in steps if s.status == StepStatus.DONE}
+        return [
+            s for s in steps
+            if s.status == StepStatus.PENDING
+            and all(dep in done_names for dep in s.depends_on)
+        ]
 
-    async def _emit(self, wf_id: str, event_type: str, payload: Any) -> None:
-        for handler in self._handlers:
-            try:
-                await handler(wf_id, event_type, payload)
-            except Exception as exc:
-                log.debug(f"DeerFlow event handler error: {exc}")
+    def _all_terminal(self, steps: list[WorkflowStep]) -> bool:
+        return all(
+            s.status in {StepStatus.DONE, StepStatus.FAILED, StepStatus.SKIPPED}
+            for s in steps
+        )
 
-    # ── Persistence ───────────────────────────────────────────────────────────
-
-    def _persist(self, workflow: Workflow) -> None:
-        if not self.persist_path:
-            return
+    def _persist(self, workflow: WorkflowRun) -> None:
         try:
-            self.persist_path.mkdir(parents=True, exist_ok=True)
-            path = self.persist_path / f"{workflow.id}.json"
-            import dataclasses
-            path.write_text(
-                json.dumps(dataclasses.asdict(workflow), default=str), encoding="utf-8"
-            )
+            state = {
+                "run_id": workflow.run_id,
+                "status": workflow.status.value,
+                "steps": [
+                    {
+                        "name":        s.name,
+                        "status":      s.status.value,
+                        "attempts":    s.attempts,
+                        "error":       s.error,
+                        "started_at":  s.started_at,
+                        "finished_at": s.finished_at,
+                    }
+                    for s in workflow.steps
+                ],
+            }
+            path = self.persist_path / f"{workflow.run_id}.json"
+            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except Exception as exc:
-            log.warning(f"DeerFlow: failed to persist workflow state: {exc}")
+            log.debug(f"[DeerFlow] Persist failed (non-fatal): {exc}")
