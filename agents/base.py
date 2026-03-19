@@ -36,20 +36,27 @@ log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 # ── Cost map (per 1K tokens: [input_rate, output_rate]) ──────────────────────
+# FIX: removed phantom model identifiers:
+#   "ollama/granite4-small" / "ollama/granite4-tiny" — not valid Ollama tags
+#   "openrouter/mistralai/devstral-2" — devstral-2 unverified; use devstral-small
+# Replaced with real, available model tags.
 _COST_MAP: dict[str, tuple[float, float]] = {
-    "claude-opus-4-20250514":       (0.015,    0.075),
-    "claude-sonnet-4-20250514":     (0.003,    0.015),
-    "claude-haiku-4-5-20251001":    (0.00025,  0.00125),
-    "gpt-4o":                       (0.005,    0.015),
-    "gpt-4o-mini":                  (0.00015,  0.0006),
-    "deepseek-chat":                (0.00014,  0.00028),
-    "gemini/gemini-1.5-pro":        (0.0035,   0.0105),
-    "ollama/qwen2.5-coder:32b":     (0.0,      0.0),
-    "ollama/granite4-small":        (0.0,      0.0),
-    "ollama/granite4-tiny":         (0.0,      0.0),
-    "ollama/llama3.3:70b":          (0.0,      0.0),
-    "openrouter/meta-llama/llama-4":(0.0002,   0.0008),
-    "openrouter/mistralai/devstral-2": (0.0002, 0.0006),
+    "claude-opus-4-6":                            (0.015,    0.075),
+    "claude-sonnet-4-6":                          (0.003,    0.015),
+    "claude-haiku-4-5-20251001":                  (0.00025,  0.00125),
+    "gpt-4o":                                     (0.005,    0.015),
+    "gpt-4o-mini":                                (0.00015,  0.0006),
+    "deepseek-chat":                              (0.00014,  0.00028),
+    "gemini/gemini-1.5-pro":                      (0.0035,   0.0105),
+    "ollama/qwen2.5-coder:32b":                   (0.0,      0.0),
+    "ollama/granite-code:8b":                     (0.0,      0.0),   # real Ollama tag
+    "ollama/granite-code:3b":                     (0.0,      0.0),   # real Ollama tag
+    "ollama/deepseek-coder-v2:16b":               (0.0,      0.0),
+    "ollama/llama3.3:70b":                        (0.0,      0.0),
+    "openrouter/meta-llama/llama-4-scout":        (0.00018,  0.00090),
+    "openrouter/mistralai/devstral-small":        (0.0002,   0.0006),
+    "openrouter/deepseek/deepseek-coder-v2-0724": (0.00014,  0.00028),
+    "openrouter/openai/o3":                       (0.005,    0.020),
 }
 
 DEFAULT_MAX_RETRIES  = 3
@@ -77,7 +84,7 @@ class AgentConfig(BaseModel):
     Unified configuration passed to every agent.
     Carries both fixer and reviewer model identities for independence tracking.
     """
-    model:               str       = "claude-sonnet-4-20250514"
+    model:               str       = "claude-sonnet-4-6"
     fallback_models:     list[str] = Field(default_factory=lambda: [
         "gpt-4o-mini", "ollama/qwen2.5-coder:32b"
     ])
@@ -86,8 +93,8 @@ class AgentConfig(BaseModel):
     max_retries:         int       = DEFAULT_MAX_RETRIES
     timeout_s:           int       = DEFAULT_TIMEOUT_S
     cost_ceiling_usd:    float     = 50.0
-    triage_model:        str       = "ollama/granite4-tiny"
-    critical_fix_model:  str       = "openrouter/meta-llama/llama-4"
+    triage_model:        str       = "ollama/granite-code:3b"    # FIX: real Ollama tag
+    critical_fix_model:  str       = "openrouter/meta-llama/llama-4-scout"
     reviewer_model:      str       = "ollama/qwen2.5-coder:32b"
     reviewer_model_family: str     = "alibaba"
     run_id:              str       = ""
