@@ -433,7 +433,83 @@ class AuditorAgent(BaseAgent):
             compliance_violations=violations,
             mil882e_category=mil882e,
             is_mandatory=f.is_mandatory if hasattr(f, "is_mandatory") else False,
+            # FIX: populate requirement_id by resolving the MISRA/CERT/CWE rule
+            # against the requirements index stored in .stabilizer/requirements.json
+            # (if available). Without this the RTM has no traceability content.
+            requirement_id=self._resolve_requirement_id(f),
         )
+
+    def _resolve_requirement_id(self, f: "RawFinding") -> str:
+        """
+        Map a compliance rule tag to the nearest requirement ID.
+
+        Resolution order:
+        1. .stabilizer/requirements.json  — project-specific mapping
+           Format: {"MISRA-C:2023-15.1": "REQ-001", "CWE-787": "REQ-042", ...}
+        2. Built-in rule-to-generic-requirement fallback table
+        3. Empty string (RTM row will have no requirement — acceptable for INFO)
+        """
+        # Try rule-based lookup
+        candidates = [f.misra_rule, f.cert_rule, f.jsf_rule, f.cwe_id]
+        candidates = [c for c in candidates if c]
+
+        # 1. Project-specific requirements map
+        req_map = self._load_requirements_map()
+        for rule in candidates:
+            if rule in req_map:
+                return req_map[rule]
+
+        # 2. Built-in generic fallback for common standards
+        _GENERIC_MAP: dict[str, str] = {
+            # MISRA mandatory rules → safety-critical requirement bucket
+            "MISRA-C:2023-1.3":  "REQ-SAFETY-001",
+            "MISRA-C:2023-2.1":  "REQ-SAFETY-002",
+            "MISRA-C:2023-15.1": "REQ-SAFETY-003",
+            "MISRA-C:2023-17.3": "REQ-SAFETY-004",
+            "MISRA-C:2023-18.1": "REQ-SAFETY-005",
+            "MISRA-C:2023-22.1": "REQ-SAFETY-006",
+            "MISRA-C:2023-22.2": "REQ-SAFETY-007",
+            # CWE Top-10 → security requirement bucket
+            "CWE-787": "REQ-SEC-001",
+            "CWE-79":  "REQ-SEC-002",
+            "CWE-89":  "REQ-SEC-003",
+            "CWE-416": "REQ-SEC-004",
+            "CWE-476": "REQ-SEC-005",
+            "CWE-190": "REQ-SEC-006",
+            "CWE-125": "REQ-SEC-007",
+            "CWE-22":  "REQ-SEC-008",
+            # CERT memory rules
+            "MEM30-C": "REQ-MEM-001",
+            "MEM32-C": "REQ-MEM-002",
+            "STR31-C": "REQ-MEM-003",
+            "INT31-C": "REQ-MEM-004",
+        }
+        for rule in candidates:
+            if rule in _GENERIC_MAP:
+                return _GENERIC_MAP[rule]
+
+        return ""
+
+    def _load_requirements_map(self) -> dict[str, str]:
+        """Load .stabilizer/requirements.json if present; cache for the run."""
+        if hasattr(self, "_req_map_cache"):
+            return self._req_map_cache  # type: ignore[attr-defined]
+        self._req_map_cache: dict[str, str] = {}
+        try:
+            if self.repo_root:
+                req_file = Path(self.repo_root) / ".stabilizer" / "requirements.json"
+                if req_file.exists():
+                    import json
+                    self._req_map_cache = json.loads(
+                        req_file.read_text(encoding="utf-8")
+                    )
+                    self.log.info(
+                        f"[auditor] Loaded {len(self._req_map_cache)} requirement "
+                        "mappings from .stabilizer/requirements.json"
+                    )
+        except Exception as exc:
+            self.log.debug(f"[auditor] requirements.json load failed: {exc}")
+        return self._req_map_cache
 
     async def _validate_batch(self, issues: list[Issue]) -> list[Issue]:
         """

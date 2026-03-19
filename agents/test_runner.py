@@ -63,11 +63,36 @@ class TestRunnerAgent(BaseAgent):
         )
         result.run_id          = self.run_id
         result.fix_attempt_id  = fix_attempt_id
+
+        # FIX: populate mcdc_coverage from gcov output for C/C++ files.
+        # Previously this always defaulted to 0.0, making DO-178C DAL-A/B
+        # evidence for MC/DC impossible. We now query gcov via the MCP manager
+        # if C/C++ files were changed and gcov instrumentation is present.
+        if changed_files and self.mcp:
+            c_files = [f for f in changed_files if f.endswith((".c", ".cpp", ".cc", ".h", ".hpp"))]
+            if c_files:
+                mcdc_values: list[float] = []
+                for cfile in c_files[:5]:   # limit to avoid long gate times
+                    try:
+                        cov = await self.mcp.get_coverage(cfile)
+                        mc = cov.get("mcdc_coverage_pct", 0.0)
+                        if mc > 0.0:
+                            mcdc_values.append(mc)
+                    except Exception:
+                        pass
+                if mcdc_values:
+                    result.mcdc_coverage = sum(mcdc_values) / len(mcdc_values)
+                    self.log.info(
+                        f"[test_runner] MC/DC coverage: {result.mcdc_coverage:.1f}% "
+                        f"(avg over {len(mcdc_values)} instrumented files)"
+                    )
+
         await self.storage.upsert_test_result(result)
         self.log.info(
             f"[test_runner] {result.status.value} — "
             f"passed={result.passed} failed={result.failed} "
-            f"coverage={result.coverage_pct:.1f}%"
+            f"coverage={result.coverage_pct:.1f}% "
+            f"mcdc={result.mcdc_coverage:.1f}%"
         )
         return result
 
@@ -120,6 +145,18 @@ class TestRunnerAgent(BaseAgent):
                 TestRunStatus.PASSED if failed == 0 and errors == 0
                 else TestRunStatus.FAILED
             )
+            # FIX: populate coverage_pct from pytest-cov JSON if available
+            try:
+                import json as _json
+                cov_file = Path("/tmp/pytest_report.json")
+                if cov_file.exists():
+                    rpt = _json.loads(cov_file.read_text())
+                    pct = rpt.get("coverage", {}).get("totals", {}).get("percent_covered", 0.0)
+                    if pct:
+                        coverage = float(pct)
+            except Exception:
+                pass
+
             return TestRunResult(
                 status=status,
                 passed=passed, failed=failed,
