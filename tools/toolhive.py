@@ -17,12 +17,30 @@ _NETWORK_ONLY_TOOLS = {"semgrep", "cve_lookup", "sbom", "github"}
 
 
 class ToolHive:
+    """
+    ToolHive manages containerised analysis tools via Docker.
+
+    NOTE ON CONTAINER IMAGES:
+    The default image prefix ghcr.io/rhodawk is a placeholder — no public
+    images exist at that registry.  Override via RHODAWK_TOOLHIVE_REGISTRY
+    env-var to point at your private registry, or set image_prefix when
+    constructing ToolHive directly.  probe_available() returns False when
+    the image pull fails, so the callers fall back to local binaries
+    gracefully.  Never let a missing image registry abort the pipeline.
+    """
+
     def __init__(
         self,
-        image_prefix:  str  = "ghcr.io/rhodawk",
+        image_prefix:  str  = "",
         pin_images:    bool = False,
     ) -> None:
-        self.image_prefix = image_prefix
+        import os as _os
+        # Environment override so operators can supply their own registry
+        self.image_prefix = (
+            image_prefix
+            or _os.environ.get("RHODAWK_TOOLHIVE_REGISTRY", "")
+            or "ghcr.io/rhodawk"   # placeholder — override in production
+        )
         self.pin_images   = pin_images
         self._available_cache: dict[str, bool] = {}
 
