@@ -1,15 +1,13 @@
 """
 swarm/deerflow_orchestrator.py
 ===============================
-DeerFlow workflow orchestrator — sole execution path for Rhodawk AI.
+DeerFlow single-pass workflow executor — called per cycle by StabilizerController.
 
 PRODUCTION FIXES vs audit report
 ──────────────────────────────────
-• DeerFlow is now the ONLY orchestration path. Classic and LangGraph paths
-  removed from controller.py. This module is authoritative.
-• StepStatus enum is stable and importable (was inconsistent).
-• WorkflowRun persisted to disk on every step completion — crash recovery
-  does not require LangGraph PostgresSaver.
+• DeerFlow is the ONLY orchestration path. Classic and LangGraph paths removed.
+• StepStatus enum is stable and importable.
+• WorkflowRun persisted to disk on every step completion — crash recovery.
 • Retry semantics: max_retry=3 per step, exponential backoff.
 • Dependency resolution: steps with dependencies block until deps complete.
 • Parallel execution: independent steps run concurrently via asyncio.gather.
@@ -17,6 +15,18 @@ PRODUCTION FIXES vs audit report
   →FIX→REVIEW→GATE→COMMIT→REINDEX cycle.
 • Each step calls the corresponding controller phase method.
 • Workflow state machine: PENDING→RUNNING→DONE|FAILED|SKIPPED.
+
+NOTE ON MULTI-CYCLE LOOP:
+  This module executes ONE pass of the pipeline.  The outer convergence
+  loop (max_cycles, ConvergenceDetector) lives in
+  StabilizerController._run_deerflow() in orchestrator/controller.py.
+  DeerFlowOrchestrator.run() is called once per cycle by that loop.
+
+NOTE ON "PREFECT 3" CLAIM:
+  The cover-letter for this project incorrectly described this module as
+  "Prefect 3".  This is a bespoke async DAG — it has no Prefect dependency.
+  The implementation is intentionally self-contained to avoid the operational
+  overhead of a Prefect server in embedded/military deployments.
 """
 from __future__ import annotations
 
