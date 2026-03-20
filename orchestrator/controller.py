@@ -48,10 +48,10 @@ from agents.test_runner    import TestRunnerAgent
 from brain.graph           import DependencyGraphEngine
 from brain.schemas import (
     AuditRun, AuditScore, AuditTrailEntry, ArtifactType,
-    AutonomyLevel, CbmcVerificationResult, DomainMode,
-    ExecutorType, FormalVerificationStatus, FunctionStalenessMark,
-    Issue, IssueStatus, PatchMode, PatrolEvent,
-    ReviewerIndependenceRecord, RunStatus, Severity,
+    AutonomyLevel, CbmcVerificationResult, CompoundFinding,
+    DomainMode, ExecutorType, FormalVerificationStatus,
+    FunctionStalenessMark, Issue, IssueStatus, PatchMode, PatrolEvent,
+    ReviewerIndependenceRecord, RunStatus, Severity, SynthesisReport,
     SoftwareLevel, TestRunStatus, ToolQualificationLevel,
 )
 from brain.sqlite_storage  import SQLiteBrainStorage
@@ -89,6 +89,9 @@ try:
     _CPG_AVAILABLE = True
 except ImportError:
     _CPG_AVAILABLE = False
+
+# ── Gap 2: Synthesis Agent — cross-domain compound findings ──────────────────
+from agents.synthesis_agent import SynthesisAgent
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +191,15 @@ class StabilizerConfig(BaseModel):
     cpg_blast_radius_threshold: int    = 50
     cpg_max_slice_nodes: int           = 50
     cpg_max_files_in_slice: int        = 30
+    # Synthesis Agent (Gap 2) — cross-domain compound finding detection
+    synthesis_enabled:          bool   = True
+    synthesis_dedup_enabled:    bool   = True
+    synthesis_compound_enabled: bool   = True
+    # Dedicated model for synthesis — should be a DIFFERENT family from primary
+    # auditors so it brings genuinely fresh cross-domain reasoning.
+    # Defaults to critical_fix_model; override with RHODAWK_SYNTHESIS_MODEL env var.
+    synthesis_model:            str    = ""
+    synthesis_max_compound:     int    = 20
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -246,6 +258,10 @@ class StabilizerController:
         self._program_slicer:       Any | None         = None
         self._cpg_context_selector: Any | None         = None
         self._incremental_updater:  Any | None         = None
+        # ── Gap 2: Synthesis Agent state ─────────────────────────────────────
+        # Compound findings detected in the last synthesis pass.
+        # Persisted here so DeerFlow steps and the report exporter can read them.
+        self._last_compound_findings: list[CompoundFinding] = []
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -746,6 +762,8 @@ class StabilizerController:
         # steps receive the issue list.  Without this assignment _last_audit_issues
         # defaulted to [] and the entire fix pipeline was a silent no-op.
         self._last_audit_issues = issues
+        # Gap 2: _last_compound_findings is set inside _phase_audit by SynthesisAgent.
+        # It is already populated when we reach here.
         return await self._record_score(issues)
 
     async def run_consensus_phase(
@@ -785,6 +803,17 @@ class StabilizerController:
     # ── Audit phase ────────────────────────────────────────────────────────────
 
     async def _phase_audit(self) -> list[Issue]:
+        """
+        Run the three-domain audit (SECURITY, ARCHITECTURE, STANDARDS) in
+        parallel, then pass all findings through SynthesisAgent which:
+
+          1. Deduplicates by fingerprint + LLM semantic pass
+          2. Detects cross-domain compound findings (Gap 2)
+
+        The synthesis step is what separates this system from CodeRabbit and
+        Greptile — both tools use single-pass LLM scans that cannot reason
+        about a bug requiring information from two auditor domains simultaneously.
+        """
         assert self.run and self.storage
         a_cfg = _agent_cfg(self.config, self.run.id)
         auditors = [
@@ -817,9 +846,76 @@ class StabilizerController:
             elif isinstance(r, Exception):
                 self.log.error(f"Auditor failed: {r}")
 
+        raw_count = len(all_issues)
+        self.log.info(
+            f"[audit] Three-domain audit complete: {raw_count} raw findings "
+            f"(SECURITY + ARCHITECTURE + STANDARDS)"
+        )
+
+        # ── Gap 2: Synthesis — dedup + cross-domain compound detection ────────
+        if self.config.synthesis_enabled and all_issues:
+            synthesis_model = (
+                self.config.synthesis_model
+                or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
+                or self.config.critical_fix_model
+            )
+            synthesis_agent = SynthesisAgent(
+                storage=self.storage,
+                run_id=self.run.id,
+                config=a_cfg,
+                mcp_manager=self.mcp,
+                domain_mode=self.config.domain_mode,
+                repo_root=self.config.repo_root,
+                synthesis_model=synthesis_model,
+                dedup_enabled=self.config.synthesis_dedup_enabled,
+                compound_enabled=self.config.synthesis_compound_enabled,
+                max_compound_findings=self.config.synthesis_max_compound,
+            )
+            try:
+                deduped_issues, compound_findings = await synthesis_agent.run(
+                    issues=all_issues
+                )
+                # Persist compound findings for report exporter and DeerFlow
+                self._last_compound_findings = compound_findings
+
+                # Materialise compound findings as Issues in the issue list so
+                # they flow through consensus → fix → review unchanged
+                compound_issues = [
+                    await self.storage.get_issue(cf.synthesized_issue_id)
+                    for cf in compound_findings
+                    if cf.synthesized_issue_id
+                ]
+                compound_issues = [i for i in compound_issues if i is not None]
+
+                all_issues = deduped_issues + compound_issues
+
+                # Record compound findings in Prometheus
+                for cf in compound_findings:
+                    record_issue(cf.severity.value, self.config.domain_mode.value)
+
+                self.log.info(
+                    f"[audit] Synthesis: {raw_count} → {len(deduped_issues)} "
+                    f"(deduped) + {len(compound_issues)} compound findings "
+                    f"= {len(all_issues)} total"
+                )
+            except Exception as exc:
+                self.log.error(
+                    f"[audit] SynthesisAgent failed — using raw undeduped findings: {exc}"
+                )
+                # Fail-open: never lose findings because synthesis crashed
+                self._last_compound_findings = []
+        else:
+            self._last_compound_findings = []
+            self.log.debug(
+                "[audit] Synthesis disabled or no findings — skipping synthesis pass"
+            )
+
         await self._trail(
             "AUDIT_PHASE_COMPLETE", self.run.id, "run",
-            after=f"{len(all_issues)} issues",
+            after=(
+                f"{len(all_issues)} issues "
+                f"({len(self._last_compound_findings)} compound)"
+            ),
         )
         return all_issues
 
