@@ -648,6 +648,200 @@ class TestIncrementalCPGUpdater:
         assert "foo.py" in result.changed_files
 
 
+# ── BUG-2 regression: _parse_unified_diff must extract function names ─────────
+#
+# BUG-2 was the most critical silent failure in Gap 4: _parse_unified_diff only
+# matched file paths from "diff --git" header lines and never parsed the
+# "@@ -a,b +c,d @@ funcname" hunk-header context string.  The result was that
+# CommitDiff.changed_functions and CommitDiff.all_changed_functions were always
+# empty, so function-level staleness tracking never triggered.
+#
+# Every test below must stay green to prevent silent regression.
+
+class TestBugFix_BUG2_HunkExtraction:
+
+    def test_python_hunk_header_extracts_function_name(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/payment_service.py b/payment_service.py\n"
+            "index a1b2c3d..e4f5g6h 100644\n"
+            "--- a/payment_service.py\n"
+            "+++ b/payment_service.py\n"
+            "@@ -42,7 +42,8 @@ def process_payment(amount, user_id):\n"
+            "     if amount <= 0:\n"
+            "-        raise ValueError('bad amount')\n"
+            "+        raise ValueError(f'bad amount: {amount}')\n"
+            "     charge = amount * 1.02\n"
+            "     return charge\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert "payment_service.py" in result.changed_files
+        assert len(result.all_changed_functions) >= 1, (
+            "BUG-2 regression: all_changed_functions must not be empty for a diff "
+            "with hunk context — was always empty before the fix"
+        )
+        assert "process_payment" in result.all_changed_functions
+
+    def test_async_python_function_hunk_header(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/auth_middleware.py b/auth_middleware.py\n"
+            "--- a/auth_middleware.py\n"
+            "+++ b/auth_middleware.py\n"
+            "@@ -10,6 +10,7 @@ async def fetch_user(token):\n"
+            "-    return db.get(token)\n"
+            "+    user = db.get(token)\n"
+            "+    return user\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert "auth_middleware.py" in result.changed_files
+        assert "fetch_user" in result.all_changed_functions
+
+    def test_c_function_hunk_header(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/crypto.c b/crypto.c\n"
+            "--- a/crypto.c\n"
+            "+++ b/crypto.c\n"
+            "@@ -88,9 +88,10 @@ int verify_signature(const uint8_t *sig, size_t len)\n"
+            " {\n"
+            "-    if (!sig) return -1;\n"
+            "+    if (!sig || len == 0) return -1;\n"
+            "     return _check(sig, len);\n"
+            " }\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert "crypto.c" in result.changed_files
+        assert "verify_signature" in result.all_changed_functions
+
+    def test_rust_function_hunk_header(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/lib.rs b/lib.rs\n"
+            "--- a/lib.rs\n"
+            "+++ b/lib.rs\n"
+            "@@ -55,7 +55,8 @@ pub fn compute_blast_radius(nodes: &[Node]) -> usize {\n"
+            "-    nodes.len()\n"
+            "+    nodes.iter().filter(|n| n.active).count()\n"
+            " }\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert "lib.rs" in result.changed_files
+        assert "compute_blast_radius" in result.all_changed_functions
+
+    def test_multi_file_diff_extracts_all_functions(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/payment_service.py b/payment_service.py\n"
+            "--- a/payment_service.py\n"
+            "+++ b/payment_service.py\n"
+            "@@ -10,4 +10,5 @@ def process_payment(amount, user_id):\n"
+            "-    pass\n"
+            "+    return amount\n"
+            "\n"
+            "diff --git a/auth_middleware.py b/auth_middleware.py\n"
+            "--- a/auth_middleware.py\n"
+            "+++ b/auth_middleware.py\n"
+            "@@ -5,3 +5,4 @@ def verify_token(token):\n"
+            "-    return True\n"
+            "+    return bool(token)\n"
+            "\n"
+            "diff --git a/user_model.py b/user_model.py\n"
+            "--- a/user_model.py\n"
+            "+++ b/user_model.py\n"
+            "@@ -30,4 +30,5 @@ def get_user(user_id):\n"
+            "-    return None\n"
+            "+    return db.query(user_id)\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert set(result.changed_files) == {
+            "payment_service.py", "auth_middleware.py", "user_model.py",
+        }
+        assert "process_payment" in result.all_changed_functions
+        assert "verify_token"    in result.all_changed_functions
+        assert "get_user"        in result.all_changed_functions
+        assert "process_payment" in result.changed_functions.get("payment_service.py", [])
+        assert "verify_token"    in result.changed_functions.get("auth_middleware.py", [])
+        assert "get_user"        in result.changed_functions.get("user_model.py", [])
+
+    def test_diff_without_hunk_context_falls_back_to_body_scan(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/utils.py b/utils.py\n"
+            "--- a/utils.py\n"
+            "+++ b/utils.py\n"
+            "@@ -1,2 +1,5 @@\n"
+            " x = 1\n"
+            "+\n"
+            "+def new_helper(val):\n"
+            "+    return val * 2\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        assert "utils.py" in result.changed_files
+        assert "new_helper" in result.all_changed_functions, (
+            "body-scan fallback must detect +def lines when hunk context is absent"
+        )
+
+    def test_control_flow_keywords_are_never_function_names(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        diff_text = (
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -5,3 +5,4 @@ if condition:\n"
+            "-    pass\n"
+            "+    x = 1\n"
+        )
+        result = _parse_unified_diff(diff_text)
+        bad = {"if", "for", "while", "class", "return", "else", "switch"}
+        leaked = bad.intersection(result.all_changed_functions)
+        assert not leaked, f"control-flow keywords leaked: {leaked}"
+
+    def test_empty_diff_produces_empty_result(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        result = _parse_unified_diff("")
+        assert result.changed_files == []
+        assert result.all_changed_functions == []
+
+    def test_all_changed_functions_is_always_a_list(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        for payload in ["", "not a diff at all", "diff --git a/x b/x\n"]:
+            result = _parse_unified_diff(payload)
+            assert isinstance(result.all_changed_functions, list), (
+                f"all_changed_functions is not a list for: {payload!r}"
+            )
+
+    def test_hunk_context_with_and_without_context_string(self):
+        from cpg.incremental_updater import _parse_unified_diff
+        # No context string: body scan finds nothing (body edit, no new def line)
+        r1 = _parse_unified_diff(
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 42\n"
+        )
+        assert "foo.py" in r1.changed_files
+        assert isinstance(r1.all_changed_functions, list)
+
+        # With context string: function name must be extracted
+        r2 = _parse_unified_diff(
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1,3 +1,4 @@ def foo():\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 42\n"
+        )
+        assert "foo.py" in r2.changed_files
+        assert "foo" in r2.all_changed_functions, (
+            "function name must be extracted when hunk context string is present"
+        )
+
+
 # ── Context variable extraction tests ─────────────────────────────────────────
 
 class TestVariableExtraction:
