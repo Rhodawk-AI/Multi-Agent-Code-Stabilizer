@@ -80,6 +80,16 @@ from brain.hybrid_retriever     import HybridRetriever
 from context.repo_map           import get_repo_map
 from memory.fix_memory          import get_fix_memory
 
+# ── Gap 1: CPG-based causal context ──────────────────────────────────────────
+try:
+    from cpg.cpg_engine          import CPGEngine, get_cpg_engine
+    from cpg.program_slicer      import ProgramSlicer
+    from cpg.context_selector    import CPGContextSelector
+    from cpg.incremental_updater import IncrementalCPGUpdater
+    _CPG_AVAILABLE = True
+except ImportError:
+    _CPG_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
 # Files larger than this threshold use UNIFIED_DIFF mode (surgical patches)
@@ -98,16 +108,17 @@ class StabilizerConfig(BaseModel):
     repo_root:           Path
     master_prompt_path:  Path          = Path("config/prompts/base.md")
     github_token:        str           = ""
-    # Model routing
-    primary_model:       str           = "ollama/granite4-small"
+    # Model routing — Qwen2.5-Coder-32B via vLLM local; override with env RHODAWK_PRIMARY_MODEL
+    primary_model:       str           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
     critical_fix_model:  str           = "openrouter/meta-llama/llama-4"
     triage_model:        str           = "ollama/granite4-tiny"
-    reviewer_model:      str           = "ollama/qwen2.5-coder:32b"  # MUST differ from primary
+    reviewer_model:      str           = "ollama/qwen2.5-coder:32b"
     fallback_models:     list[str]     = Field(default_factory=lambda: [
         "ollama/qwen2.5-coder:32b",
         "openrouter/mistralai/devstral-2",
         "claude-sonnet-4-20250514",
     ])
+    vllm_base_url:       str           = "http://localhost:8000/v1"
     # Run limits
     max_cycles:          int           = 50
     cost_ceiling_usd:    float         = 50.0
@@ -125,14 +136,14 @@ class StabilizerConfig(BaseModel):
     run_mypy:            bool          = True
     run_bandit:          bool          = True
     run_ruff:            bool          = True
-    run_clang_tidy:      bool          = True   # C/C++ gate
-    run_cppcheck:        bool          = True   # C/C++ secondary gate
-    run_cbmc:            bool          = False  # Bounded model checking (slow)
+    run_clang_tidy:      bool          = True
+    run_cppcheck:        bool          = True
+    run_cbmc:            bool          = False
     formal_verification: bool          = False
     run_tests_after_fix: bool          = True
     # Storage
-    use_sqlite:          bool          = False   # True = dev mode only
-    postgres_dsn:        str           = ""      # Falls back to env RHODAWK_PG_DSN
+    use_sqlite:          bool          = False
+    postgres_dsn:        str           = ""
     # Vector store
     vector_store_enabled: bool         = False
     qdrant_url:          str           = "http://localhost:6333"
@@ -147,19 +158,14 @@ class StabilizerConfig(BaseModel):
     base_branch:         str           = "main"
     branch_prefix:       str           = "stabilizer"
     # Escalation
-    api_base_url:        str           = ""      # For approval links in notifications
+    api_base_url:        str           = ""
     escalation_timeout_h: float        = 24.0
     # Orchestration
-    use_deerflow:        bool          = True    # Always True in production
+    use_deerflow:        bool          = True
     # Compliance
     misra_enabled:       bool          = True
     cert_enabled:        bool          = True
-    jsf_enabled:         bool          = False   # JSF++ — only when explicitly needed
-
-    # ── Antagonist additions ─────────────────────────────────────────────────
-    # Model
-    primary_model:       str           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
-    vllm_base_url:       str           = "http://localhost:8000/v1"
+    jsf_enabled:         bool          = False
     # Repo-map
     repo_map_enabled:    bool          = True
     repo_map_max_tokens: int           = 2048
@@ -170,10 +176,18 @@ class StabilizerConfig(BaseModel):
     pynguin_timeout_s:   int           = 60
     use_hypothesis:      bool          = True
     # Mutation testing
-    mutation_testing_enabled: bool     = False   # opt-in; slow
-    mutation_score_threshold: float | None = None  # None = domain default
-    # Fix memory (Algorithm Distillation)
+    mutation_testing_enabled: bool     = False
+    mutation_score_threshold: float | None = None
+    # Fix memory
     fix_memory_enabled:  bool          = True
+    # CPG (Gap 1)
+    cpg_enabled:         bool          = True
+    joern_url:           str           = "http://localhost:8080"
+    joern_repo_path:     str           = ""
+    joern_project_name:  str           = "rhodawk"
+    cpg_blast_radius_threshold: int    = 50
+    cpg_max_slice_nodes: int           = 50
+    cpg_max_files_in_slice: int        = 30
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -227,6 +241,11 @@ class StabilizerController:
         self._hybrid_retriever: HybridRetriever | None = None
         self._repo_map:         Any | None             = None
         self._fix_memory:       Any | None             = None
+        # ── Gap 1: CPG subsystems ─────────────────────────────────────────────
+        self._cpg_engine:           Any | None         = None
+        self._program_slicer:       Any | None         = None
+        self._cpg_context_selector: Any | None         = None
+        self._incremental_updater:  Any | None         = None
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -443,12 +462,111 @@ class StabilizerController:
         except Exception as exc:
             self.log.debug(f"vLLM LiteLLM config: {exc}")
 
+        # 5. Gap 1: CPG engine (Joern Code Property Graph)
+        await self._init_cpg()
+
         self.log.info(
             f"Antagonist subsystems: "
             f"hybrid_retriever={self._hybrid_retriever is not None} "
             f"repo_map={self._repo_map is not None} "
-            f"fix_memory={self._fix_memory is not None}"
+            f"fix_memory={self._fix_memory is not None} "
+            f"cpg_engine={self._cpg_engine is not None and getattr(self._cpg_engine, 'is_available', False)}"
         )
+
+    async def _init_cpg(self) -> None:
+        """
+        Gap 1: Initialise the CPG subsystem (Joern + ProgramSlicer + ContextSelector).
+
+        All failures are non-fatal — the core pipeline continues without CPG,
+        falling back to the existing hybrid BM25+dense retrieval path.
+
+        Wiring:
+          CPGEngine           — connects to Joern, imports codebase
+          ProgramSlicer       — computes backward/forward slices
+          CPGContextSelector  — selects causally relevant context for FixerAgent
+          IncrementalUpdater  — updates CPG after commits (Gap 4 integration)
+        """
+        if not self.config.cpg_enabled or not _CPG_AVAILABLE:
+            self.log.info(
+                "CPG disabled (cpg_enabled=False or cpg module not installed). "
+                "Context selection will use hybrid BM25+dense retrieval."
+            )
+            return
+
+        try:
+            # Resolve Joern URL from env or config
+            import os
+            joern_url = (
+                os.environ.get("JOERN_URL", "")
+                or self.config.joern_url
+                or "http://localhost:8080"
+            )
+            joern_repo_path = (
+                os.environ.get("JOERN_REPO_PATH", "")
+                or self.config.joern_repo_path
+                or str(self.config.repo_root)
+            )
+
+            self._cpg_engine = get_cpg_engine(
+                joern_url=joern_url,
+                graph_engine=self.graph_engine,
+                blast_radius_threshold=self.config.cpg_blast_radius_threshold,
+            )
+
+            # Non-blocking init — returns False if Joern not running
+            connected = await self._cpg_engine.initialise(
+                repo_path=joern_repo_path,
+                project_name=self.config.joern_project_name,
+            )
+
+            if connected:
+                self.log.info(
+                    f"CPGEngine: Joern connected at {joern_url} — "
+                    f"CPG analysis enabled (blast_radius_threshold="
+                    f"{self.config.cpg_blast_radius_threshold})"
+                )
+            else:
+                self.log.info(
+                    "CPGEngine: Joern not available — "
+                    "falling back to networkx import graph for context selection. "
+                    "To enable full CPG: docker-compose up joern"
+                )
+
+            # ProgramSlicer wraps CPGEngine with LLM-friendly output
+            self._program_slicer = ProgramSlicer(
+                cpg_engine=self._cpg_engine,
+                max_slice_nodes=self.config.cpg_max_slice_nodes,
+                max_files_in_slice=self.config.cpg_max_files_in_slice,
+            )
+
+            # CPGContextSelector: the Gap 1 context selection layer
+            # Replaces vector similarity for WHICH CODE TO LOAD
+            # (vector stays for PATTERN MATCHING / few-shot examples)
+            self._cpg_context_selector = CPGContextSelector(
+                cpg_engine=self._cpg_engine,
+                program_slicer=self._program_slicer,
+                repo_root=self.config.repo_root,
+                hybrid_retriever=self._hybrid_retriever,
+                vector_brain=self.vector_brain,
+            )
+
+            # IncrementalCPGUpdater: Gap 4 integration
+            # After each commit, computes the 50-200 function audit target set
+            self._incremental_updater = IncrementalCPGUpdater(
+                cpg_engine=self._cpg_engine,
+                repo_root=self.config.repo_root,
+                storage=self.storage,
+            )
+
+        except Exception as exc:
+            self.log.warning(
+                f"CPG subsystem init failed (non-fatal): {exc} — "
+                "continuing without CPG"
+            )
+            self._cpg_engine           = None
+            self._program_slicer       = None
+            self._cpg_context_selector = None
+            self._incremental_updater  = None
 
     # ── Main entry point ───────────────────────────────────────────────────────
 
@@ -605,6 +723,7 @@ class StabilizerController:
             vector_brain=self.vector_brain,
             hybrid_retriever=self._hybrid_retriever,
             repo_map=self._repo_map,
+            cpg_engine=self._cpg_engine,
         )
         await reader.run(force_reread=force_reread)
         await self._trail(
@@ -771,6 +890,10 @@ class StabilizerController:
             repo_map=self._repo_map,
             hybrid_retriever=self._hybrid_retriever,
             fix_memory=self._fix_memory,
+            # Gap 1: CPG causal context
+            cpg_engine=self._cpg_engine,
+            cpg_context_selector=self._cpg_context_selector,
+            program_slicer=self._program_slicer,
         )
         fixes = await fixer.run()
         for f in fixes:
@@ -928,6 +1051,7 @@ class StabilizerController:
             storage=self.storage,
             run_id=self.run.id,
             config=_agent_cfg(self.config, self.run.id),
+            cpg_engine=self._cpg_engine,
         )
         formal_agent = (
             FormalVerifierAgent(
@@ -1145,6 +1269,26 @@ class StabilizerController:
         }
         await self._requeue_stale_functions(committed)
         await self._requeue_transitive_dependents(committed)
+
+        # Gap 1/4: Incremental CPG update after commit
+        # Computes the 50–200 function audit target set for the next cycle.
+        # This is the Gap 4 fix: instead of re-auditing 10M lines, we audit
+        # only the functions in the CPG impact set of the changed functions.
+        if self._incremental_updater and committed:
+            try:
+                update_result = await self._incremental_updater.update_after_commit(
+                    changed_files=committed,
+                    run_id=self.run.id,
+                )
+                self.log.info(
+                    f"[CPG] Incremental update: "
+                    f"changed={update_result.total_functions_changed} fns, "
+                    f"impact={update_result.total_functions_affected} fns, "
+                    f"audit_targets={update_result.total_functions_to_audit} fns "
+                    f"(vs {sum(r.line_count for r in await self.storage.list_files())} total lines)"
+                )
+            except Exception as exc:
+                self.log.warning(f"[CPG] Incremental update failed (non-fatal): {exc}")
 
     def _module_for_fix(self, fix) -> str:
         paths = [ff.path for ff in fix.fixed_files]
@@ -1496,6 +1640,12 @@ class StabilizerController:
                 pass
         if self.vector_brain:
             self.vector_brain.close()
+        # Gap 1: Close Joern connection
+        if self._cpg_engine:
+            try:
+                await self._cpg_engine.close()
+            except Exception:
+                pass
         if self.storage:
             await self.storage.close()
         ACTIVE_RUNS.dec()
