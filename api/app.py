@@ -112,6 +112,8 @@ def create_app() -> FastAPI:
         # this router those proposals were unreachable from outside the process —
         # dashboards and human reviewers had no REST surface to query or act on them.
         ("api.routes.refactor_proposals", "router"),
+        # GAP 4: commit-granularity incremental audit endpoints
+        ("api.routes.commits",           "router"),
     ]:
         try:
             import importlib
