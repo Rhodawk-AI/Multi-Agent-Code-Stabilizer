@@ -530,6 +530,12 @@ class RefactorProposal(BaseModel):
     affected_file_count: int = 0
     test_files_affected: list[str] = Field(default_factory=list)
     blast_radius_score: float = 0.0
+    # Import-only blast radius: files that import a changed symbol without
+    # calling any changed function.  Broken by type/signature changes even
+    # though the call graph does not reach them.  Tracked separately so the
+    # human reviewer knows the full surface area, not just call-site count.
+    importing_modules: list[str] = Field(default_factory=list)
+    importing_module_count: int = 0
     affected_components: list[str] = Field(default_factory=list)
     proposed_refactoring: str = ''
     migration_steps: list[str] = Field(default_factory=list)

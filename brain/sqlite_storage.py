@@ -1371,6 +1371,8 @@ class SQLiteBrainStorage(BrainStorage):
                     affected_file_count INTEGER,
                     test_files_affected TEXT,
                     blast_radius_score REAL,
+                    importing_modules TEXT,
+                    importing_module_count INTEGER,
                     affected_components TEXT,
                     proposed_refactoring TEXT,
                     migration_steps TEXT,
@@ -1382,14 +1384,27 @@ class SQLiteBrainStorage(BrainStorage):
                     created_at TEXT
                 )
             """)
+            # ADD COLUMN is idempotent on SQLite when the column doesn't exist
+            # yet — needed for databases created before this migration.
+            for col, typedef in (
+                ("importing_modules",      "TEXT"),
+                ("importing_module_count", "INTEGER"),
+            ):
+                try:
+                    await db.execute(
+                        f"ALTER TABLE refactor_proposals ADD COLUMN {col} {typedef}"
+                    )
+                except Exception:
+                    pass  # column already exists
             await db.execute("""
                 INSERT OR REPLACE INTO refactor_proposals
                     (id, fix_attempt_id, run_id, issue_ids, changed_functions,
                      affected_function_count, affected_file_count, test_files_affected,
-                     blast_radius_score, affected_components, proposed_refactoring,
+                     blast_radius_score, importing_modules, importing_module_count,
+                     affected_components, proposed_refactoring,
                      migration_steps, estimated_scope, risks, recommendation,
                      escalation_id, requires_human_review, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 proposal.id, proposal.fix_attempt_id, proposal.run_id,
                 _json.dumps(proposal.issue_ids),
@@ -1398,6 +1413,8 @@ class SQLiteBrainStorage(BrainStorage):
                 proposal.affected_file_count,
                 _json.dumps(proposal.test_files_affected),
                 proposal.blast_radius_score,
+                _json.dumps(getattr(proposal, 'importing_modules', [])),
+                getattr(proposal, 'importing_module_count', 0),
                 _json.dumps(proposal.affected_components),
                 proposal.proposed_refactoring,
                 _json.dumps(proposal.migration_steps),
@@ -1449,6 +1466,10 @@ class SQLiteBrainStorage(BrainStorage):
             affected_file_count=row["affected_file_count"] or 0,
             test_files_affected=_json.loads(row["test_files_affected"] or "[]"),
             blast_radius_score=row["blast_radius_score"] or 0.0,
+            importing_modules=_json.loads(row["importing_modules"] or "[]")
+                if "importing_modules" in row.keys() else [],
+            importing_module_count=row["importing_module_count"] or 0
+                if "importing_module_count" in row.keys() else 0,
             affected_components=_json.loads(row["affected_components"] or "[]"),
             proposed_refactoring=row["proposed_refactoring"] or "",
             migration_steps=_json.loads(row["migration_steps"] or "[]"),
