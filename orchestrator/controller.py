@@ -1107,6 +1107,11 @@ class StabilizerController:
             cpg_engine=self._cpg_engine,
             cpg_context_selector=self._cpg_context_selector,
             program_slicer=self._program_slicer,
+            # Gap 3: forward impact gate — escalation_manager fires when blast
+            # radius exceeds threshold; blast_radius_threshold forwarded from
+            # config so it matches the CPGEngine and PlannerAgent thresholds.
+            escalation_manager=self._escalation_mgr,
+            blast_radius_threshold=self.config.cpg_blast_radius_threshold,
         )
         fixes = await fixer.run()
         for f in fixes:
@@ -1265,6 +1270,10 @@ class StabilizerController:
             run_id=self.run.id,
             config=_agent_cfg(self.config, self.run.id),
             cpg_engine=self._cpg_engine,
+            # Gap 3: blast radius hard-block in planner also triggers an
+            # escalation — without this the planner blocks the commit silently
+            # but no human is notified.
+            escalation_manager=self._escalation_mgr,
         )
         formal_agent = (
             FormalVerifierAgent(
