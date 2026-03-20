@@ -10,6 +10,8 @@ These tests cover:
   4. CPGContextSelector — context selection for FixerAgent
   5. IncrementalCPGUpdater — diff parsing and audit target computation
   6. Gap 1 integration — CPG context injection in FixerAgent
+  7. Type flow graph — callers that violate the type contract (Gap 1, third
+     graph type)
 
 All tests run without a live Joern server.  Joern-dependent paths are
 mocked; the fallback (networkx + vector) paths are tested against real data.
@@ -133,6 +135,14 @@ class TestJoernClient:
         result = await mock_joern_client.compute_impact_set(["process_payment"])
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_get_type_flows_to_callers_returns_empty_when_not_ready(
+        self, mock_joern_client
+    ):
+        """get_type_flows_to_callers must never raise even when Joern is down."""
+        result = await mock_joern_client.get_type_flows_to_callers("validate_session")
+        assert result == []
+
     def test_escape_helper(self):
         from cpg.joern_client import _esc
         assert _esc('test"value') == 'test\\"value'
@@ -167,6 +177,20 @@ class TestCPGEngine:
                len(result.callers) >= 0  # may be empty if graph doesn't have them
         assert result.issue_file == "payment_service.py"
         assert result.issue_function == "process_payment"
+
+    @pytest.mark.asyncio
+    async def test_compute_context_slice_has_type_flow_violations_field(
+        self, cpg_engine_no_joern
+    ):
+        """CPGContextSlice must always expose type_flow_violations — even on fallback."""
+        result = await cpg_engine_no_joern.compute_context_slice(
+            issue_file="payment_service.py",
+            issue_function="process_payment",
+        )
+        assert hasattr(result, "type_flow_violations")
+        assert isinstance(result.type_flow_violations, list)
+        # Fallback path: Joern unavailable → empty list (not populated without CPG)
+        assert result.type_flow_violations == []
 
     @pytest.mark.asyncio
     async def test_compute_context_slice_no_fallback(self):
@@ -221,6 +245,55 @@ class TestCPGEngine:
         )
         # With 5 affected files and threshold=2, score > 0
         assert result.affected_file_count == 5
+
+    @pytest.mark.asyncio
+    async def test_compute_type_flow_violations_returns_empty_no_joern(
+        self, cpg_engine_no_joern
+    ):
+        """compute_type_flow_violations returns empty list when Joern unavailable."""
+        result = await cpg_engine_no_joern.compute_type_flow_violations(
+            "validate_session"
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_compute_type_flow_violations_with_live_joern(self):
+        """With a mocked live Joern client, violations are returned correctly."""
+        from cpg.cpg_engine import CPGEngine
+
+        engine = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        mock_client.get_type_flows_to_callers = AsyncMock(return_value=[
+            {
+                "caller_name":  "process_payment",
+                "caller_file":  "payment_service.py",
+                "caller_line":  3,
+                "return_type":  "User | None",
+                "has_null_guard": False,
+                "violation":    True,
+                "relationship": "type_flow_caller",
+            },
+            {
+                "caller_name":  "safe_handler",
+                "caller_file":  "safe_service.py",
+                "caller_line":  10,
+                "return_type":  "User | None",
+                "has_null_guard": True,
+                "violation":    False,
+                "relationship": "type_flow_caller",
+            },
+        ])
+        engine._client = mock_client
+
+        result = await engine.compute_type_flow_violations("validate_session")
+        assert len(result) == 2
+        # Both raw results returned (engine method passes through the full list)
+        violations = [r for r in result if r.get("violation")]
+        assert len(violations) == 1
+        assert violations[0]["caller_name"] == "process_payment"
 
     def test_cache_invalidation_all(self, cpg_engine_no_joern):
         """invalidate_cache(None) clears all caches."""
@@ -286,6 +359,52 @@ class TestProgramSlicer:
         assert result.origin_function == "process_payment"
         # Source should be graph_fallback (Joern not available)
         assert result.source in ("graph_fallback", "vector_fallback", "cpg", "error")
+
+    @pytest.mark.asyncio
+    async def test_backward_slice_includes_type_flow_nodes(self):
+        """When CPGContextSlice contains type_flow_violations, they appear in
+        SliceResult.nodes with node_type='type_flow'."""
+        from cpg.program_slicer import ProgramSlicer, SliceDirection
+        from cpg.cpg_engine import CPGContextSlice
+
+        fake_slice = CPGContextSlice(
+            issue_file="payment_service.py",
+            issue_function="process_payment",
+            callers=[],
+            callees=[],
+            causal_functions=[],
+            data_flow_sources=[],
+            type_flow_violations=[
+                {
+                    "function":      "process_payment",
+                    "file":          "payment_service.py",
+                    "line":          3,
+                    "return_type":   "User | None",
+                    "has_null_guard": False,
+                    "relationship":  "type_flow_violation",
+                }
+            ],
+            files_in_slice=["payment_service.py"],
+            source="cpg",
+        )
+
+        mock_cpg = MagicMock()
+        mock_cpg.is_available = True
+        mock_cpg.has_fallback = False
+        mock_cpg.compute_context_slice = AsyncMock(return_value=fake_slice)
+
+        slicer = ProgramSlicer(cpg_engine=mock_cpg)
+        result = await slicer.compute_backward_slice(
+            file_path="payment_service.py",
+            function_name="process_payment",
+            line_number=3,
+        )
+
+        # At least one node must be a type_flow node
+        type_flow_nodes = [n for n in result.nodes if n.node_type == "type_flow"]
+        assert len(type_flow_nodes) == 1
+        assert type_flow_nodes[0].relationship == "type_flow_violation"
+        assert "User | None" in type_flow_nodes[0].code_snippet
 
     @pytest.mark.asyncio
     async def test_forward_slice_empty_when_no_cpg(self):
@@ -707,6 +826,24 @@ class TestFixerAgentCPGIntegration:
         assert "user_model.py::get_user" in captured_prompt[0]
         assert "Causal Context" in captured_prompt[0]
 
+    @pytest.mark.asyncio
+    async def test_generate_patch_fix_single_definition(self, tmp_path):
+        """Regression: _generate_patch_fix must have exactly ONE definition.
+
+        The original codebase had a duplicate stub (no cpg_context param) that
+        immediately preceded the real implementation.  This test verifies the
+        stub has been removed and the method signature contains cpg_context.
+        """
+        import inspect
+        from agents.fixer import FixerAgent
+
+        sig = inspect.signature(FixerAgent._generate_patch_fix)
+        params = list(sig.parameters.keys())
+        assert "cpg_context" in params, (
+            "_generate_patch_fix is missing cpg_context parameter — "
+            "the stub duplicate was not removed correctly."
+        )
+
 
 # ── PlannerAgent CPG blast radius tests ────────────────────────────────────────
 
@@ -770,3 +907,233 @@ class TestPlannerCPGBlastRadius:
         # through the planner evaluate() — we just verify it doesn't crash
         # when blast radius is high
         assert planner.cpg_engine is mock_cpg
+
+
+# ── Type flow graph tests (Gap 1 — third graph type) ──────────────────────────
+
+class TestTypeFlowGraph:
+    """
+    Tests for the type flow graph — the third graph type required by Gap 1.
+
+    Type flow traces how a function's return type is used by its callers.
+    A violation occurs when the caller does not guard against a weaker type
+    (e.g. None / null) that the function may actually return.
+
+    Classic Gap 1 example:
+        auth_middleware.validate_session()  → can return None
+        payment_service.process_payment()   → calls validate_session() and
+                                              dereferences .account_id
+                                              WITHOUT a None-check ← violation
+    """
+
+    @pytest.mark.asyncio
+    async def test_joern_client_type_flows_returns_empty_not_ready(
+        self, mock_joern_client
+    ):
+        """get_type_flows_to_callers never raises when Joern is unavailable."""
+        result = await mock_joern_client.get_type_flows_to_callers(
+            "validate_session", max_results=10
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_cpg_engine_type_flow_violations_no_joern(
+        self, cpg_engine_no_joern
+    ):
+        """compute_type_flow_violations returns [] when Joern is unavailable."""
+        result = await cpg_engine_no_joern.compute_type_flow_violations(
+            "validate_session", max_results=10
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_cpg_engine_type_flow_violations_with_mocked_client(self):
+        """compute_type_flow_violations passes results from Joern client through."""
+        from cpg.cpg_engine import CPGEngine
+
+        engine = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        mock_client.get_type_flows_to_callers = AsyncMock(return_value=[
+            {
+                "caller_name":   "process_payment",
+                "caller_file":   "payment_service.py",
+                "caller_line":   3,
+                "return_type":   "User | None",
+                "has_null_guard": False,
+                "violation":     True,
+                "relationship":  "type_flow_caller",
+            },
+        ])
+        engine._client = mock_client
+
+        result = await engine.compute_type_flow_violations("validate_session")
+        assert len(result) == 1
+        assert result[0]["caller_name"] == "process_payment"
+        assert result[0]["violation"] is True
+        mock_client.get_type_flows_to_callers.assert_called_once_with(
+            function_name="validate_session", max_results=20
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_slice_type_flow_violations_populated_with_joern(self):
+        """When Joern is live, type_flow_violations is populated in the slice."""
+        from cpg.cpg_engine import CPGEngine
+
+        engine = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        # call graph
+        mock_client.get_callers = AsyncMock(return_value=[])
+        mock_client.get_callees = AsyncMock(return_value=[])
+        # data flow
+        mock_client.compute_backward_slice = AsyncMock(return_value=[])
+        mock_client.get_data_flows_to_function = AsyncMock(return_value=[])
+        # type flow — one violation
+        mock_client.get_type_flows_to_callers = AsyncMock(return_value=[
+            {
+                "caller_name":   "process_payment",
+                "caller_file":   "payment_service.py",
+                "caller_line":   3,
+                "return_type":   "User | None",
+                "has_null_guard": False,
+                "violation":     True,
+                "relationship":  "type_flow_caller",
+            },
+            {
+                "caller_name":   "safe_caller",
+                "caller_file":   "safe_service.py",
+                "caller_line":   10,
+                "return_type":   "User | None",
+                "has_null_guard": True,
+                "violation":     False,
+                "relationship":  "type_flow_caller",
+            },
+        ])
+        engine._client = mock_client
+
+        ctx = await engine.compute_context_slice(
+            issue_file="auth_middleware.py",
+            issue_function="validate_session",
+            issue_line=3,
+            variable_name="token",
+        )
+
+        # Only the caller WITHOUT a guard should be in type_flow_violations
+        assert len(ctx.type_flow_violations) == 1
+        assert ctx.type_flow_violations[0]["function"] == "process_payment"
+        assert ctx.type_flow_violations[0]["relationship"] == "type_flow_violation"
+        # Violation file must be in the files_in_slice aggregation
+        assert "payment_service.py" in ctx.files_in_slice
+
+    @pytest.mark.asyncio
+    async def test_program_slicer_type_flow_node_in_slice(self):
+        """ProgramSlicer.compute_backward_slice includes type_flow nodes."""
+        from cpg.program_slicer import ProgramSlicer
+        from cpg.cpg_engine import CPGContextSlice
+
+        # Build a CPGContextSlice that has one type_flow_violation
+        fake_ctx = CPGContextSlice(
+            issue_file="auth_middleware.py",
+            issue_function="validate_session",
+            callers=[],
+            callees=[],
+            causal_functions=[],
+            data_flow_sources=[],
+            type_flow_violations=[
+                {
+                    "function":      "process_payment",
+                    "file":          "payment_service.py",
+                    "line":          3,
+                    "return_type":   "User | None",
+                    "has_null_guard": False,
+                    "relationship":  "type_flow_violation",
+                }
+            ],
+            files_in_slice=["auth_middleware.py", "payment_service.py"],
+            source="cpg",
+        )
+
+        mock_cpg = MagicMock()
+        mock_cpg.is_available = True
+        mock_cpg.has_fallback = False
+        mock_cpg.compute_context_slice = AsyncMock(return_value=fake_ctx)
+
+        slicer = ProgramSlicer(cpg_engine=mock_cpg)
+        result = await slicer.compute_backward_slice(
+            file_path="auth_middleware.py",
+            function_name="validate_session",
+            line_number=3,
+        )
+
+        type_nodes = [n for n in result.nodes if n.node_type == "type_flow"]
+        assert len(type_nodes) == 1, "Expected exactly one type_flow node"
+        tf = type_nodes[0]
+        assert tf.function_name == "process_payment"
+        assert tf.file_path == "payment_service.py"
+        assert tf.line_number == 3
+        assert tf.relationship == "type_flow_violation"
+        assert "User | None" in tf.code_snippet
+
+    @pytest.mark.asyncio
+    async def test_joern_server_cpg_type_flows_tool(self):
+        """cpg_type_flows MCP tool returns violations and all_callers keys."""
+        # Import the function directly without a live Joern server
+        # by monkey-patching get_joern_client
+        from unittest.mock import patch, AsyncMock as AM
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.get_type_flows_to_callers = AM(return_value=[
+            {
+                "caller_name":   "process_payment",
+                "caller_file":   "payment_service.py",
+                "caller_line":   3,
+                "return_type":   "User | None",
+                "has_null_guard": False,
+                "violation":     True,
+                "relationship":  "type_flow_caller",
+            },
+        ])
+
+        with patch(
+            "tools.servers.joern_server.get_joern_client",
+            return_value=mock_client,
+        ):
+            from tools.servers.joern_server import cpg_type_flows
+            result = await cpg_type_flows("validate_session", max_results=5)
+
+        assert "violations" in result
+        assert "all_callers" in result
+        assert "violation_count" in result
+        assert result["violation_count"] == 1
+        assert result["total"] == 1
+        assert result["function"] == "validate_session"
+        assert result["violations"][0]["caller_name"] == "process_payment"
+
+    def test_joern_server_type_flows_schema_registered(self):
+        """cpg_type_flows must appear in get_tool_schemas() output."""
+        from tools.servers.joern_server import get_tool_schemas, _TOOLS
+        names_in_schema = {s["name"] for s in get_tool_schemas()}
+        assert "cpg_type_flows" in names_in_schema, (
+            "cpg_type_flows missing from get_tool_schemas()"
+        )
+        assert "cpg_type_flows" in _TOOLS, (
+            "cpg_type_flows missing from _TOOLS dispatch table"
+        )
+
+    def test_type_flow_violations_field_on_cpg_context_slice(self):
+        """CPGContextSlice dataclass must expose type_flow_violations field."""
+        from cpg.cpg_engine import CPGContextSlice
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(CPGContextSlice)}
+        assert "type_flow_violations" in field_names, (
+            "CPGContextSlice is missing the type_flow_violations field"
+        )
+        # Default must be an empty list (not None, not missing)
+        s = CPGContextSlice()
+        assert s.type_flow_violations == []
