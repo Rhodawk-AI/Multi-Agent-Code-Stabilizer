@@ -81,6 +81,7 @@ def chunk_file(
             line_end=line_end,
             language=language,
             strategy=strategy,
+            content=chunk_content,
             function_name=fn_name,
             all_functions=[fn_name] if fn_name else [],
             raw_observations=[],
