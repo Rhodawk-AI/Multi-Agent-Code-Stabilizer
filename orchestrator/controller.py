@@ -860,11 +860,16 @@ class StabilizerController:
                 or self.config.critical_fix_model
             )
 
-            # ── GAP 2 FIX: warn when synthesis falls back to same model family ──
-            # The spec requires synthesis to use a DIFFERENT family from the
-            # auditors so cross-domain reasoning comes from genuinely fresh eyes.
-            # When synthesis_model is blank it silently uses critical_fix_model
-            # (potentially the same Anthropic/Ollama/etc. family as the auditors).
+            # ── GAP 2 FIX: Enforce synthesis model family independence ──────────
+            # The spec requires synthesis to use a DIFFERENT model family from
+            # the auditors so cross-domain reasoning comes from genuinely fresh
+            # eyes.  When synthesis_model is blank it falls back to
+            # critical_fix_model (potentially the same family as the auditors).
+            #
+            # Enforcement levels:
+            #   • MILITARY / AEROSPACE / NUCLEAR: raises ConfigurationError
+            #     (same-family synthesis is a compliance failure in these modes)
+            #   • All other domains: logs a WARNING (advisory only)
             _synthesis_model_is_default = not (
                 self.config.synthesis_model
                 or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
@@ -879,6 +884,36 @@ class StabilizerController:
                     "RHODAWK_SYNTHESIS_MODEL env var to a different family "
                     "(e.g. DeepSeek-Coder-V2 or Qwen2.5-Coder-32B) for best results."
                 )
+            else:
+                # When synthesis_model IS explicitly set, verify the families differ.
+                try:
+                    from verification.independence_enforcer import extract_model_family
+                    primary_family   = extract_model_family(self.config.primary_model)
+                    synthesis_family = extract_model_family(synthesis_model)
+                    if (
+                        primary_family
+                        and synthesis_family
+                        and primary_family == synthesis_family
+                    ):
+                        _family_msg = (
+                            f"[audit] synthesis_model ({synthesis_model}) appears to be "
+                            f"the same model family as primary_model "
+                            f"({self.config.primary_model}): both resolve to "
+                            f"'{primary_family}'. Cross-domain compound finding quality "
+                            "will be reduced. Set synthesis_model to a model from a "
+                            "different provider/family for genuine independence."
+                        )
+                        if self.config.domain_mode in {
+                            DomainMode.MILITARY, DomainMode.AEROSPACE, DomainMode.NUCLEAR
+                        }:
+                            raise ConfigurationError(_family_msg)
+                        else:
+                            self.log.warning(_family_msg)
+                except (ImportError, Exception) as _family_exc:
+                    # extract_model_family is best-effort; never block the pipeline
+                    self.log.debug(
+                        f"[audit] synthesis model family check skipped: {_family_exc}"
+                    )
 
             synthesis_agent = SynthesisAgent(
                 storage=self.storage,
@@ -905,13 +940,28 @@ class StabilizerController:
                 self._last_compound_findings = compound_findings
 
                 # Materialise compound findings as Issues in the issue list so
-                # they flow through consensus → fix → review unchanged
-                compound_issues = [
-                    await self.storage.get_issue(cf.synthesized_issue_id)
-                    for cf in compound_findings
-                    if cf.synthesized_issue_id
-                ]
-                compound_issues = [i for i in compound_issues if i is not None]
+                # they flow through consensus → fix → review unchanged.
+                # FIX: replaced silent list-comprehension None-drop with
+                # explicit per-finding fetch so storage failures are logged
+                # at ERROR level instead of being swallowed silently.
+                compound_issues: list[Issue] = []
+                for cf in compound_findings:
+                    if not cf.synthesized_issue_id:
+                        continue
+                    fetched = await self.storage.get_issue(cf.synthesized_issue_id)
+                    if fetched is None:
+                        self.log.error(
+                            f"[audit] Compound finding '{cf.title}' could not be "
+                            f"materialised — storage returned None for "
+                            f"synthesized_issue_id={cf.synthesized_issue_id}. "
+                            "This likely means upsert_synthesis_report / "
+                            "upsert_issue is not implemented on the active "
+                            "storage backend (e.g. PostgresBrainStorage). "
+                            "The compound finding will be omitted from this "
+                            "audit cycle's issue list."
+                        )
+                    else:
+                        compound_issues.append(fetched)
 
                 all_issues = deduped_issues + compound_issues
 
