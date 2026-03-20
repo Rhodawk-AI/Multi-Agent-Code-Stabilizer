@@ -137,6 +137,50 @@ async def cpg_data_flows(
     }
 
 
+async def cpg_type_flows(
+    function_name: str,
+    max_results:   int = 20,
+) -> dict:
+    """Gap 1 — type flow graph MCP tool.
+
+    Finds callers of ``function_name`` that use its return value without a
+    null / type guard.  This implements the third graph type required by Gap 1
+    (call graph + data flow graph + **type flow graph**).
+
+    A *violation* means: the caller dereferences or uses the return value
+    directly, but the function can return None / null / nullptr.  The classic
+    example from Gap 1:
+
+        auth_middleware.validate_session() → returns None on bad token
+        payment_service.process_payment() → calls validate_session() and
+                                             accesses result.account_id
+                                             WITHOUT a None-check  ← violation
+
+    Returns:
+        all_callers     — every caller found in the call graph
+        violations      — subset where has_null_guard is False
+        violation_count — len(violations)
+        total           — len(all_callers)
+        function        — the function queried
+    """
+    from cpg.joern_client import get_joern_client
+    client = get_joern_client(base_url=_JOERN_URL)
+    if not client.is_ready:
+        await client.connect()
+    flows = await client.get_type_flows_to_callers(
+        function_name=function_name,
+        max_results=max_results,
+    )
+    violations = [f for f in flows if f.get("violation", False)]
+    return {
+        "all_callers":     flows,
+        "violations":      violations,
+        "violation_count": len(violations),
+        "total":           len(flows),
+        "function":        function_name,
+    }
+
+
 async def cpg_vulnerability_scan(vuln_type: str = "all", file_pattern: str = ".*") -> dict:
     from cpg.cpg_engine import get_cpg_engine
     engine = get_cpg_engine(joern_url=_JOERN_URL)
@@ -178,6 +222,8 @@ _TOOLS = {
     "cpg_impact_set":         cpg_impact_set,
     "cpg_blast_radius":       cpg_blast_radius,
     "cpg_data_flows":         cpg_data_flows,
+    # Gap 1 — third graph type: type flow (callers violating the type contract)
+    "cpg_type_flows":         cpg_type_flows,
     "cpg_vulnerability_scan": cpg_vulnerability_scan,
     "cpg_import_codebase":    cpg_import_codebase,
     "cpg_query":              cpg_query,
@@ -274,6 +320,25 @@ def get_tool_schemas() -> list[dict]:
                     "max_paths": {"type": "integer", "default": 10},
                 },
                 "required": ["sink_function"],
+            },
+        },
+        {
+            "name": "cpg_type_flows",
+            "description": (
+                "Gap 1 — type flow graph: find callers that violate the type contract "
+                "of a function by using its return value without a null/type guard. "
+                "Implements the third graph type required by Gap 1 "
+                "(call graph + data flow graph + type flow graph). "
+                "Use this when a crash may be caused by a caller that does not guard "
+                "against None/null even though the callee can return it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 20},
+                },
+                "required": ["function_name"],
             },
         },
         {
