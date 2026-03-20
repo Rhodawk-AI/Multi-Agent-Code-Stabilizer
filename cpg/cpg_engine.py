@@ -297,7 +297,21 @@ class CPGEngine:
                 affected_files |= self.graph_engine.impact_radius(fp, max_depth=depth)
             blast.affected_files      = sorted(affected_files)
             blast.affected_file_count = len(affected_files)
+            # Gap 3.B fix: the graph fallback only counts files, not functions.
+            # Leaving affected_function_count=0 makes blast_radius_score=0.0
+            # and requires_human_review=False, silently bypassing the gate.
+            # Use a conservative heuristic (10 functions/file) so the gate
+            # fires correctly on degraded data.  Log a WARNING so operators
+            # know the estimate is not CPG-computed.
+            _estimated_fn_count = blast.affected_file_count * 10
+            blast.affected_function_count = _estimated_fn_count
             blast.source = "graph_fallback"
+            log.warning(
+                f"CPGEngine.compute_blast_radius: Joern unavailable — "
+                f"function count is ESTIMATED ({blast.affected_file_count} files × 10 = "
+                f"{_estimated_fn_count} functions). Blast radius gate may fire "
+                f"conservatively. Start Joern for exact CPG results."
+            )
 
         blast.test_files_affected = [
             f for f in blast.affected_files if "test" in f.lower() or "spec" in f.lower()
@@ -308,7 +322,8 @@ class CPGEngine:
         log.info(
             f"CPGEngine.compute_blast_radius: changed={len(function_names)} → "
             f"affected={blast.affected_function_count} fns/{blast.affected_file_count} files "
-            f"score={blast.blast_radius_score:.2f} human_review={blast.requires_human_review}"
+            f"score={blast.blast_radius_score:.2f} human_review={blast.requires_human_review} "
+            f"source={blast.source}"
         )
         return blast
 
