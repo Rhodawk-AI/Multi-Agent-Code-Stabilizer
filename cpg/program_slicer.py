@@ -140,6 +140,21 @@ class ProgramSlicer:
                     relationship="data_flow_source",
                     depth=item.get("path_length", 0),
                 ))
+            # ── Type flow violations (third graph type) ──────────────────────
+            # Callers that dereference the return value without a null/type guard.
+            # These represent WHERE the type contract violation will crash, not
+            # just where data flows.  Included so FixerAgent sees both the bug
+            # origin (data flow source) and the crash site (type flow violation).
+            for item in ctx.type_flow_violations:
+                nodes.append(SliceNode(
+                    function_name=item.get("function", ""),
+                    file_path=item.get("file", ""),
+                    line_number=item.get("line", 0),
+                    code_snippet=f"no null guard — return_type={item.get('return_type', '?')}",
+                    node_type="type_flow",
+                    relationship="type_flow_violation",
+                    depth=1,
+                ))
             result.nodes          = nodes[:self._max_nodes]
             result.files_in_slice = ctx.files_in_slice[:self._max_files]
             result.total_nodes    = len(result.nodes)

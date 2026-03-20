@@ -16,17 +16,21 @@ _CACHE_TTL = 3600
 
 @dataclass
 class CPGContextSlice:
-    issue_file:        str       = ""
-    issue_function:    str       = ""
-    issue_line:        int       = 0
-    causal_functions:  list[dict] = field(default_factory=list)
-    callers:           list[dict] = field(default_factory=list)
-    callees:           list[dict] = field(default_factory=list)
-    data_flow_sources: list[dict] = field(default_factory=list)
-    files_in_slice:    list[str]  = field(default_factory=list)
-    total_functions:   int        = 0
-    total_files:       int        = 0
-    source:            str        = "cpg"
+    issue_file:           str       = ""
+    issue_function:       str       = ""
+    issue_line:           int       = 0
+    causal_functions:     list[dict] = field(default_factory=list)
+    callers:              list[dict] = field(default_factory=list)
+    callees:              list[dict] = field(default_factory=list)
+    data_flow_sources:    list[dict] = field(default_factory=list)
+    # Gap 1 – type flow: callers that assume a stricter type than the function
+    # may return (e.g. no None-check after a function that can return None).
+    # Populated only when Joern is available; empty otherwise.
+    type_flow_violations: list[dict] = field(default_factory=list)
+    files_in_slice:       list[str]  = field(default_factory=list)
+    total_functions:      int        = 0
+    total_files:          int        = 0
+    source:               str        = "cpg"
 
 
 @dataclass
@@ -137,6 +141,7 @@ class CPGEngine:
         for item in (
             result.causal_functions + result.callers
             + result.callees + result.data_flow_sources
+            + result.type_flow_violations
         ):
             fp = item.get("file", "")
             if fp and fp != "<unknown>":
@@ -147,6 +152,7 @@ class CPGEngine:
         result.total_functions = (
             len(result.causal_functions) + len(result.callers)
             + len(result.callees) + len(result.data_flow_sources)
+            + len(result.type_flow_violations)
         )
         self._slice_cache[cache_key] = (time.time(), result)
         log.info(
@@ -212,12 +218,39 @@ class CPGEngine:
         )
         existing_files = {item["file"] for item in (base.callers + base.causal_functions)}
         base.data_flow_sources = [
-            {"function": f.source_method, "file": f.source_file,
-             "line": f.source_line, "relationship": "data_flow_source",
-             "path_length": f.path_length}
+            {**{"function": f.source_method, "file": f.source_file,
+                "line": f.source_line, "relationship": "data_flow_source",
+                "path_length": f.path_length}}
             for f in flows
             if f.source_file and f.source_file not in existing_files
         ]
+
+        # ── Type flow graph (Gap 1, third graph type) ─────────────────────────
+        # Finds callers that violate the type contract of this function by using
+        # its return value without a null / type guard.  These are structurally
+        # distinct from data-flow sources — they indicate WHERE the crash will
+        # materialise (the caller that dereferences None), not just WHERE data
+        # flows.  This completes the three-graph requirement:
+        #   call graph      → base.callers / base.callees
+        #   data flow graph → base.causal_functions / base.data_flow_sources
+        #   type flow graph → base.type_flow_violations  ← NEW
+        type_flows = await self._client.get_type_flows_to_callers(
+            function_name=function_name,
+            max_results=10,
+        )
+        base.type_flow_violations = [
+            {
+                "function":     tf["caller_name"],
+                "file":         tf["caller_file"],
+                "line":         tf["caller_line"],
+                "return_type":  tf["return_type"],
+                "has_null_guard": tf["has_null_guard"],
+                "relationship": "type_flow_violation",
+            }
+            for tf in type_flows
+            if tf.get("violation", False)
+        ]
+
         return base
 
     def _compute_graph_fallback_slice(self, base: CPGContextSlice, issue_file: str) -> CPGContextSlice:
@@ -310,6 +343,27 @@ class CPGEngine:
                     self._callee_cache.pop(f"{fn}:{depth}", None)
                 for k in [k for k in self._slice_cache if fn in k]:
                     del self._slice_cache[k]
+
+    async def compute_type_flow_violations(
+        self,
+        function_name: str,
+        max_results:   int = 20,
+    ) -> list[dict]:
+        """Return callers that violate the type contract of ``function_name``.
+
+        This is the public entry point for the type flow graph query. It wraps
+        ``JoernClient.get_type_flows_to_callers`` with the engine's availability
+        guard so callers never need to check ``is_available`` themselves.
+
+        Returns an empty list when Joern is unavailable (same as all other
+        CPGEngine methods — never raises).
+        """
+        if not self.is_available or not self._client:
+            return []
+        return await self._client.get_type_flows_to_callers(
+            function_name=function_name,
+            max_results=max_results,
+        )
 
     async def scan_for_vulnerability_patterns(self, vuln_type: str = "all") -> list[dict]:
         if not self.is_available or not self._client:

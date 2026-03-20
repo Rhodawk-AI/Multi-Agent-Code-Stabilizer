@@ -245,6 +245,79 @@ class JoernClient:
             log.debug(f"JoernClient.get_callees({function_name}): {exc}")
             return []
 
+    async def get_type_flows_to_callers(
+        self,
+        function_name: str,
+        max_results:   int = 20,
+    ) -> list[dict]:
+        """Type flow graph analysis: find callers that violate the type contract
+        of ``function_name``.
+
+        Two-pass implementation:
+          1. Query Joern for the declared return type of the function.
+          2. Query all callers and check whether each caller contains a
+             null/None/nullptr guard before using the return value.
+
+        A caller WITHOUT a null guard is a *type flow violation*: it assumes
+        a stricter type than the function may actually return.  This is the
+        exact cross-service pattern described in Gap 1:
+            auth_middleware.validate_session() started returning ``None``, but
+            payment_service.process_payment() still dereferences the result
+            as a ``User`` without checking.
+
+        Returns a list of dicts with keys:
+            caller_name, caller_file, caller_line,
+            return_type, has_null_guard, violation (bool), relationship
+        """
+        if not self.is_ready:
+            return []
+        try:
+            # Pass 1: resolve the declared return type
+            rtype_q = (
+                f'cpg.method.name("{_esc(function_name)}")'
+                ".methodReturn.typeFullName.l.headOption.getOrElse(\"ANY\")"
+            )
+            rtype_raw = await self._query(rtype_q)
+            return_type = str(rtype_raw[0]) if rtype_raw else "ANY"
+
+            # Pass 2: callers + null-guard detection via AST control-flow scan
+            # The regex covers Python (None / is None / != None),
+            # C/C++/Java (null / NULL / nullptr / != null), and
+            # common guard idioms (Optional.isPresent, hasValue, etc.)
+            null_guard_regex = (
+                ".*None.*|.*null.*|.*nullptr.*|.*NULL.*"
+                "|.*is_none.*|.*isNone.*|.*isEmpty.*"
+                "|.*Optional.*|.*hasValue.*|.*isDefined.*"
+            )
+            q = (
+                f'cpg.method.name("{_esc(function_name)}").caller\n'
+                ".map(m => Map(\n"
+                '  "callerName" -> m.name,\n'
+                '  "callerFile" -> m.filename,\n'
+                '  "callerLine" -> m.lineNumber.getOrElse(0),\n'
+                "  \"hasNullGuard\" -> m.ast.isControlStructure\n"
+                f'    .condition.code("{_esc(null_guard_regex)}").l.nonEmpty\n'
+                f')).take({max_results}).l'
+            )
+            raw = await self._query(q)
+            results: list[dict] = []
+            for r in raw:
+                has_guard = bool(r.get("hasNullGuard", True))
+                results.append({
+                    "caller_name":  r.get("callerName", ""),
+                    "caller_file":  r.get("callerFile", ""),
+                    "caller_line":  int(r.get("callerLine", 0)),
+                    "return_type":  return_type,
+                    "has_null_guard": has_guard,
+                    # violation = caller does NOT guard against non-standard type
+                    "violation":    not has_guard,
+                    "relationship": "type_flow_caller",
+                })
+            return results
+        except Exception as exc:
+            log.debug(f"JoernClient.get_type_flows_to_callers({function_name}): {exc}")
+            return []
+
     async def get_call_sites(self, function_name: str) -> list[dict]:
         if not self.is_ready:
             return []
