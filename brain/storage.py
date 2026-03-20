@@ -16,7 +16,7 @@ from brain.schemas import (
     PlannerRecord, PolyspaceFinding,
     RequirementTraceability, ReviewerIndependenceRecord,
     RunStatus, SoftwareAccomplishmentSummary,
-    SoftwareConfigurationIndex, TestRunResult,
+    SoftwareConfigurationIndex, SynthesisReport, TestRunResult,
 )
 
 
@@ -281,5 +281,64 @@ class BrainStorage(ABC):
         Persist an LLM call record for cost tracking and reproducibility.
         The session dict contains: run_id, agent_type, model, prompt_tokens,
         completion_tokens, cost_usd, duration_ms, success, error.
+        """
+        ...
+
+    # ── GAP 2: SYNTHESIS AGENT (cross-domain compound findings) ───────────────
+
+    @abstractmethod
+    async def upsert_synthesis_report(self, report: SynthesisReport) -> None:
+        """
+        Persist a SynthesisReport produced after each audit cycle.
+
+        Records deduplication effectiveness (raw → deduped counts), compound
+        finding yield, synthesis model used, and wall-clock duration.
+        Idempotent on (run_id, cycle) — re-running the same cycle overwrites
+        the previous report for that cycle.
+        """
+        ...
+
+    @abstractmethod
+    async def get_synthesis_report(
+        self,
+        run_id: str,
+        cycle: int | None = None,
+    ) -> SynthesisReport | None:
+        """
+        Retrieve a SynthesisReport.
+
+        If cycle is None, returns the latest (highest cycle) report for the run.
+        If cycle is provided, returns the report for that specific cycle.
+        Returns None when no matching report exists.
+        """
+        ...
+
+    @abstractmethod
+    async def list_synthesis_reports(
+        self,
+        run_id: str | None = None,
+    ) -> list[SynthesisReport]:
+        """
+        List SynthesisReports, optionally filtered by run_id.
+
+        Returns empty list (never None) when no reports exist.
+        Ordered by (run_id, cycle) ascending so callers can track trends.
+        """
+        ...
+
+    @abstractmethod
+    async def list_compound_findings(
+        self,
+        run_id: str | None = None,
+        severity: str | None = None,
+    ) -> list[Issue]:
+        """
+        List compound findings — Issues with executor_type=SYNTHESIS.
+
+        Cross-domain vulnerabilities detected by SynthesisAgent that no
+        single-domain auditor can identify alone.
+
+        Optionally filtered by run_id and/or severity string
+        (e.g. 'CRITICAL', 'MAJOR'). Returns empty list (never None).
         """
         ...
