@@ -659,6 +659,59 @@ class JoernClient:
 
         return list(results.values())
 
+    async def resolve_method_fqn(
+        self,
+        bare_name: str,
+        file_path: str | None = None,
+    ) -> list[str]:
+        """Resolve a bare method name to its fully-qualified name(s) as stored
+        in the CPG.
+
+        Joern stores method FQNs in language-specific formats:
+          Python : ``<module>.<class>.<method>``
+            e.g.  ``services.payment_service.PaymentService.process_payment``
+          C/C++  : ``<namespace>::<class>::<method>``
+          Java   : ``<package>.<class>.<method>:<signature>``
+
+        A bare name derived from the file-system path (e.g. the tree-sitter
+        symbol ``process_payment``, or the path-derived prefix
+        ``src.services.payment_service.process_payment``) does **not**
+        necessarily match any CPG node.  This method performs an exact
+        ``name`` lookup against the CPG so that callers can pass the actual
+        FQN to ``compute_impact_set`` / ``get_importing_files``.
+
+        When ``file_path`` is provided the search is constrained to methods
+        whose ``filename`` ends with the basename of ``file_path``, which
+        avoids false positives for common names like ``__init__`` or ``run``.
+
+        Returns all matching FQNs (may be more than one when overloaded), or
+        an empty list when Joern is unavailable or the name is not in the CPG.
+        """
+        if not self.is_ready:
+            return []
+        try:
+            if file_path:
+                # Normalise to the bare filename (no directory) so the
+                # endsWith filter works regardless of absolute vs relative
+                # paths stored in the CPG.
+                from pathlib import Path as _P
+                filename = _P(file_path).name
+                q = (
+                    f'cpg.method.name("{_esc(bare_name)}")'
+                    f'.filter(_.filename.endsWith("{_esc(filename)}"))'
+                    ".fullName.dedup.l"
+                )
+            else:
+                q = (
+                    f'cpg.method.name("{_esc(bare_name)}")'
+                    ".fullName.dedup.l"
+                )
+            raw = await self._query(q)
+            return [str(r) for r in raw if r and str(r) not in ("", "<empty>")]
+        except Exception as exc:
+            log.debug(f"JoernClient.resolve_method_fqn({bare_name!r}, {file_path!r}): {exc}")
+            return []
+
     async def compute_impact_set(self, function_names: list[str], depth: int = 3) -> list[dict]:
         if not self.is_ready or not function_names:
             return []

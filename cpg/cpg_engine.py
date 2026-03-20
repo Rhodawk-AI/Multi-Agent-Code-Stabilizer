@@ -281,6 +281,77 @@ class CPGEngine:
             log.debug(f"CPGEngine._compute_graph_fallback_slice: {exc}")
         return base
 
+    async def resolve_function_names(
+        self,
+        bare_names: list[str],
+        file_paths: list[str] | None = None,
+    ) -> list[str]:
+        """Resolve bare symbol names to their CPG fully-qualified names.
+
+        The fixer derives candidate names two ways:
+          1. Bare tree-sitter symbols  (e.g. ``process_payment``)
+          2. Path-prefixed names       (e.g. ``src.services.payment_service.process_payment``)
+
+        Neither is guaranteed to match the FQN stored in the Joern CPG, which
+        uses the language's own module-qualification convention.  For example,
+        if ``src/`` is on ``sys.path`` Joern stores
+        ``services.payment_service.process_payment``, not the path-prefixed form.
+
+        This method performs a CPG ``method.name`` lookup for every bare symbol
+        and collects the actual FQNs returned by Joern.  The output list
+        contains both the original names (as a fallback in case the symbol is
+        not yet in the CPG) and every resolved FQN, deduplicated.
+
+        Passing both forms to ``compute_impact_set`` / ``get_importing_files``
+        maximises the hit rate regardless of language or package structure.
+
+        When Joern is unavailable the input list is returned unchanged so all
+        callers degrade gracefully.
+        """
+        if not self.is_available or not self._client:
+            return list(bare_names)
+
+        resolved: list[str] = []
+        seen: set[str] = set()
+
+        # Strip path-prefixed variants — keep only the bare (last component)
+        # names for the CPG lookup; the CPG never stores file-system prefixes.
+        bare_only: list[str] = []
+        for name in bare_names:
+            # A bare name has no dots except for language-native FQNs that
+            # already came from a previous resolution pass (which would already
+            # appear in the ``seen`` set).  Take the last dotted segment as the
+            # unambiguous bare symbol name.
+            bare = name.split(".")[-1]
+            if bare and bare not in seen:
+                bare_only.append(bare)
+                seen.add(bare)
+
+        # Always keep every original name as fallback.
+        for name in bare_names:
+            if name not in seen:
+                resolved.append(name)
+                seen.add(name)
+
+        # Query CPG for FQNs, optionally constrained per source file.
+        for bare in bare_only:
+            for fp in (file_paths or [None]):
+                try:
+                    fqns = await self._client.resolve_method_fqn(bare, fp)
+                    for fqn in fqns:
+                        if fqn not in seen:
+                            resolved.append(fqn)
+                            seen.add(fqn)
+                except Exception as exc:
+                    log.debug(f"CPGEngine.resolve_function_names({bare!r}, {fp!r}): {exc}")
+
+        if len(resolved) > len(bare_names):
+            log.info(
+                f"CPGEngine.resolve_function_names: {len(bare_names)} candidate names → "
+                f"{len(resolved)} after CPG FQN resolution"
+            )
+        return resolved
+
     async def compute_blast_radius(
         self,
         function_names: list[str],
@@ -290,8 +361,17 @@ class CPGEngine:
         blast = CPGBlastRadius(changed_functions=function_names)
 
         if self.is_available and self._client:
+            # ── Resolve bare names → CPG fully-qualified names ─────────────────
+            # Names derived from file-system paths or tree-sitter bare symbols
+            # do not necessarily match the FQN stored in the CPG.  Resolve them
+            # first so compute_impact_set / get_importing_files hit real nodes.
+            resolved_names = await self.resolve_function_names(
+                bare_names=function_names,
+                file_paths=file_paths,
+            )
+
             # ── Call graph: callers + callees ─────────────────────────────────
-            affected = await self._client.compute_impact_set(function_names=function_names, depth=depth)
+            affected = await self._client.compute_impact_set(function_names=resolved_names, depth=depth)
             blast.affected_functions      = affected
             blast.affected_function_count = len(affected)
             blast.affected_files          = sorted(set(
@@ -306,7 +386,7 @@ class CPGEngine:
             # in the blast radius.  The call-graph pass above misses these
             # entirely; this pass fills the gap.
             import_hits = await self._client.get_importing_files(
-                symbol_names=function_names,
+                symbol_names=resolved_names,
                 file_paths=file_paths or [],
             )
             # De-duplicate against files already captured by the call graph.
