@@ -1237,3 +1237,690 @@ class TestCPGFQNResolution:
         )
         assert blast.importing_module_count == 1
         assert "consumer.py" in blast.importing_modules
+
+
+# ===========================================================================
+# Gap 3 — Proactive Architectural Smell Detection
+# ===========================================================================
+# Three new test classes covering the three structural fixes:
+#
+#   TestBugRecurrenceEscalation
+#       Signal 1: fix_memory recurrence count >= threshold → refactor proposal
+#
+#   TestCPGCouplingSmellEscalation
+#       Signal 2: CPG distinct_caller_modules >= threshold → refactor proposal
+#
+#   TestArchitecturalSymptomPlanner
+#       PlannerAgent: is_architectural_symptom=True blocks fix, creates escalation
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the new test classes
+# ---------------------------------------------------------------------------
+
+def _make_planner(storage, run_id="test-run", cpg_engine=None, escalation_manager=None):
+    from agents.planner import PlannerAgent
+    from agents.base import AgentConfig
+    return PlannerAgent(
+        storage=storage,
+        run_id=run_id,
+        config=AgentConfig(model="test-model", run_id=run_id),
+        cpg_engine=cpg_engine,
+        escalation_manager=escalation_manager,
+    )
+
+
+def _make_fix_attempt(run_id="test-run", path="foo.py", changes_made="add null guard"):
+    from brain.schemas import FixAttempt, FixedFile, PatchMode
+    return FixAttempt(
+        run_id=run_id,
+        issue_ids=["issue-1"],
+        fixed_files=[
+            FixedFile(
+                path=path,
+                content="def f(x):\n    if x is None:\n        return\n    return x.value\n",
+                changes_made=changes_made,
+                patch_mode=PatchMode.FULL_FILE,
+            )
+        ],
+        fixer_model="test-model",
+    )
+
+
+def _inject_fix_memory_entries(json_path, count, issue_type="null deref in payment_service",
+                                file_context="payment_service.py", reverted=False):
+    """Write ``count`` fix-memory records for the given issue_type."""
+    records = []
+    if json_path.exists():
+        records = json.loads(json_path.read_text())
+    for i in range(count):
+        ts = (datetime.now(timezone.utc) - timedelta(days=i)).isoformat()
+        records.append({
+            "issue_type":   issue_type,
+            "file_context": file_context,
+            "fix_approach": f"[REVERTED] approach {i}" if reverted else f"approach {i}",
+            "test_result":  "REGRESSION: broke auth" if reverted else "passed=1 failed=0",
+            "run_id":       f"run-{i}",
+            "created_at":   ts,
+            "reverted":     reverted,
+        })
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(records))
+
+
+# ===========================================================================
+# TestBugRecurrenceEscalation
+# ===========================================================================
+
+class TestBugRecurrenceEscalation:
+    """
+    Signal 1 — fix_memory recurrence gate.
+
+    When the same bug class has been successfully patched >= 3 times
+    within 180 days, _check_bug_recurrence() must return
+    is_structural=True and _fix_group() must route to
+    _generate_refactor_proposal() instead of generating a patch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recurrence_above_threshold_returns_is_structural_true(self, tmp_path):
+        """_check_bug_recurrence returns is_structural=True when recurrence_count >= 3."""
+        from memory.fix_memory import FixMemory
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm.initialise()
+        json_path = tmp_path / "fix_memory.json"
+
+        # Inject 3 successful (non-reverted) entries for the same bug class.
+        _inject_fix_memory_entries(json_path, count=3,
+                                   issue_type="null deref in payment_service")
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+        fixer = _make_fixer(storage, fix_memory=fm)
+
+        issue = _make_issue(description="null deref in payment_service")
+        signal = await fixer._check_bug_recurrence(
+            issues=[issue],
+            file_paths=["payment_service.py"],
+            function_names=["process_payment"],
+        )
+
+        assert signal.is_structural is True
+        assert signal.recurrence_count >= 3
+        assert "recurrence" in signal.escalation_reason
+
+    @pytest.mark.asyncio
+    async def test_recurrence_below_threshold_returns_is_structural_false(self, tmp_path):
+        """_check_bug_recurrence returns is_structural=False when recurrence_count < 3."""
+        from memory.fix_memory import FixMemory
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm.initialise()
+        json_path = tmp_path / "fix_memory.json"
+
+        # Only 2 entries — below the threshold of 3.
+        _inject_fix_memory_entries(json_path, count=2,
+                                   issue_type="null deref in payment_service")
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+        fixer = _make_fixer(storage, fix_memory=fm)
+
+        issue = _make_issue(description="null deref in payment_service")
+        signal = await fixer._check_bug_recurrence(
+            issues=[issue],
+            file_paths=["payment_service.py"],
+            function_names=["process_payment"],
+        )
+
+        assert signal.is_structural is False
+        assert signal.recurrence_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reverted_entries_counted_separately(self, tmp_path):
+        """Reverted entries populate reverted_count but do NOT increment recurrence_count."""
+        from memory.fix_memory import FixMemory
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm.initialise()
+        json_path = tmp_path / "fix_memory.json"
+
+        # 1 successful + 3 reverted — recurrence_count should be 1 (below threshold).
+        _inject_fix_memory_entries(json_path, count=1,
+                                   issue_type="null deref", reverted=False)
+        _inject_fix_memory_entries(json_path, count=3,
+                                   issue_type="null deref", reverted=True)
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+        fixer = _make_fixer(storage, fix_memory=fm)
+
+        issue = _make_issue(description="null deref")
+        signal = await fixer._check_bug_recurrence(
+            issues=[issue],
+            file_paths=["foo.py"],
+            function_names=["bar"],
+        )
+
+        assert signal.reverted_count >= 1, "reverted entries must be captured"
+        # recurrence_count counts only non-reverted successes.
+        # 1 success < threshold=3, so is_structural must be False for recurrence alone.
+        # (coupling signal is absent — cpg_engine=None)
+        assert signal.recurrence_count == 1
+        assert signal.is_structural is False
+
+    @pytest.mark.asyncio
+    async def test_no_crash_when_fix_memory_is_none(self, tmp_path):
+        """_check_bug_recurrence must not raise when fix_memory is None."""
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+        fixer = _make_fixer(storage, fix_memory=None)
+
+        issue = _make_issue(description="null deref")
+        signal = await fixer._check_bug_recurrence(
+            issues=[issue],
+            file_paths=["foo.py"],
+            function_names=["bar"],
+        )
+
+        assert signal.is_structural is False
+        assert signal.recurrence_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recurrence_gate_triggers_refactor_proposal_in_fix_group(self, tmp_path):
+        """
+        When _check_bug_recurrence returns is_structural=True, _fix_group()
+        must return a FixAttempt with blast_radius_exceeded=True and
+        refactor_proposal_id set — no fixed_files should be generated.
+        """
+        from memory.fix_memory import FixMemory
+        from brain.schemas import IssueStatus, Severity
+        from unittest.mock import patch, AsyncMock
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm.initialise()
+        json_path = tmp_path / "fix_memory.json"
+        _inject_fix_memory_entries(json_path, count=4,
+                                   issue_type="null deref payment")
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+
+        # Write a minimal file so _load_file works.
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / "payment_service.py").write_text("def process(x):\n    return x.value\n")
+
+        fixer = _make_fixer(storage, repo_root=repo_root, fix_memory=fm)
+
+        issue = _make_issue(
+            file_path="payment_service.py",
+            severity="CRITICAL",
+            description="null deref payment",
+        )
+        issue.status = IssueStatus.OPEN
+        await storage.upsert_issue(issue)
+
+        # Stub _generate_refactor_proposal so we don't need a live LLM.
+        from brain.schemas import FixAttempt, PatchMode, RefactorProposal
+        stub_proposal = RefactorProposal(
+            run_id="test-run",
+            issue_ids=[issue.id],
+            trigger_source="recurrence",
+            recurrence_count=4,
+            requires_human_review=True,
+        )
+        await storage.upsert_refactor_proposal(stub_proposal)
+
+        stub_fix = FixAttempt(
+            run_id="test-run",
+            issue_ids=[issue.id],
+            fixed_files=[],
+            fixer_model="test-model",
+            blast_radius_exceeded=True,
+            refactor_proposal_id=stub_proposal.id,
+            patch_mode=PatchMode.FULL_FILE,
+        )
+        await storage.upsert_fix(stub_fix)
+
+        with patch.object(fixer, "_generate_refactor_proposal",
+                          new=AsyncMock(return_value=stub_fix)):
+            result = await fixer._fix_group(
+                frozenset(["payment_service.py"]), [issue]
+            )
+
+        assert result.blast_radius_exceeded is True
+        assert result.refactor_proposal_id != ""
+        assert result.fixed_files == []
+
+    def test_bug_recurrence_signal_schema_fields(self):
+        """BugRecurrenceSignal has all expected fields with correct defaults."""
+        from brain.schemas import BugRecurrenceSignal
+        s = BugRecurrenceSignal()
+        assert s.recurrence_count == 0
+        assert s.reverted_count == 0
+        assert s.window_days == 180
+        assert s.coupling_score == -1.0
+        assert s.is_structural is False
+        assert s.escalation_reason == ""
+        assert s.coupling_module_threshold == 5
+
+    def test_refactor_proposal_has_recurrence_fields(self):
+        """RefactorProposal schema carries all recurrence/coupling fields."""
+        from brain.schemas import RefactorProposal
+        p = RefactorProposal(
+            recurrence_count=3,
+            reverted_count=1,
+            distinct_caller_modules=6,
+            coupling_score=0.6,
+            recurrence_escalation_reason="test reason",
+            trigger_source="recurrence",
+        )
+        assert p.recurrence_count == 3
+        assert p.reverted_count == 1
+        assert p.distinct_caller_modules == 6
+        assert p.coupling_score == 0.6
+        assert p.trigger_source == "recurrence"
+
+    def test_refactor_proposal_trigger_source_default(self):
+        """RefactorProposal.trigger_source defaults to 'blast_radius'."""
+        from brain.schemas import RefactorProposal
+        p = RefactorProposal()
+        assert p.trigger_source == "blast_radius"
+
+
+# ===========================================================================
+# TestCPGCouplingSmellEscalation
+# ===========================================================================
+
+class TestCPGCouplingSmellEscalation:
+    """
+    Signal 2 — CPG coupling smell gate.
+
+    When CPGEngine.compute_coupling_smell() returns is_smell=True
+    (distinct_caller_modules >= threshold), _check_bug_recurrence() must
+    set is_structural=True and _fix_group() must route to a refactor proposal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_compute_coupling_smell_returns_is_smell_true_above_threshold(self):
+        """
+        CPGEngine.compute_coupling_smell marks is_smell=True when
+        distinct_caller_modules >= coupling_module_threshold.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        # Simulate 6 distinct modules (threshold=5).
+        mock_client.compute_coupling_score = AsyncMock(return_value={
+            "distinct_caller_modules": 6,
+            "coupling_score":          0.6,
+            "dominant_caller_module":  "auth/",
+            "total_callers":           24,
+            "function_name_used":      "validate_session",
+        })
+
+        engine = CPGEngine()
+        engine._client = mock_client
+        engine._ready  = True
+
+        result = await engine.compute_coupling_smell(
+            function_names=["validate_session"],
+            coupling_module_threshold=5,
+        )
+
+        assert result["is_smell"] is True
+        assert result["distinct_caller_modules"] == 6
+        assert result["coupling_score"] == 0.6
+        assert result["coupling_module_threshold"] == 5
+
+    @pytest.mark.asyncio
+    async def test_compute_coupling_smell_returns_is_smell_false_below_threshold(self):
+        """
+        CPGEngine.compute_coupling_smell marks is_smell=False when
+        distinct_caller_modules < coupling_module_threshold.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.compute_coupling_score = AsyncMock(return_value={
+            "distinct_caller_modules": 3,
+            "coupling_score":          0.3,
+            "dominant_caller_module":  "auth/",
+            "total_callers":           9,
+            "function_name_used":      "validate_session",
+        })
+
+        engine = CPGEngine()
+        engine._client = mock_client
+        engine._ready  = True
+
+        result = await engine.compute_coupling_smell(
+            function_names=["validate_session"],
+            coupling_module_threshold=5,
+        )
+
+        assert result["is_smell"] is False
+
+    @pytest.mark.asyncio
+    async def test_compute_coupling_smell_returns_safe_dict_when_joern_unavailable(self):
+        """
+        When Joern is unavailable compute_coupling_smell must return a safe
+        dict (is_smell=False, coupling_score=-1.0) without raising.
+        """
+        from cpg.cpg_engine import CPGEngine
+
+        engine = CPGEngine()
+        # _client=None, _ready=False — Joern unavailable.
+
+        result = await engine.compute_coupling_smell(function_names=["fn"])
+
+        assert result["is_smell"] is False
+        assert result["coupling_score"] == -1.0
+        assert result["distinct_caller_modules"] == 0
+
+    @pytest.mark.asyncio
+    async def test_coupling_smell_sets_is_structural_true_in_check_bug_recurrence(self, tmp_path):
+        """
+        When cpg_engine.compute_coupling_smell returns is_smell=True,
+        _check_bug_recurrence must set is_structural=True even when
+        recurrence_count=0 (no prior fixes in memory).
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_engine = MagicMock(spec=CPGEngine)
+        mock_engine.is_available = True
+        mock_engine.compute_coupling_smell = AsyncMock(return_value={
+            "distinct_caller_modules":  7,
+            "coupling_score":           0.7,
+            "dominant_caller_module":   "billing/",
+            "total_callers":            28,
+            "function_name_used":       "process_payment",
+            "is_smell":                 True,
+            "coupling_module_threshold": 5,
+        })
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+        fixer = _make_fixer(storage, cpg_engine=mock_engine, fix_memory=None)
+
+        issue = _make_issue(description="null deref process_payment")
+        signal = await fixer._check_bug_recurrence(
+            issues=[issue],
+            file_paths=["billing/payment_service.py"],
+            function_names=["process_payment"],
+        )
+
+        assert signal.is_structural is True
+        assert signal.distinct_caller_modules == 7
+        assert signal.coupling_score == 0.7
+        assert "coupling_smell" in signal.escalation_reason
+
+    @pytest.mark.asyncio
+    async def test_compute_structural_risk_combines_blast_and_coupling(self):
+        """
+        CPGEngine.compute_structural_risk returns requires_refactor=True when
+        coupling is_smell is True, even if blast.requires_human_review=False.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import MagicMock, AsyncMock, patch
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+
+        engine = CPGEngine(blast_radius_threshold=50)
+        engine._client = mock_client
+        engine._ready  = True
+
+        # Blast radius: well below gate (only 5 functions).
+        from cpg.cpg_engine import CPGBlastRadius
+        safe_blast = CPGBlastRadius(
+            changed_functions=["fn"],
+            affected_function_count=5,
+            affected_file_count=2,
+            blast_radius_score=0.025,
+            requires_human_review=False,
+        )
+
+        # Coupling smell: 6 distinct modules (above threshold=5).
+        coupling_smell = {
+            "distinct_caller_modules":  6,
+            "coupling_score":           0.6,
+            "dominant_caller_module":   "auth/",
+            "total_callers":            18,
+            "function_name_used":       "fn",
+            "is_smell":                 True,
+            "coupling_module_threshold": 5,
+        }
+
+        with patch.object(engine, "compute_blast_radius",
+                          new=AsyncMock(return_value=safe_blast)), \
+             patch.object(engine, "compute_coupling_smell",
+                          new=AsyncMock(return_value=coupling_smell)):
+            result = await engine.compute_structural_risk(
+                function_names=["fn"],
+                coupling_module_threshold=5,
+            )
+
+        assert result["requires_refactor"] is True
+        assert "coupling_smell" in result["refactor_reason"]
+        assert result["blast"] is safe_blast
+        assert result["coupling"] is coupling_smell
+
+    @pytest.mark.asyncio
+    async def test_joern_client_compute_coupling_score_groups_by_parent_dir(self):
+        """
+        JoernClient.compute_coupling_score must group caller files by parent
+        directory and count distinct directories as distinct_caller_modules.
+        """
+        from cpg.joern_client import JoernClient
+        from unittest.mock import MagicMock, AsyncMock
+
+        client = JoernClient()
+        client._session = MagicMock()
+        client._ready   = True
+
+        # 5 callers from 3 different parent dirs.
+        raw_results = [
+            {"callerFile": "auth/login.py"},
+            {"callerFile": "auth/logout.py"},
+            {"callerFile": "billing/invoice.py"},
+            {"callerFile": "reporting/dashboard.py"},
+            {"callerFile": "reporting/export.py"},
+        ]
+        client._query = AsyncMock(return_value=raw_results)
+
+        result = await client.compute_coupling_score(
+            function_names=["validate_session"],
+        )
+
+        assert result["distinct_caller_modules"] == 3   # auth, billing, reporting
+        assert result["total_callers"] == 5
+        assert result["coupling_score"] == pytest.approx(0.3, abs=0.01)
+        assert result["function_name_used"] == "validate_session"
+
+    @pytest.mark.asyncio
+    async def test_joern_client_compute_coupling_score_returns_safe_dict_when_not_ready(self):
+        """compute_coupling_score returns safe dict when client is not ready."""
+        from cpg.joern_client import JoernClient
+
+        client = JoernClient()
+        # _ready=False — no active session.
+
+        result = await client.compute_coupling_score(function_names=["fn"])
+
+        assert result["distinct_caller_modules"] == 0
+        assert result["coupling_score"] == -1.0
+        assert result["is_smell"] if "is_smell" in result else True  # key may be absent
+
+    def test_coupling_smell_reason_included_in_refactor_proposal(self):
+        """
+        When trigger_source='coupling_smell', RefactorProposal stores the
+        coupling metadata so the human reviewer sees the structural context.
+        """
+        from brain.schemas import RefactorProposal
+        p = RefactorProposal(
+            trigger_source="coupling_smell",
+            distinct_caller_modules=7,
+            coupling_score=0.7,
+            recurrence_escalation_reason=(
+                "coupling_smell: 7 distinct caller modules >= threshold=5"
+            ),
+        )
+        assert p.trigger_source == "coupling_smell"
+        assert p.distinct_caller_modules == 7
+        assert "coupling_smell" in p.recurrence_escalation_reason
+
+
+# ===========================================================================
+# TestArchitecturalSymptomPlanner
+# ===========================================================================
+
+class TestArchitecturalSymptomPlanner:
+    """
+    PlannerAgent architectural symptom detection.
+
+    When the coherence LLM sets is_architectural_symptom=True the planner
+    must block the fix, set verdict=UNSAFE, and create an
+    ARCHITECTURAL_SYMPTOM_DETECTED escalation — regardless of blast radius.
+    """
+
+    @pytest.mark.asyncio
+    async def test_architectural_symptom_blocks_fix(self, tmp_path):
+        """
+        When _assess_coherence returns is_architectural_symptom=True the
+        planner verdict must be UNSAFE and block_commit must be True.
+        """
+        from agents.planner import PlannerAgent
+        from brain.schemas import PlannerVerdict
+        from unittest.mock import patch, AsyncMock
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+
+        fix = _make_fix_attempt()
+        await storage.upsert_fix(fix)
+
+        planner = _make_planner(storage)
+
+        # Stub the two LLM calls.
+        with patch.object(
+            planner, "_classify_reversibility",
+            new=AsyncMock(return_value=("REVERSIBLE", 0.9, "clean revert possible"))
+        ), patch.object(
+            planner, "_assess_coherence",
+            new=AsyncMock(return_value=(
+                True,    # safe
+                0.4,     # risk_score — below block threshold
+                [],      # concerns
+                "looks fine locally",   # simulation_summary
+                True,    # is_architectural_symptom  ← triggers block
+                "Function called from 6 unrelated modules; ownership boundary absent.",
+            ))
+        ):
+            record = await planner.evaluate(fix)
+
+        assert record.verdict == PlannerVerdict.UNSAFE
+        assert record.block_commit is True
+        assert "ArchSymptom" in record.reason or "architectural" in record.reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_architectural_symptom_creates_escalation(self, tmp_path):
+        """
+        When is_architectural_symptom=True the planner must call
+        escalation_manager.create_escalation with type
+        ARCHITECTURAL_SYMPTOM_DETECTED.
+        """
+        from agents.planner import PlannerAgent
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+
+        fix = _make_fix_attempt()
+        await storage.upsert_fix(fix)
+
+        mock_esc_manager = MagicMock()
+        mock_esc_manager.create_escalation = AsyncMock(return_value=MagicMock(id="esc-1"))
+
+        planner = _make_planner(storage, escalation_manager=mock_esc_manager)
+
+        with patch.object(
+            planner, "_classify_reversibility",
+            new=AsyncMock(return_value=("REVERSIBLE", 0.9, ""))
+        ), patch.object(
+            planner, "_assess_coherence",
+            new=AsyncMock(return_value=(
+                True, 0.3, [], "", True,
+                "Same null-deref class appeared here 4 times in 6 months.",
+            ))
+        ):
+            await planner.evaluate(fix)
+
+        mock_esc_manager.create_escalation.assert_called_once()
+        call_kwargs = mock_esc_manager.create_escalation.call_args.kwargs
+        assert call_kwargs.get("escalation_type") == "ARCHITECTURAL_SYMPTOM_DETECTED"
+        assert "architectural" in call_kwargs.get("description", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_no_architectural_symptom_does_not_block_when_otherwise_safe(self, tmp_path):
+        """
+        When is_architectural_symptom=False and all other signals are safe
+        the planner must NOT block the fix.
+        """
+        from agents.planner import PlannerAgent
+        from brain.schemas import PlannerVerdict
+        from unittest.mock import patch, AsyncMock
+
+        storage = _make_storage(tmp_path)
+        await storage.initialise()
+
+        fix = _make_fix_attempt()
+        await storage.upsert_fix(fix)
+
+        planner = _make_planner(storage)
+
+        with patch.object(
+            planner, "_classify_reversibility",
+            new=AsyncMock(return_value=("REVERSIBLE", 0.95, ""))
+        ), patch.object(
+            planner, "_assess_coherence",
+            new=AsyncMock(return_value=(
+                True,   # safe
+                0.2,    # risk_score — safe
+                [],
+                "no issues",
+                False,  # is_architectural_symptom=False
+                "",
+            ))
+        ):
+            record = await planner.evaluate(fix)
+
+        assert record.block_commit is False
+        assert record.verdict in (PlannerVerdict.SAFE, PlannerVerdict.SAFE_WITH_WARNING)
+
+    def test_causal_chain_response_has_architectural_symptom_fields(self):
+        """CausalChainResponse carries the two new architectural symptom fields."""
+        from agents.planner import CausalChainResponse
+        r = CausalChainResponse(
+            safe=True,
+            risk_score=0.3,
+            is_architectural_symptom=True,
+            architectural_reason="over-coupled function",
+        )
+        assert r.is_architectural_symptom is True
+        assert r.architectural_reason == "over-coupled function"
+
+    def test_causal_chain_response_defaults_symptom_false(self):
+        """CausalChainResponse.is_architectural_symptom defaults to False."""
+        from agents.planner import CausalChainResponse
+        r = CausalChainResponse()
+        assert r.is_architectural_symptom is False
+        assert r.architectural_reason == ""
