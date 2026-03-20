@@ -113,6 +113,21 @@ tree-sitter-language-pack>=0.1.0
 networkx>=3.3.0
 pyan3>=1.1.1
 
+# ── Gap 1: CPG / Joern client ─────────────────────────────────────────────────
+# Joern itself is a JVM application — no Python package needed.
+# The Python CPG client communicates with the Joern HTTP server via aiohttp.
+# aiohttp is already in the web/API section above.
+# No additional Python packages required for the CPG subsystem.
+#
+# To start Joern:
+#   docker-compose up joern              (recommended)
+#   OR manually:
+#   docker run -p 8080:8080 -v /your/repo:/repo ghcr.io/joernio/joern joern --server
+#
+# JVM requirement: Joern requires JDK 17+.  The Docker image includes it.
+# Memory:  Joern needs 4–10GB RAM for 10M line codebases.
+#          Set mem_limit in docker-compose.yml accordingly.
+
 # ── Formal verification ───────────────────────────────────────────────────────
 z3-solver>=4.13.0
 

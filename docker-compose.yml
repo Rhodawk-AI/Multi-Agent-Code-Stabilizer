@@ -102,6 +102,48 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
+  # ── Gap 1: Joern Code Property Graph server ───────────────────────────────
+  # Joern builds a CPG (AST + CFG + PDG) for the entire codebase.
+  # This replaces vector similarity for context selection: instead of finding
+  # semantically similar code we compute the backward program slice — the
+  # functions that CAUSED the bug, regardless of semantic similarity.
+  #
+  # Supports: C/C++, Java, Python, JavaScript, TypeScript, Go, Kotlin, PHP
+  # License: Apache 2.0
+  # Docs: https://docs.joern.io
+  #
+  # The repo is mounted into the container at /repo so Joern can parse it.
+  # Set JOERN_REPO_PATH in .env to the HOST path of the repo being audited.
+  joern:
+    image: ghcr.io/joernio/joern:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - JOERN_SERVER_HOST=0.0.0.0
+      - JOERN_SERVER_PORT=8080
+    volumes:
+      # Mount the target repository so Joern can parse it.
+      # ${JOERN_REPO_PATH} = absolute path to the repo on the host.
+      # Override in .env: JOERN_REPO_PATH=/path/to/your/repo
+      - ${JOERN_REPO_PATH:-/tmp/rhodawk_empty}:/repo:ro
+      - joern_workspace:/root/.joern
+    command: >
+      joern
+      --server
+      --server-host 0.0.0.0
+      --server-port 8080
+      --max-heap-size 8g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v1/projects"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    # Joern needs significant memory for large codebases
+    mem_limit: 10g
+    mem_reservation: 4g
+
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -125,3 +167,7 @@ volumes:
   qdrant_data:
   ollama_models:
   grafana_data:
+  # Gap 1: Joern CPG workspace (persists the built CPG across restarts)
+  # Avoids full CPG rebuild on every container restart — only changed files
+  # are re-parsed using Joern's incremental overlay mechanism.
+  joern_workspace:
