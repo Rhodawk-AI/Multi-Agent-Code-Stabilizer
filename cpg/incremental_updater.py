@@ -39,6 +39,21 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Maximum number of functions that may appear in the CPG-computed impact set
+# before the incremental audit scheduler switches to a "mark all impacted
+# files STALE" strategy instead of emitting per-function staleness marks.
+#
+# Why this cap exists: at 10M lines, a single change to a base utility (e.g.
+# utils.py or a logging helper) can produce thousands of transitive callers at
+# depth 3.  Without a cap, the staleness-mark table would receive thousands of
+# rows per commit, turning the storage layer into a bottleneck and making the
+# next read phase re-audit more code than a full codebase scan would.
+#
+# When the cap is hit we log a warning and fall back to file-level STALE
+# marking (the same coarse behaviour as the old hash-based staleness tracking),
+# which is still much better than re-auditing 10M lines from scratch.
+_MAX_IMPACT_BREADTH: int = 500
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -137,7 +152,28 @@ class IncrementalCPGUpdater:
                     file_paths=list(changed_files),
                     depth=3,
                 )
-                result.impact_set               = impact.affected_functions
+                # GAP 4 FIX: guard against unbounded impact sets.
+                # A single change to a widely-used utility can produce
+                # thousands of transitive callers at depth 3.  When the
+                # impact set exceeds _MAX_IMPACT_BREADTH we truncate it and
+                # log a warning so operators know why per-function marks were
+                # not emitted.  The caller (CommitAuditScheduler or
+                # _requeue_transitive_dependents) will fall back to file-level
+                # STALE marking for the overflow, which is still far cheaper
+                # than a full 10M-line re-audit.
+                raw_impact = impact.affected_functions
+                if len(raw_impact) > _MAX_IMPACT_BREADTH:
+                    log.warning(
+                        "IncrementalCPGUpdater: impact set size %d exceeds "
+                        "cap %d for functions %s — truncating to cap. "
+                        "Consider raising cpg_blast_radius_threshold or "
+                        "refactoring the changed utility.",
+                        len(raw_impact),
+                        _MAX_IMPACT_BREADTH,
+                        diff.all_changed_functions[:5],
+                    )
+                    raw_impact = raw_impact[:_MAX_IMPACT_BREADTH]
+                result.impact_set               = raw_impact
                 result.impact_files             = impact.affected_files
                 result.total_functions_affected  = impact.affected_function_count
             except Exception as exc:
@@ -386,11 +422,41 @@ def _ts_changed_functions(original: str, new_content: str, file_path: str) -> li
     parser = get_parser(lang)
 
     def _extract_fn_bodies(content: str) -> dict[str, str]:
+        """
+        Return a mapping of qualified_name → function_body_text.
+
+        GAP 4 FIX: method names are now qualified as ``ClassName.method_name``
+        to prevent name collisions between methods in different classes.
+
+        Original bug: the function used a plain dict keyed on bare function
+        names, so two classes both containing ``def run(self)`` would silently
+        overwrite each other in the dict.  The diff comparison would then miss
+        a change to the *first* ``run`` seen if the *second* ``run`` was
+        unchanged, and vice versa, producing both false negatives and false
+        positives in the changed-function list.
+
+        For module-level functions (not inside any class) the key is still the
+        bare function name, matching the behaviour of _regex_changed_functions
+        and the hunk-header parser so all three extraction paths produce
+        consistent names.
+        """
         tree  = parser.parse(content.encode())
         lines = content.splitlines()
         bodies: dict[str, str] = {}
 
-        def _walk(node) -> None:
+        def _walk(node, class_name: str = "") -> None:
+            current_class = class_name
+
+            # Detect class / struct / impl boundaries to update the prefix.
+            if node.type in {
+                "class_definition", "class_declaration",
+                "struct_item", "impl_item",
+            }:
+                for child in node.children:
+                    if child.type in {"identifier", "name", "type_identifier"}:
+                        current_class = child.text.decode(errors="replace")
+                        break
+
             if node.type in {
                 "function_definition", "function_declaration",
                 "method_definition", "function_item", "arrow_function",
@@ -401,11 +467,16 @@ def _ts_changed_functions(original: str, new_content: str, file_path: str) -> li
                         fn_name = child.text.decode(errors="replace")
                         break
                 if fn_name:
-                    bodies[fn_name] = "\n".join(
+                    qualified = (
+                        f"{current_class}.{fn_name}"
+                        if current_class else fn_name
+                    )
+                    bodies[qualified] = "\n".join(
                         lines[node.start_point[0]:node.end_point[0] + 1]
                     )
+
             for child in node.children:
-                _walk(child)
+                _walk(child, current_class)
 
         _walk(tree.root_node)
         return bodies
@@ -419,9 +490,23 @@ def _ts_changed_functions(original: str, new_content: str, file_path: str) -> li
 
 def _regex_changed_functions(original: str, new_content: str, file_path: str) -> list[str]:
     ext = Path(file_path).suffix.lower()
+    # GAP 4 FIX: the Python pattern previously used `^` which only matched
+    # module-level functions (column 0).  Class methods are indented by 4+
+    # spaces, so they were invisible to the regex and never appeared in the
+    # changed-function list.
+    #
+    # Fix: use `^\s*` to match any indentation level.  This covers:
+    #   • Module-level `def foo(` and `async def foo(`
+    #   • Class methods `    def foo(self,`
+    #   • Doubly-nested methods (e.g. closures, nested classes)
+    #
+    # The captured group is still the bare function name, which is consistent
+    # with the hunk-header parser.  Name qualification (ClassName.method_name)
+    # is done by the tree-sitter path; the regex path is a fallback for when
+    # tree-sitter is unavailable and bare names are acceptable.
     patterns = {
-        ".py":  re.compile(r"^(?:async\s+)?def\s+(\w+)\s*\("),
-        ".pyi": re.compile(r"^def\s+(\w+)\s*\("),
+        ".py":  re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\("),
+        ".pyi": re.compile(r"^\s*def\s+(\w+)\s*\("),
         ".c":   re.compile(r"^[a-zA-Z_][\w\s\*]+\s+(\w+)\s*\("),
         ".h":   re.compile(r"^[a-zA-Z_][\w\s\*]+\s+(\w+)\s*\("),
         ".cpp": re.compile(r"^[a-zA-Z_][\w:\s\*<>]+\s+(\w+)\s*\("),
