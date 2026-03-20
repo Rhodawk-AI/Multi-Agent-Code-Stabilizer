@@ -1,30 +1,3 @@
-"""
-orchestrator/controller.py — Rhodawk AI Code Stabilizer
-========================================================
-
-PRODUCTION FIXES vs audit report
-──────────────────────────────────
-• ARCH-1: Removed _run_classic() and _run_langgraph() parallel paths.
-  DeerFlow is the sole orchestration layer. No silent fallbacks.
-• ARCH-2: PostgreSQL is now the default storage backend. SQLite is
-  explicitly opt-in via use_sqlite=True for development only.
-• ARCH-3: startup.feature_matrix.verify() called at initialise() — any
-  required capability missing in military/aerospace/nuclear raises
-  ConfigurationError before the first LLM call.
-• ARCH-4: ESCALATE_HUMAN now calls EscalationManager.create_escalation()
-  and awaits wait_for_resolution() — the pipeline genuinely blocks.
-• ARCH-5: _phase_fix() enforces ReviewerIndependenceRecord — rejects
-  fix/reviewer pairs from the same model family.
-• ARCH-6: _phase_commit() uses UNIFIED_DIFF patch mode by default for
-  files above SURGICAL_PATCH_THRESHOLD lines.
-• ARCH-7: Function-level staleness tracking after each commit — only
-  stale functions are re-audited, not entire files.
-• ARCH-8: StabilizerConfig defaults removed from field defaults where
-  they caused mutable-default issues; all lists use Field(default_factory).
-• ARCH-9: _commit_module_group uses proper JJ/git atomic commit via
-  the version-control MCP tool rather than direct file writes then PR.
-• Removed FIX_RATIO_MIN/MAX guards — replaced by compiler correctness gate.
-"""
 from __future__ import annotations
 
 import asyncio
