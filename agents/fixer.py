@@ -293,9 +293,16 @@ class FixerAgent(BaseAgent):
                 ]
 
             blast = await self.cpg_engine.compute_blast_radius(function_names=function_names, file_paths=file_paths, depth=3)
-            if not blast.affected_functions:
+            if not blast.affected_functions and not blast.importing_modules:
                 return ('', blast)
-            lines: list[str] = [f'Blast radius: **{blast.affected_function_count} functions** across **{blast.affected_file_count} files** (score={blast.blast_radius_score:.2f})', '']
+
+            lines: list[str] = [
+                f'Blast radius: **{blast.affected_function_count} functions** across '
+                f'**{blast.affected_file_count} files** '
+                f'(score={blast.blast_radius_score:.4f})',
+                '',
+            ]
+
             by_file: dict[str, list[dict]] = {}
             for fn in blast.affected_functions:
                 fp = fn.get('file_path', '<unknown>')
@@ -308,12 +315,37 @@ class FixerAgent(BaseAgent):
                     rel = fn.get('relationship', '')
                     lines.append(f'  - L{line}  `{name}` [{rel}]')
                 lines.append('')
+
             if blast.test_files_affected:
                 lines.append(f'**Test files that cover changed code** ({len(blast.test_files_affected)}):')
                 for tf in blast.test_files_affected[:10]:
                     lines.append(f'  - `{tf}`')
+                lines.append('')
+
+            # ── Import-only references ─────────────────────────────────────────
+            # These files import a changed symbol but never call any changed
+            # function.  They are invisible to the call graph and were the
+            # undercount identified in the Gap 3 audit.  A type or signature
+            # change will break them even though no call site exists.
+            if blast.importing_modules:
+                lines.append(
+                    f'**Import-only references** — files that import a changed symbol '
+                    f'without calling any changed function ({blast.importing_module_count}):'
+                )
+                lines.append(
+                    '_These files are broken by type changes, constant renames, and '
+                    'signature shifts even though the call graph does not reach them._'
+                )
+                for im in blast.importing_modules[:20]:
+                    lines.append(f'  - `{im}`')
+                lines.append('')
+
             context_text = '\n'.join(lines)
-            self.log.info(f'[Fixer] Gap 3 forward impact: {blast.affected_function_count} fns requires_human_review={blast.requires_human_review}')
+            self.log.info(
+                f'[Fixer] Gap 3 forward impact: {blast.affected_function_count} fns '
+                f'+ {blast.importing_module_count} import-only modules '
+                f'requires_human_review={blast.requires_human_review}'
+            )
             return (context_text, blast)
         except Exception as exc:
             self.log.debug(f'_get_forward_impact_context: {exc}')
@@ -336,7 +368,7 @@ class FixerAgent(BaseAgent):
         except Exception as exc:
             self.log.error(f'[Fixer] _generate_refactor_proposal LLM call failed: {exc}')
             resp = _RefactorResponse(proposed_refactoring='LLM generation failed — manual review required.', recommendation='Route to senior engineer for manual refactor planning.')
-        proposal = RefactorProposal(run_id=self.run_id, issue_ids=[i.id for i in issues], changed_functions=blast.changed_functions, affected_function_count=blast.affected_function_count, affected_file_count=blast.affected_file_count, test_files_affected=blast.test_files_affected, blast_radius_score=blast.blast_radius_score, affected_components=resp.affected_components, proposed_refactoring=resp.proposed_refactoring, migration_steps=resp.migration_steps, estimated_scope=resp.estimated_scope, risks=resp.risks, recommendation=resp.recommendation, requires_human_review=True)
+        proposal = RefactorProposal(run_id=self.run_id, issue_ids=[i.id for i in issues], changed_functions=blast.changed_functions, affected_function_count=blast.affected_function_count, affected_file_count=blast.affected_file_count, test_files_affected=blast.test_files_affected, blast_radius_score=blast.blast_radius_score, importing_modules=blast.importing_modules, importing_module_count=blast.importing_module_count, affected_components=resp.affected_components, proposed_refactoring=resp.proposed_refactoring, migration_steps=resp.migration_steps, estimated_scope=resp.estimated_scope, risks=resp.risks, recommendation=resp.recommendation, requires_human_review=True)
         if hasattr(self.storage, 'upsert_refactor_proposal'):
             await self.storage.upsert_refactor_proposal(proposal)
         escalation_id = ''
