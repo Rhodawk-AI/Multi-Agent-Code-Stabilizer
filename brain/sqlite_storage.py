@@ -1683,3 +1683,147 @@ class SQLiteBrainStorage(BrainStorage):
                 return result
             except Exception:
                 return []
+
+    # ── GAP 2: SynthesisReport persistence ────────────────────────────────────
+
+    async def _ensure_synthesis_reports_table(self, db) -> None:
+        """Create synthesis_reports table if it does not exist."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS synthesis_reports (
+                id      TEXT PRIMARY KEY,
+                run_id  TEXT NOT NULL,
+                cycle   INTEGER NOT NULL DEFAULT 0,
+                data    TEXT NOT NULL
+            )
+        """)
+        try:
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_synthesis_reports_run "
+                "ON synthesis_reports(run_id)"
+            )
+        except Exception:
+            pass
+
+    async def upsert_synthesis_report(self, report: "SynthesisReport") -> None:  # type: ignore[override]
+        """
+        Persist a SynthesisReport produced by SynthesisAgent after each
+        synthesis pass.  One report per run per cycle — the id field is the
+        natural primary key.
+
+        Gap 2 fix: previously SynthesisReport was defined in schemas.py and
+        imported in controller.py but never constructed or stored.  Per-run
+        synthesis quality metrics (dedup counts, compound finding counts) were
+        only emitted to log.info and lost.  This method closes that gap.
+        """
+        from brain.schemas import SynthesisReport
+        async with self._write() as db:
+            await self._ensure_synthesis_reports_table(db)
+            await db.execute(
+                "INSERT OR REPLACE INTO synthesis_reports (id, run_id, cycle, data) "
+                "VALUES (?,?,?,?)",
+                (report.id, report.run_id, report.cycle, report.model_dump_json()),
+            )
+            await db.commit()
+
+    async def get_synthesis_report(self, run_id: str, cycle: int | None = None) -> "SynthesisReport | None":  # type: ignore[override]
+        """
+        Retrieve the SynthesisReport for a run.
+
+        If cycle is specified, returns the report for that cycle.
+        If cycle is None, returns the most recent report for the run.
+        """
+        from brain.schemas import SynthesisReport
+        async with self._conn() as db:
+            try:
+                await self._ensure_synthesis_reports_table(db)
+                if cycle is not None:
+                    sql = (
+                        "SELECT data FROM synthesis_reports "
+                        "WHERE run_id=? AND cycle=? LIMIT 1"
+                    )
+                    params = (run_id, cycle)
+                else:
+                    sql = (
+                        "SELECT data FROM synthesis_reports "
+                        "WHERE run_id=? ORDER BY cycle DESC LIMIT 1"
+                    )
+                    params = (run_id,)
+                async with db.execute(sql, params) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        return SynthesisReport.model_validate_json(row["data"])
+            except Exception:
+                pass
+        return None
+
+    async def list_synthesis_reports(self, run_id: str | None = None) -> "list[SynthesisReport]":  # type: ignore[override]
+        """
+        List all SynthesisReports, optionally filtered by run_id.
+        Ordered by run_id ASC, cycle ASC.
+        """
+        from brain.schemas import SynthesisReport
+        async with self._conn() as db:
+            try:
+                await self._ensure_synthesis_reports_table(db)
+                if run_id:
+                    sql = (
+                        "SELECT data FROM synthesis_reports "
+                        "WHERE run_id=? ORDER BY cycle ASC"
+                    )
+                    params = (run_id,)
+                else:
+                    sql = "SELECT data FROM synthesis_reports ORDER BY run_id, cycle ASC"
+                    params = ()
+                async with db.execute(sql, params) as cur:
+                    rows = await cur.fetchall()
+                result = []
+                for row in rows:
+                    try:
+                        result.append(SynthesisReport.model_validate_json(row["data"]))
+                    except Exception:
+                        pass
+                return result
+            except Exception:
+                return []
+
+    # ── GAP 2: Compound findings query ────────────────────────────────────────
+
+    async def list_compound_findings(
+        self,
+        run_id: str | None = None,
+        severity: str | None = None,
+    ) -> list:
+        """
+        Return all Issues with executor_type=SYNTHESIS — these ARE the
+        compound findings.  SynthesisAgent materialises each CompoundFinding
+        as a regular Issue (executor_type=SYNTHESIS) so they flow through the
+        normal consensus → fix → review pipeline.
+
+        This query surfaces them as first-class objects for the API and
+        external consumers (dashboards, webhooks, DeerFlow).
+
+        Parameters
+        ----------
+        run_id:
+            If provided, filter to a specific run.
+        severity:
+            If provided (e.g. "CRITICAL"), filter by severity value.
+        """
+        from brain.schemas import ExecutorType
+        async with self._conn() as db:
+            try:
+                conditions = ["executor_type = ?"]
+                params: list = [ExecutorType.SYNTHESIS.value]
+                if run_id:
+                    conditions.append("run_id = ?")
+                    params.append(run_id)
+                if severity:
+                    conditions.append("severity = ?")
+                    params.append(severity)
+                where = " AND ".join(conditions)
+                sql = f"SELECT * FROM issues WHERE {where} ORDER BY created_at DESC"
+                async with db.execute(sql, params) as cur:
+                    rows = await cur.fetchall()
+                return [self._row_to_issue(row) for row in rows]
+            except Exception:
+                return []
