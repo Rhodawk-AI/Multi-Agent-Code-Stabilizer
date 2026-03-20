@@ -1004,3 +1004,236 @@ class TestImportGraphBlastRadius:
         assert loaded is not None, "legacy proposal must be loadable after migration"
         assert loaded.importing_module_count == 0
         assert loaded.importing_modules == []
+
+
+# ===========================================================================
+# Fix 2 — CPG FQN resolution: resolve_method_fqn + resolve_function_names
+# ===========================================================================
+
+class TestCPGFQNResolution:
+    """
+    Verifies that CPGEngine.resolve_function_names resolves bare symbol names
+    to actual CPG FQNs via JoernClient.resolve_method_fqn, and that
+    compute_blast_radius passes resolved names to compute_impact_set and
+    get_importing_files rather than the raw fixer-derived names.
+
+    This prevents the silent zero-hit failure where a name like
+    ``src.services.payment_service.process_payment`` (derived from the file
+    system path) does not match the CPG node
+    ``services.payment_service.process_payment`` (derived from sys.path).
+    """
+
+    # ── JoernClient.resolve_method_fqn exists and is callable ────────────────
+
+    def test_resolve_method_fqn_exists_on_client(self):
+        from cpg.joern_client import JoernClient
+        assert hasattr(JoernClient, "resolve_method_fqn"), (
+            "JoernClient must expose resolve_method_fqn"
+        )
+        import inspect
+        assert inspect.iscoroutinefunction(JoernClient.resolve_method_fqn), (
+            "resolve_method_fqn must be async"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_returns_empty_when_not_ready(self):
+        from cpg.joern_client import JoernClient
+        client = JoernClient()
+        # _ready is False — must return [] without crashing
+        result = await client.resolve_method_fqn("process_payment", "payment_service.py")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_returns_fqns_from_cpg(self):
+        """When Joern returns FQNs, resolve_method_fqn surfaces them."""
+        from cpg.joern_client import JoernClient
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = JoernClient()
+        client._ready = True
+        client._session = MagicMock()
+        client._query = AsyncMock(return_value=[
+            "services.payment_service.PaymentService.process_payment",
+        ])
+
+        fqns = await client.resolve_method_fqn("process_payment", "payment_service.py")
+        assert len(fqns) == 1
+        assert fqns[0] == "services.payment_service.PaymentService.process_payment"
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_filters_empty_results(self):
+        from cpg.joern_client import JoernClient
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = JoernClient()
+        client._ready = True
+        client._session = MagicMock()
+        # Joern may return empty strings or "<empty>" sentinel values
+        client._query = AsyncMock(return_value=["", "<empty>", "valid.FQN.method"])
+
+        fqns = await client.resolve_method_fqn("method")
+        assert "" not in fqns
+        assert "<empty>" not in fqns
+        assert "valid.FQN.method" in fqns
+
+    # ── CPGEngine.resolve_function_names ──────────────────────────────────────
+
+    def test_resolve_function_names_exists_on_engine(self):
+        from cpg.cpg_engine import CPGEngine
+        assert hasattr(CPGEngine, "resolve_function_names"), (
+            "CPGEngine must expose resolve_function_names"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_returns_input_when_joern_unavailable(self):
+        from cpg.cpg_engine import CPGEngine
+
+        engine = CPGEngine()
+        engine._ready = False  # Joern unavailable
+
+        names = ["process_payment", "src.services.payment_service.process_payment"]
+        result = await engine.resolve_function_names(names)
+        assert set(result) >= set(names), (
+            "When Joern is unavailable, all input names must be returned as fallback"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_adds_cpg_fqn_alongside_bare(self):
+        """
+        resolve_function_names must return BOTH the original names AND the
+        CPG-resolved FQN so that impact queries hit real CPG nodes while the
+        bare name still works as a fallback.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=["services.payment_service.PaymentService.process_payment"]
+        )
+
+        engine = CPGEngine()
+        engine._client = mock_client
+        engine._ready  = True
+
+        result = await engine.resolve_function_names(
+            bare_names=["process_payment"],
+            file_paths=["src/services/payment_service.py"],
+        )
+
+        assert "process_payment" in result, (
+            "Bare name must be retained as fallback"
+        )
+        assert "services.payment_service.PaymentService.process_payment" in result, (
+            "CPG-resolved FQN must be added"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_deduplicates(self):
+        """Passing the same name twice must not produce duplicates."""
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.resolve_method_fqn = AsyncMock(return_value=["pkg.mod.fn"])
+
+        engine = CPGEngine()
+        engine._client = mock_client
+        engine._ready  = True
+
+        result = await engine.resolve_function_names(
+            bare_names=["fn", "fn"],
+        )
+        assert result.count("fn") == 1, "Duplicates must be removed"
+        assert result.count("pkg.mod.fn") == 1
+
+    # ── compute_blast_radius passes resolved names downstream ─────────────────
+
+    @pytest.mark.asyncio
+    async def test_compute_blast_radius_uses_resolved_names_for_impact_set(self):
+        """
+        compute_blast_radius must call compute_impact_set with resolved FQNs,
+        not the raw fixer-derived names.  This is the core regression: when
+        only the raw name is passed, Joern returns zero results and the blast
+        gate never fires for repos with non-trivial package structure.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock, call
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+
+        # resolve_method_fqn returns the real FQN
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=["services.payment_service.PaymentService.process_payment"]
+        )
+        # impact set returns one affected function
+        mock_client.compute_impact_set = AsyncMock(return_value=[
+            {"function_name": "caller_fn", "file_path": "checkout.py",
+             "line_number": 42, "relationship": "caller", "depth": 1}
+        ])
+        mock_client.get_importing_files = AsyncMock(return_value=[])
+
+        engine = CPGEngine(blast_radius_threshold=50)
+        engine._client = mock_client
+        engine._ready  = True
+
+        await engine.compute_blast_radius(
+            function_names=["process_payment"],
+            file_paths=["src/services/payment_service.py"],
+        )
+
+        # compute_impact_set must have been called with a list that includes
+        # the resolved FQN, not just the bare name.
+        assert mock_client.compute_impact_set.called, "compute_impact_set must be called"
+        call_kwargs = mock_client.compute_impact_set.call_args
+        passed_names = (
+            call_kwargs.kwargs.get("function_names")
+            or (call_kwargs.args[0] if call_kwargs.args else [])
+        )
+        assert "services.payment_service.PaymentService.process_payment" in passed_names, (
+            "compute_impact_set must receive the CPG-resolved FQN, not just the bare name"
+        )
+
+    @pytest.mark.asyncio
+    async def test_compute_blast_radius_uses_resolved_names_for_import_query(self):
+        """
+        get_importing_files must also receive the resolved FQNs so import-only
+        references are found even in repos with non-trivial package structure.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=["auth.middleware.validate_session"]
+        )
+        mock_client.compute_impact_set = AsyncMock(return_value=[])
+        mock_client.get_importing_files = AsyncMock(return_value=[
+            {"importer_file": "consumer.py", "imported_symbol": "validate_session",
+             "relationship": "import_reference"}
+        ])
+
+        engine = CPGEngine(blast_radius_threshold=50)
+        engine._client = mock_client
+        engine._ready  = True
+
+        blast = await engine.compute_blast_radius(
+            function_names=["validate_session"],
+            file_paths=["auth/middleware.py"],
+        )
+
+        assert mock_client.get_importing_files.called
+        import_kwargs = mock_client.get_importing_files.call_args
+        import_names = (
+            import_kwargs.kwargs.get("symbol_names")
+            or (import_kwargs.args[0] if import_kwargs.args else [])
+        )
+        assert "auth.middleware.validate_session" in import_names, (
+            "get_importing_files must receive the CPG-resolved FQN"
+        )
+        assert blast.importing_module_count == 1
+        assert "consumer.py" in blast.importing_modules
