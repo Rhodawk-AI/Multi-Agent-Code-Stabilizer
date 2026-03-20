@@ -25,6 +25,16 @@ PRODUCTION FIXES vs audit report
 • Extended AuditRun: software_level, tool_qualification_level, baseline_id
 • Added PatchMode enum (FULL_FILE / UNIFIED_DIFF / AST_REWRITE)
 • Removed FIX_RATIO_MIN — replaced by compiler-based correctness gate
+
+GAP 2 ADDITIONS (Synthesis Agent — cross-domain compound findings)
+────────────────────────────────────────────────────────────────────
+• Added ExecutorType.SYNTHESIS — new executor for SynthesisAgent findings
+• Added CompoundFindingCategory — classification of cross-domain pairings
+• Added CompoundFinding — cross-domain vulnerability produced by SynthesisAgent;
+  each CompoundFinding is also materialised as a regular Issue (executor_type=SYNTHESIS)
+  so it flows through the normal consensus → fix → review pipeline
+• Added SynthesisReport — run-level summary of deduplication and compound detection
+  stored for retrospective analysis across runs
 """
 from __future__ import annotations
 
@@ -129,6 +139,8 @@ class ExecutorType(str, Enum):
     MISRA        = "MISRA"
     CERT         = "CERT"
     JSF          = "JSF"
+    # Gap 2: cross-domain synthesis
+    SYNTHESIS    = "SYNTHESIS"
 
 
 class ChunkStrategy(str, Enum):
@@ -600,6 +612,9 @@ class Issue(BaseModel):
     # Consensus
     consensus_votes:       int          = 0
     consensus_confidence:  float        = 0.0
+    # Gap 2: synthesis metadata
+    is_mandatory:          bool         = False  # True for MISRA mandatory / SYNTHESIS CRITICAL
+    compound_finding_id:   str          = ""     # Set when issue originated from SynthesisAgent
     # Timestamps
     detected_at:           datetime     = Field(default_factory=_utcnow)
     closed_at:             datetime | None = None
@@ -671,6 +686,84 @@ class PlannerRecord(BaseModel):
     simulation_summary:    str              = ""
     formal_proof_available: bool            = False
     evaluated_at:          datetime         = Field(default_factory=_utcnow)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gap 2: Cross-domain compound findings and synthesis report
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CompoundFindingCategory(str, Enum):
+    """
+    Classification of which auditor domains contributed to a compound finding.
+    Each value encodes the pairing that makes the compound finding unique.
+    """
+    SECURITY_ARCHITECTURE   = "SECURITY_ARCHITECTURE"   # race-condition + auth bypass
+    SECURITY_STANDARDS      = "SECURITY_STANDARDS"       # CWE violation + rule miss
+    ARCHITECTURE_STANDARDS  = "ARCHITECTURE_STANDARDS"   # invariant break + rule
+    ALL_DOMAINS             = "ALL_DOMAINS"              # rarest, most severe
+    SECURITY_ONLY           = "SECURITY_ONLY"            # upgraded single-domain
+    ARCHITECTURE_ONLY       = "ARCHITECTURE_ONLY"
+    STANDARDS_ONLY          = "STANDARDS_ONLY"
+
+
+class CompoundFinding(BaseModel):
+    """
+    A cross-domain compound finding produced by SynthesisAgent.
+
+    Compound findings represent vulnerabilities that require information from
+    ≥2 auditor domains to identify.  They are worth more than the sum of
+    their contributing issues because the combination creates an attack or
+    failure path that no single-domain scan can detect.
+
+    Each CompoundFinding is also materialised as a regular Issue (with
+    executor_type=SYNTHESIS) so it flows through the normal consensus →
+    fix → review pipeline unchanged.
+    """
+    id:                      str                     = Field(default_factory=_new_id)
+    run_id:                  str                     = ""
+    title:                   str                     = ""
+    description:             str                     = ""
+    severity:                Severity                = Severity.CRITICAL
+    category:                CompoundFindingCategory = CompoundFindingCategory.SECURITY_ARCHITECTURE
+    contributing_issue_ids:  list[str]               = Field(default_factory=list)
+    synthesized_issue_id:    str                     = ""   # Issue created for this finding
+    domains_involved:        list[str]               = Field(default_factory=list)
+    # How much more severe is this compound issue than the worst single finding?
+    amplification_factor:    float                   = Field(ge=1.0, le=10.0, default=2.0)
+    # LOW | MEDIUM | HIGH | ARCHITECTURAL
+    fix_complexity:          str                     = "HIGH"
+    rationale:               str                     = ""
+    # Compliance tags inherited/combined from contributors
+    cwe_id:                  str                     = ""
+    misra_rule:              str                     = ""
+    cert_rule:               str                     = ""
+    mil882e_category:        MilStd882eCategory      = MilStd882eCategory.CAT_I
+    is_mandatory:            bool                    = True
+    created_at:              datetime                = Field(default_factory=_utcnow)
+
+
+class SynthesisReport(BaseModel):
+    """
+    Summary record written by SynthesisAgent after each synthesis pass.
+
+    Stored to enable retrospective analysis of deduplication effectiveness
+    and compound finding quality across runs.
+    """
+    id:                      str            = Field(default_factory=_new_id)
+    run_id:                  str            = ""
+    cycle:                   int            = 0
+    raw_issue_count:         int            = 0        # Before any deduplication
+    fingerprint_dedup_count: int            = 0        # Removed by fingerprint pass
+    semantic_dedup_count:    int            = 0        # Removed by LLM semantic pass
+    final_issue_count:       int            = 0        # After all dedup
+    compound_finding_count:  int            = 0        # New cross-domain findings
+    compound_critical_count: int            = 0        # Of those, CRITICAL severity
+    synthesis_model:         str            = ""
+    dedup_enabled:           bool           = True
+    compound_enabled:        bool           = True
+    synthesis_summary:       str            = ""       # LLM-generated narrative
+    duration_s:              float          = 0.0
+    created_at:              datetime       = Field(default_factory=_utcnow)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
