@@ -520,6 +520,58 @@ class FixAttempt(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
+class BugRecurrenceSignal(BaseModel):
+    """Captures the result of a historical-recurrence check performed before
+    the fixer generates a patch.
+
+    When the same bug class (matched by semantic similarity against fix_memory)
+    has been patched N or more times within the recurrence window, this is
+    strong evidence that the root cause is structural — a patch will not
+    eliminate the recurrence.  The fixer uses this signal to route to a
+    refactor proposal instead of generating another patch.
+
+    Fields
+    ------
+    recurrence_count:
+        Number of prior successful fixes (non-reverted) for the same bug class
+        found in fix_memory within the time window.
+    reverted_count:
+        Number of prior fix attempts for the same bug class that were reverted
+        (regression detected).  Combined with recurrence_count this measures
+        fix instability.
+    window_days:
+        The time window in days over which recurrences were counted (default 180).
+    dominant_file_context:
+        The most common file context seen in the historical entries, i.e. the
+        module most frequently implicated in this bug class.
+    coupling_score:
+        CPG-derived architectural coupling score for the implicated functions
+        (0.0 = well-encapsulated, 1.0 = maximally coupled).  Set to -1.0 when
+        CPG is unavailable.
+    distinct_caller_modules:
+        Number of distinct caller modules identified by the CPG coupling query.
+        High values (> coupling_module_threshold) are an independent smell signal.
+    coupling_module_threshold:
+        The threshold above which distinct_caller_modules triggers a coupling
+        smell escalation regardless of recurrence_count.
+    is_structural:
+        True when recurrence_count >= recurrence_threshold OR
+        coupling_score >= coupling_score_threshold OR
+        distinct_caller_modules >= coupling_module_threshold.
+    escalation_reason:
+        Human-readable summary of why is_structural was set.
+    """
+    recurrence_count:           int   = 0
+    reverted_count:             int   = 0
+    window_days:                int   = 180
+    dominant_file_context:      str   = ''
+    coupling_score:             float = -1.0
+    distinct_caller_modules:    int   = 0
+    coupling_module_threshold:  int   = 5
+    is_structural:              bool  = False
+    escalation_reason:          str   = ''
+
+
 class RefactorProposal(BaseModel):
     id: str = Field(default_factory=_new_id)
     fix_attempt_id: str = ''
@@ -544,6 +596,17 @@ class RefactorProposal(BaseModel):
     recommendation: str = ''
     escalation_id: str = ''
     requires_human_review: bool = True
+    # ── Recurrence / coupling smell fields (Gap 3 proactive arch detection) ──
+    # Populated when the refactor proposal was triggered by recurrence or CPG
+    # coupling analysis rather than (or in addition to) blast radius overflow.
+    recurrence_count: int = 0
+    reverted_count: int = 0
+    distinct_caller_modules: int = 0
+    coupling_score: float = -1.0
+    recurrence_escalation_reason: str = ''
+    # Trigger source: 'blast_radius' | 'recurrence' | 'coupling_smell' |
+    # 'architectural_symptom' | 'combined'
+    trigger_source: str = 'blast_radius'
     created_at: datetime = Field(default_factory=_utcnow)
 
 class PlannerRecord(BaseModel):
@@ -748,4 +811,3 @@ class ConvergenceRecord(BaseModel):
 # Tests and external callers import `Escalation` rather than `EscalationRecord`.
 # The alias keeps those imports working without duplicating the class.
 Escalation = EscalationRecord
-    recorded_at: datetime = Field(default_factory=_utcnow)
