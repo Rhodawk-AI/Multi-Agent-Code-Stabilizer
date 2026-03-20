@@ -175,6 +175,7 @@ class FixerAgent(BaseAgent):
         MAX_FEEDBACK_ROUNDS = 3
         last_result = None
         last_test_output = ''
+        test_passed = False
         for feedback_round in range(1, MAX_FEEDBACK_ROUNDS + 1):
             prompt_extra = ''
             if last_test_output:
@@ -187,6 +188,12 @@ class FixerAgent(BaseAgent):
             self.log.info(f'[Fixer] feedback_round={feedback_round}/{MAX_FEEDBACK_ROUNDS} test_passed={test_passed}')
             if test_passed:
                 break
+        # Gap 3.A fix: close the revert-memory feedback loop.
+        # When all rounds exhaust without a passing probe, persist the failed
+        # approach as a negative example so the fixer never repeats it for the
+        # same issue type and file context in future runs.
+        if not test_passed and self.fix_memory and last_result is not None:
+            await self._store_failure_memory(issues, file_paths, last_result, last_test_output)
         result = last_result
         if needs_ast and isinstance(result, FixResponse):
             result = await self._apply_ast_rewrites(result, file_contents, patch_modes)
@@ -339,6 +346,46 @@ class FixerAgent(BaseAgent):
             self.fix_memory.store_success(issue_type=issue_type, file_context=file_context, fix_approach=fix_approach, test_result='gate_passed=True', run_id=self.run_id)
         except Exception as exc:
             self.log.debug(f'_store_fix_memory: {exc}')
+
+    async def _store_failure_memory(self, issues: list, file_paths: list[str], last_result: Any, test_output: str) -> None:
+        """Gap 3.A: Persist a failed approach as a negative example.
+
+        Called when all MAX_FEEDBACK_ROUNDS probe attempts fail so the fixer
+        never re-applies the same approach for the same issue type and file
+        context in future runs.  The entry is stored with a ``[REVERTED]``
+        prefix by ``fix_memory.store_failure`` so the LLM prompt treats it as
+        an explicit negative example.
+        """
+        if not self.fix_memory:
+            return
+        try:
+            issue_type = issues[0].description[:80] if issues else 'unknown'
+            file_context = ', '.join(file_paths[:3])
+            # Extract a readable approach summary from the last generated result.
+            if isinstance(last_result, PatchResponse) and last_result.patched_files:
+                fix_approach = '; '.join(
+                    pf.diff_summary[:80] for pf in last_result.patched_files[:3] if pf.diff_summary
+                ) or 'patch generated (no diff_summary)'
+            elif isinstance(last_result, FixResponse) and last_result.fixed_files:
+                fix_approach = '; '.join(
+                    ff.diff_summary[:80] for ff in last_result.fixed_files[:3] if ff.diff_summary
+                ) or 'full-file rewrite (no diff_summary)'
+            else:
+                fix_approach = 'unknown approach'
+            failure_reason = test_output[:400] if test_output else 'all probe rounds failed — no test output captured'
+            self.fix_memory.store_failure(
+                issue_type=issue_type,
+                file_context=file_context,
+                fix_approach=fix_approach,
+                failure_reason=failure_reason,
+                run_id=self.run_id,
+            )
+            self.log.info(
+                f'[Fixer] Gap 3.A: stored failed approach to revert memory '
+                f'issue_type={issue_type!r:.60} files={file_context!r:.80}'
+            )
+        except Exception as exc:
+            self.log.debug(f'_store_failure_memory: {exc}')
 
     async def _apply_ast_rewrites(self, result: 'FixResponse', original_contents: dict[str, str], patch_modes: dict[str, PatchMode]) -> 'FixResponse':
         from sandbox.ast_rewrite import get_rewriter, ASTRewriteInstruction, RewriteOp
