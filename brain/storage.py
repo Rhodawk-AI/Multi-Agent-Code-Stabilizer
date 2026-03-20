@@ -1,20 +1,3 @@
-"""
-brain/storage.py
-================
-Abstract storage interface for Rhodawk AI Code Stabilizer.
-
-PRODUCTION FIXES vs audit report
-──────────────────────────────────
-• Added escalation CRUD (upsert_escalation, get_escalation, list_escalations)
-• Added baseline CRUD (upsert_baseline, get_active_baseline, list_baselines)
-• Added function staleness CRUD (upsert_staleness_mark, list_stale_functions)
-• Added compliance finding storage (upsert_ldra_finding, upsert_polyspace_finding,
-  upsert_cbmc_result)
-• Added requirement traceability CRUD (upsert_rtm_entry, get_rtm_for_issue)
-• Added reviewer independence record storage
-• Added SAS and SCI storage
-• All abstract methods documented with purpose and expected semantics
-"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
