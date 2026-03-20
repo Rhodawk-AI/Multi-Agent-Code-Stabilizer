@@ -707,3 +707,300 @@ class TestRefactorProposalsAPIRoute:
         import api.app as app_module
         src = inspect.getsource(app_module)
         assert "refactor_proposals" in src
+
+
+# ===========================================================================
+# Import graph blast radius — Gap 3 undercount fix
+# ===========================================================================
+
+class TestImportGraphBlastRadius:
+    """
+    CPGBlastRadius must account for modules that import a changed symbol
+    without calling any changed function (pure import references).
+
+    These files are invisible to the call graph but are broken by type
+    changes, constant renames, and signature shifts at 10M-line scale.
+
+    Three defects were present before the fix:
+      A. CPGBlastRadius had no importing_modules / importing_module_count fields.
+      B. compute_blast_radius() never called get_importing_files().
+      C. blast_radius_score formula used only affected_function_count / 200,
+         ignoring import-only modules entirely.
+    """
+
+    def _make_blast_with_imports(
+        self,
+        fn_count:      int,
+        import_count:  int,
+        threshold:     int = 50,
+    ):
+        from cpg.cpg_engine import CPGBlastRadius
+        # Build a blast radius object that reflects the post-fix structure.
+        call_score   = min(fn_count    / 200.0, 1.0)
+        import_score = min(import_count / 400.0, 1.0)
+        score        = round(0.8 * call_score + 0.2 * import_score, 4)
+        weighted     = fn_count + int(import_count * 0.5)
+        return CPGBlastRadius(
+            changed_functions=["payment_service.process_payment"],
+            affected_functions=[
+                {"function_name": f"fn_{i}", "file_path": "dep.py",
+                 "line_number": i, "relationship": "direct_caller"}
+                for i in range(fn_count)
+            ],
+            affected_files=["dep.py"],
+            affected_function_count=fn_count,
+            affected_file_count=1,
+            test_files_affected=[],
+            importing_modules=[f"module_{i}.py" for i in range(import_count)],
+            importing_module_count=import_count,
+            blast_radius_score=score,
+            requires_human_review=(weighted >= threshold),
+            source="cpg",
+        )
+
+    # ── Field existence ───────────────────────────────────────────────────────
+
+    def test_blast_radius_has_importing_module_count_field(self):
+        """CPGBlastRadius must expose importing_module_count (was missing)."""
+        from cpg.cpg_engine import CPGBlastRadius
+        blast = CPGBlastRadius()
+        assert hasattr(blast, "importing_module_count"), (
+            "CPGBlastRadius missing importing_module_count field"
+        )
+        assert blast.importing_module_count == 0
+
+    def test_blast_radius_has_importing_modules_field(self):
+        """CPGBlastRadius must expose importing_modules list (was missing)."""
+        from cpg.cpg_engine import CPGBlastRadius
+        blast = CPGBlastRadius()
+        assert hasattr(blast, "importing_modules"), (
+            "CPGBlastRadius missing importing_modules field"
+        )
+        assert blast.importing_modules == []
+
+    def test_refactor_proposal_schema_has_importing_fields(self):
+        """RefactorProposal schema must carry importing_module_count and importing_modules."""
+        from brain.schemas import RefactorProposal
+        p = RefactorProposal(run_id="r", proposed_refactoring="x", recommendation="y")
+        assert hasattr(p, "importing_module_count")
+        assert hasattr(p, "importing_modules")
+        assert p.importing_module_count == 0
+        assert p.importing_modules == []
+
+    # ── Score formula ─────────────────────────────────────────────────────────
+
+    def test_score_increases_with_import_only_modules(self):
+        """blast_radius_score must be higher when importing_module_count > 0."""
+        blast_no_imports  = self._make_blast_with_imports(fn_count=20, import_count=0)
+        blast_with_imports = self._make_blast_with_imports(fn_count=20, import_count=40)
+        assert blast_with_imports.blast_radius_score > blast_no_imports.blast_radius_score, (
+            "import-only modules must increase blast_radius_score"
+        )
+
+    def test_score_formula_weights_call_graph_higher_than_imports(self):
+        """Call graph (80%) must outweigh import graph (20%) in the score."""
+        # 100 callers, 0 importers → score = 0.8 * (100/200) = 0.40
+        blast_callers = self._make_blast_with_imports(fn_count=100, import_count=0)
+        # 0 callers, 400 importers → score = 0.2 * (400/400) = 0.20
+        blast_importers = self._make_blast_with_imports(fn_count=0, import_count=400)
+        assert blast_callers.blast_radius_score > blast_importers.blast_radius_score, (
+            "100 callers must score higher than 400 import-only modules"
+        )
+
+    def test_import_only_modules_counted_at_half_weight_for_human_review_gate(self):
+        """
+        The human review gate must fire when fn_count + 0.5*import_count >= threshold.
+        60 callers alone (threshold 50): fires without imports.
+        30 callers + 40 importers (weighted=50): fires at boundary.
+        30 callers + 39 importers (weighted=49.5 → 49): does not fire.
+        """
+        threshold = 50
+        # 60 callers, 0 importers → weighted=60 ≥ 50 → fires
+        blast_callers = self._make_blast_with_imports(fn_count=60, import_count=0,
+                                                       threshold=threshold)
+        assert blast_callers.requires_human_review is True
+
+        # 30 callers + 40 importers → weighted = 30 + 20 = 50 → fires
+        blast_boundary = self._make_blast_with_imports(fn_count=30, import_count=40,
+                                                        threshold=threshold)
+        assert blast_boundary.requires_human_review is True, (
+            "30 callers + 40 importers (weighted=50) must trigger human review"
+        )
+
+        # 30 callers + 38 importers → weighted = 30 + 19 = 49 → does not fire
+        blast_below = self._make_blast_with_imports(fn_count=30, import_count=38,
+                                                     threshold=threshold)
+        assert blast_below.requires_human_review is False, (
+            "30 callers + 38 importers (weighted=49) must NOT trigger human review"
+        )
+
+    # ── compute_blast_radius integration ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_compute_blast_radius_calls_get_importing_files(self):
+        """
+        CPGEngine.compute_blast_radius must call client.get_importing_files()
+        and populate importing_modules on the returned blast radius object.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.compute_impact_set = AsyncMock(return_value=[
+            {"function_name": "fn_a", "file_path": "dep.py",
+             "line_number": 10, "relationship": "caller", "depth": 1}
+        ])
+        mock_client.get_importing_files = AsyncMock(return_value=[
+            {"importer_file": "consumer_a.py", "imported_symbol": "process_payment",
+             "relationship": "import_reference"},
+            {"importer_file": "consumer_b.py", "imported_symbol": "process_payment",
+             "relationship": "import_reference"},
+        ])
+
+        engine = CPGEngine(blast_radius_threshold=50)
+        engine._client = mock_client
+        engine._ready  = True
+
+        blast = await engine.compute_blast_radius(
+            function_names=["process_payment"],
+            file_paths=["payment_service.py"],
+            depth=3,
+        )
+
+        mock_client.get_importing_files.assert_called_once()
+        assert blast.importing_module_count == 2, (
+            "importing_module_count must equal number of import-only files returned"
+        )
+        assert "consumer_a.py" in blast.importing_modules
+        assert "consumer_b.py" in blast.importing_modules
+
+    @pytest.mark.asyncio
+    async def test_import_only_files_not_double_counted_with_call_graph(self):
+        """
+        A file that both calls a changed function AND imports it must appear in
+        affected_files but NOT be double-counted in importing_modules.
+        """
+        from cpg.cpg_engine import CPGEngine
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.compute_impact_set = AsyncMock(return_value=[
+            {"function_name": "fn_a", "file_path": "both_caller_and_importer.py",
+             "line_number": 5, "relationship": "caller", "depth": 1}
+        ])
+        # get_importing_files returns the same file that the call graph already found
+        mock_client.get_importing_files = AsyncMock(return_value=[
+            {"importer_file": "both_caller_and_importer.py",
+             "imported_symbol": "process_payment",
+             "relationship": "import_reference"},
+            {"importer_file": "import_only.py",
+             "imported_symbol": "process_payment",
+             "relationship": "import_reference"},
+        ])
+
+        engine = CPGEngine(blast_radius_threshold=50)
+        engine._client = mock_client
+        engine._ready  = True
+
+        blast = await engine.compute_blast_radius(
+            function_names=["process_payment"],
+            file_paths=["payment_service.py"],
+        )
+
+        # "both_caller_and_importer.py" must NOT appear in importing_modules
+        assert "both_caller_and_importer.py" not in blast.importing_modules, (
+            "files already in the call graph must not be double-counted in importing_modules"
+        )
+        # "import_only.py" must appear since it is not in the call graph
+        assert "import_only.py" in blast.importing_modules
+
+    # ── Storage round-trip ────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_refactor_proposal_import_fields_persist_and_reload(self, tmp_path):
+        """importing_modules and importing_module_count must survive storage round-trip."""
+        from brain.sqlite_storage import SQLiteBrainStorage
+        from brain.schemas import RefactorProposal
+
+        storage = SQLiteBrainStorage(tmp_path / "brain.db")
+        await storage.initialise()
+
+        proposal = RefactorProposal(
+            run_id="run-import-test",
+            proposed_refactoring="Adapter pattern",
+            recommendation="Shim layer first",
+            importing_modules=["consumer_a.py", "consumer_b.py", "consumer_c.py"],
+            importing_module_count=3,
+            affected_function_count=20,
+            affected_file_count=4,
+            requires_human_review=True,
+        )
+        await storage.upsert_refactor_proposal(proposal)
+
+        loaded = await storage.get_refactor_proposal(proposal.id)
+        assert loaded is not None
+        assert loaded.importing_module_count == 3, (
+            "importing_module_count must be persisted and reloaded correctly"
+        )
+        assert set(loaded.importing_modules) == {"consumer_a.py", "consumer_b.py", "consumer_c.py"}, (
+            "importing_modules list must survive the storage round-trip"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_proposal_without_import_fields_loads_safely(self, tmp_path):
+        """
+        Proposals created before the import-graph fix (no importing_modules column)
+        must load without error and default to 0 / [].
+        """
+        import aiosqlite
+        from brain.sqlite_storage import SQLiteBrainStorage
+        from brain.schemas import RefactorProposal
+
+        db_path = tmp_path / "legacy.db"
+
+        # Create a legacy table without the new columns
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("""
+                CREATE TABLE refactor_proposals (
+                    id TEXT PRIMARY KEY,
+                    fix_attempt_id TEXT, run_id TEXT,
+                    issue_ids TEXT, changed_functions TEXT,
+                    affected_function_count INTEGER, affected_file_count INTEGER,
+                    test_files_affected TEXT, blast_radius_score REAL,
+                    affected_components TEXT, proposed_refactoring TEXT,
+                    migration_steps TEXT, estimated_scope TEXT,
+                    risks TEXT, recommendation TEXT, escalation_id TEXT,
+                    requires_human_review INTEGER, created_at TEXT
+                )
+            """)
+            import json as _json
+            from datetime import datetime, timezone
+            await db.execute(
+                """INSERT INTO refactor_proposals VALUES (
+                    'legacy-id','','legacy-run','[]','[]',
+                    5,2,'[]',0.1,'[]','old proposal','[]','1 day','[]',
+                    'manual review','',1,?
+                )""",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            await db.commit()
+
+        storage = SQLiteBrainStorage(db_path)
+        await storage.initialise()
+
+        # upsert_refactor_proposal's ALTER TABLE ADD COLUMN migration
+        # must add the missing columns so get_refactor_proposal works
+        dummy = RefactorProposal(
+            id="dummy-trigger",
+            run_id="legacy-run",
+            proposed_refactoring="x",
+            recommendation="y",
+        )
+        await storage.upsert_refactor_proposal(dummy)
+
+        loaded = await storage.get_refactor_proposal("legacy-id")
+        assert loaded is not None, "legacy proposal must be loadable after migration"
+        assert loaded.importing_module_count == 0
+        assert loaded.importing_modules == []
