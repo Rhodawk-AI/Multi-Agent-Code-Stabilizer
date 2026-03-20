@@ -15,7 +15,7 @@ try:
 except ImportError:
     _PG_AVAILABLE = False
     log.info('asyncpg/sqlalchemy not installed — PostgreSQL storage disabled. Run: pip install asyncpg sqlalchemy[asyncio]')
-from brain.schemas import AuditRun, AuditScore, AuditTrailEntry, AutonomyLevel, ChunkStrategy, DomainMode, ExecutorType, FileChunkRecord, FileRecord, FileStatus, FixAttempt, FixedFile, FormalVerificationResult, FormalVerificationStatus, GraphEdge, Issue, IssueFingerprint, IssueStatus, LLMSession, PatrolEvent, PlannerRecord, PlannerVerdict, ReversibilityClass, ReviewDecision, ReviewResult, ReviewVerdict, RunStatus, Severity, TestRunResult, TestRunStatus
+from brain.schemas import AuditRun, AuditScore, AuditTrailEntry, AutonomyLevel, ChunkStrategy, CommitAuditRecord, CommitAuditStatus, DomainMode, ExecutorType, FileChunkRecord, FileRecord, FileStatus, FixAttempt, FixedFile, FormalVerificationResult, FormalVerificationStatus, GraphEdge, Issue, IssueFingerprint, IssueStatus, LLMSession, PatrolEvent, PlannerRecord, PlannerVerdict, ReversibilityClass, ReviewDecision, ReviewResult, ReviewVerdict, RunStatus, Severity, TestRunResult, TestRunStatus
 from brain.storage import BrainStorage
 from brain.sqlite_storage import SQLiteBrainStorage
 
@@ -440,4 +440,139 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             log.warning(f'list_convergence_records failed: {exc}')
             if self._fallback:
                 return await self._fallback.list_convergence_records(run_id)
+            return []
+
+    # ── Gap 4: Commit-granularity incremental audit ──────────────────────────
+
+    async def upsert_commit_audit_record(self, record: CommitAuditRecord) -> None:
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.upsert_commit_audit_record(record)
+            return
+        try:
+            async with AsyncSession(self._engine) as session:
+                await session.execute(
+                    text("""
+                        INSERT INTO commit_audit_records (id, run_id, data)
+                        VALUES (:id, :run_id, :data::jsonb)
+                        ON CONFLICT (id) DO UPDATE SET
+                            data   = EXCLUDED.data,
+                            run_id = EXCLUDED.run_id
+                    """),
+                    {'id': record.id, 'run_id': record.run_id, 'data': record.model_dump_json()},
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(f'upsert_commit_audit_record failed: {exc}')
+            if self._fallback:
+                await self._fallback.upsert_commit_audit_record(record)
+
+    async def get_commit_audit_record(self, record_id: str) -> CommitAuditRecord | None:
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.get_commit_audit_record(record_id)
+            return None
+        try:
+            async with AsyncSession(self._engine) as session:
+                result = await session.execute(
+                    text('SELECT data FROM commit_audit_records WHERE id = :id'),
+                    {'id': record_id},
+                )
+                row = result.fetchone()
+            if not row:
+                return None
+            return CommitAuditRecord.model_validate_json(
+                row[0] if isinstance(row[0], str) else str(row[0])
+            )
+        except Exception as exc:
+            log.warning(f'get_commit_audit_record failed: {exc}')
+            if self._fallback:
+                return await self._fallback.get_commit_audit_record(record_id)
+            return None
+
+    async def get_commit_audit_record_by_hash(
+        self, commit_hash: str, run_id: str = ''
+    ) -> CommitAuditRecord | None:
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.get_commit_audit_record_by_hash(commit_hash, run_id)
+            return None
+        try:
+            async with AsyncSession(self._engine) as session:
+                if run_id:
+                    result = await session.execute(
+                        text(
+                            'SELECT data FROM commit_audit_records '
+                            "WHERE data->>'commit_hash' = :h AND run_id = :r "
+                            'ORDER BY (data->>\'created_at\') DESC LIMIT 1'
+                        ),
+                        {'h': commit_hash, 'r': run_id},
+                    )
+                else:
+                    result = await session.execute(
+                        text(
+                            'SELECT data FROM commit_audit_records '
+                            "WHERE data->>'commit_hash' = :h "
+                            'ORDER BY (data->>\'created_at\') DESC LIMIT 1'
+                        ),
+                        {'h': commit_hash},
+                    )
+                row = result.fetchone()
+            if not row:
+                return None
+            return CommitAuditRecord.model_validate_json(
+                row[0] if isinstance(row[0], str) else str(row[0])
+            )
+        except Exception as exc:
+            log.warning(f'get_commit_audit_record_by_hash failed: {exc}')
+            if self._fallback:
+                return await self._fallback.get_commit_audit_record_by_hash(commit_hash, run_id)
+            return None
+
+    async def list_commit_audit_records(
+        self,
+        run_id: str = '',
+        status: CommitAuditStatus | None = None,
+        limit: int = 100,
+    ) -> list[CommitAuditRecord]:
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.list_commit_audit_records(
+                    run_id=run_id, status=status, limit=limit
+                )
+            return []
+        try:
+            conditions: list[str] = []
+            params: dict = {'limit': limit}
+            if run_id:
+                conditions.append('run_id = :run_id')
+                params['run_id'] = run_id
+            if status is not None:
+                conditions.append("data->>'status' = :status")
+                params['status'] = status.value
+            where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
+            async with AsyncSession(self._engine) as session:
+                result = await session.execute(
+                    text(
+                        f'SELECT data FROM commit_audit_records {where} '
+                        "ORDER BY (data->>'created_at') DESC LIMIT :limit"
+                    ),
+                    params,
+                )
+                rows = result.fetchall()
+            out: list[CommitAuditRecord] = []
+            for row in rows:
+                try:
+                    out.append(CommitAuditRecord.model_validate_json(
+                        row[0] if isinstance(row[0], str) else str(row[0])
+                    ))
+                except Exception:
+                    pass
+            return out
+        except Exception as exc:
+            log.warning(f'list_commit_audit_records failed: {exc}')
+            if self._fallback:
+                return await self._fallback.list_commit_audit_records(
+                    run_id=run_id, status=status, limit=limit
+                )
             return []

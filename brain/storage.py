@@ -6,6 +6,7 @@ from typing import Any
 from brain.schemas import (
     AuditRun, AuditScore, AuditTrailEntry,
     BaselineRecord, CbmcVerificationResult,
+    CommitAuditRecord, CommitAuditStatus,
     ConvergenceRecord,
     EscalationRecord, EscalationStatus,
     FileChunkRecord, FileRecord,
@@ -333,5 +334,52 @@ class BrainStorage(ABC):
 
         Optionally filtered by run_id and/or severity string
         (e.g. 'CRITICAL', 'MAJOR'). Returns empty list (never None).
+        """
+        ...
+
+    # ── Gap 4: Commit-granularity incremental audit persistence ─────────────
+
+    @abstractmethod
+    async def upsert_commit_audit_record(self, record: CommitAuditRecord) -> None:
+        """
+        Persist a CommitAuditRecord.  Idempotent on id.
+
+        Called by CommitAuditScheduler at each state transition so that:
+        • interrupted audits can be resumed on worker restart
+        • dashboards can report per-commit compute savings
+        • CI systems can poll for DONE/FAILED status
+        """
+        ...
+
+    @abstractmethod
+    async def get_commit_audit_record(self, record_id: str) -> CommitAuditRecord | None:
+        """Return the CommitAuditRecord with the given id, or None."""
+        ...
+
+    @abstractmethod
+    async def get_commit_audit_record_by_hash(
+        self, commit_hash: str, run_id: str = ""
+    ) -> CommitAuditRecord | None:
+        """
+        Return the most recent CommitAuditRecord for a given commit_hash.
+
+        When run_id is supplied, scopes the lookup to that run.  Used by
+        the webhook endpoint to avoid scheduling duplicate audits for the
+        same commit.
+        """
+        ...
+
+    @abstractmethod
+    async def list_commit_audit_records(
+        self,
+        run_id: str = "",
+        status: CommitAuditStatus | None = None,
+        limit: int = 100,
+    ) -> list[CommitAuditRecord]:
+        """
+        List CommitAuditRecords, optionally filtered by run_id and/or status.
+
+        Returns empty list (never None).  Ordered by created_at descending so
+        callers see the most recent commits first.
         """
         ...

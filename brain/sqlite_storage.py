@@ -16,6 +16,8 @@ from brain.schemas import (
     AuditTrailEntry,
     AutonomyLevel,
     ChunkStrategy,
+    CommitAuditRecord,
+    CommitAuditStatus,
     DomainMode,
     ExecutorType,
     FileChunkRecord,
@@ -29,13 +31,10 @@ from brain.schemas import (
     Issue,
     IssueFingerprint,
     IssueStatus,
-    LLMSession,
     PatrolEvent,
     PlannerRecord,
     PlannerVerdict,
     ReversibilityClass,
-    ReviewDecision,
-    ReviewResult,
     ReviewVerdict,
     RunStatus,
     Severity,
@@ -277,6 +276,54 @@ CREATE TABLE IF NOT EXISTS llm_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_sessions(run_id);
+
+CREATE TABLE IF NOT EXISTS function_staleness (
+    id            TEXT PRIMARY KEY,
+    file_path     TEXT NOT NULL,
+    function_name TEXT NOT NULL,
+    line_start    INTEGER DEFAULT 0,
+    line_end      INTEGER DEFAULT 0,
+    stale_reason  TEXT DEFAULT '',
+    stale_since   TEXT NOT NULL,
+    run_id        TEXT DEFAULT '',
+    UNIQUE(file_path, function_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staleness_run  ON function_staleness(run_id);
+CREATE INDEX IF NOT EXISTS idx_staleness_file ON function_staleness(file_path);
+
+CREATE TABLE IF NOT EXISTS commit_audit_records (
+    id                       TEXT PRIMARY KEY,
+    run_id                   TEXT NOT NULL DEFAULT '',
+    commit_hash              TEXT NOT NULL DEFAULT '',
+    branch                   TEXT NOT NULL DEFAULT '',
+    author                   TEXT NOT NULL DEFAULT '',
+    commit_message           TEXT NOT NULL DEFAULT '',
+    changed_files            TEXT NOT NULL DEFAULT '[]',
+    changed_functions        TEXT NOT NULL DEFAULT '{}',
+    all_changed_functions    TEXT NOT NULL DEFAULT '[]',
+    new_functions            TEXT NOT NULL DEFAULT '[]',
+    deleted_functions        TEXT NOT NULL DEFAULT '[]',
+    impact_functions         TEXT NOT NULL DEFAULT '[]',
+    impact_files             TEXT NOT NULL DEFAULT '[]',
+    audit_targets            TEXT NOT NULL DEFAULT '[]',
+    total_changed_functions  INTEGER NOT NULL DEFAULT 0,
+    total_impact_functions   INTEGER NOT NULL DEFAULT 0,
+    total_functions_to_audit INTEGER NOT NULL DEFAULT 0,
+    test_files_to_run        TEXT NOT NULL DEFAULT '[]',
+    test_functions_to_run    TEXT NOT NULL DEFAULT '[]',
+    status                   TEXT NOT NULL DEFAULT 'PENDING',
+    cpg_updated              INTEGER NOT NULL DEFAULT 0,
+    joern_update_status      TEXT NOT NULL DEFAULT '',
+    error_detail             TEXT NOT NULL DEFAULT '',
+    created_at               TEXT NOT NULL,
+    started_at               TEXT,
+    finished_at              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_car_run_id      ON commit_audit_records(run_id);
+CREATE INDEX IF NOT EXISTS idx_car_commit_hash ON commit_audit_records(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_car_status      ON commit_audit_records(status);
 
 CREATE TABLE IF NOT EXISTS audit_trail (
     id             TEXT PRIMARY KEY,
@@ -919,7 +966,11 @@ class SQLiteBrainStorage(BrainStorage):
         )
 
                                                                                 
-    async def upsert_review(self, review: ReviewResult) -> None:
+    async def upsert_review(self, review) -> None:
+        """Persist a ReviewResult.  Accepts ReviewResult model or compatible duck-type."""
+        decisions_json = json.dumps(
+            [d.model_dump() if hasattr(d, "model_dump") else d for d in review.decisions]
+        )
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO review_results
@@ -934,7 +985,7 @@ class SQLiteBrainStorage(BrainStorage):
             """, (
                 review.review_id,
                 review.fix_attempt_id,
-                json.dumps([d.model_dump() for d in review.decisions]),
+                decisions_json,
                 review.overall_score,
                 review.overall_note,
                 int(review.approve_for_commit),
@@ -942,7 +993,9 @@ class SQLiteBrainStorage(BrainStorage):
             ))
             await db.commit()
 
-    async def get_review(self, fix_attempt_id: str) -> ReviewResult | None:
+    async def get_review(self, fix_attempt_id: str):
+        """Return a ReviewResult for the given fix_attempt_id, or None."""
+        from brain.schemas import ReviewDecision as _RD, ReviewResult as _RR, ReviewVerdict as _RV
         async with self._conn() as db:
             async with db.execute(
                 "SELECT * FROM review_results WHERE fix_attempt_id=?", (fix_attempt_id,)
@@ -951,10 +1004,16 @@ class SQLiteBrainStorage(BrainStorage):
                 if not row:
                     return None
                 decisions_data = json.loads(row["decisions"] or "[]")
-                return ReviewResult(
+                decisions = []
+                for d in decisions_data:
+                    try:
+                        decisions.append(_RD(**d))
+                    except Exception:
+                        pass
+                return _RR(
                     review_id=row["review_id"],
                     fix_attempt_id=row["fix_attempt_id"],
-                    decisions=[ReviewDecision(**d) for d in decisions_data],
+                    decisions=decisions,
                     overall_score=row["overall_score"],
                     overall_note=row["overall_note"] or "",
                     approve_for_commit=bool(row["approve_for_commit"]),
@@ -1167,20 +1226,48 @@ class SQLiteBrainStorage(BrainStorage):
                     for row in rows
                 ]
 
-    async def log_llm_session(self, session: LLMSession) -> None:
+    async def log_llm_session(self, session) -> None:
+        """Accept either a dict (abstract contract) or an LLMSession model."""
+        from brain.schemas import LLMSession as _LLMSession
+        if isinstance(session, dict):
+            s_id          = session.get("id", str(uuid.uuid4()))
+            s_run_id      = session.get("run_id", "")
+            s_agent_type  = session.get("agent_type", "GENERAL")
+            if hasattr(s_agent_type, "value"):
+                s_agent_type = s_agent_type.value
+            s_model       = session.get("model", "")
+            s_ptok        = session.get("prompt_tokens", 0)
+            s_ctok        = session.get("completion_tokens", 0)
+            s_cost        = session.get("cost_usd", 0.0)
+            s_dur         = session.get("duration_ms", 0)
+            s_ok          = int(session.get("success", True))
+            s_err         = session.get("error", "")
+            s_start       = session.get("started_at", datetime.now(tz=timezone.utc))
+            if isinstance(s_start, datetime):
+                s_start = s_start.isoformat()
+        else:
+            s_id          = session.id
+            s_run_id      = session.run_id
+            s_agent_type  = session.agent_type.value if hasattr(session.agent_type, "value") else str(session.agent_type)
+            s_model       = session.model
+            s_ptok        = session.prompt_tokens
+            s_ctok        = session.completion_tokens
+            s_cost        = session.cost_usd
+            s_dur         = session.duration_ms
+            s_ok          = int(session.success)
+            s_err         = session.error
+            s_start       = session.started_at.isoformat()
+
+        import uuid as _uuid
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO llm_sessions
                     (id, run_id, agent_type, model, prompt_tokens,
                      completion_tokens, cost_usd, duration_ms, success, error, started_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                session.id, session.run_id, session.agent_type.value,
-                session.model, session.prompt_tokens,
-                session.completion_tokens, session.cost_usd,
-                session.duration_ms, int(session.success),
-                session.error, session.started_at.isoformat(),
-            ))
+                ON CONFLICT(id) DO NOTHING
+            """, (s_id, s_run_id, s_agent_type, s_model, s_ptok,
+                  s_ctok, s_cost, s_dur, s_ok, s_err, s_start))
             await db.commit()
 
     async def get_total_cost(self, run_id: str) -> float:
@@ -1562,48 +1649,63 @@ class SQLiteBrainStorage(BrainStorage):
             is_active=bool(row["is_active"]),
         )
 
-                        
+    # ── Function staleness (Gap 4) ────────────────────────────────────────────
+
     async def upsert_staleness_mark(self, mark) -> None:
+        """
+        Upsert a FunctionStalenessMark.  The table is created in the main DDL
+        block so we never re-issue CREATE TABLE here.  Uses UNIQUE(file_path,
+        function_name) so repeated marks for the same function are idempotent.
+        """
+        from brain.schemas import FunctionStalenessMark  # local to avoid circulars
         async with self._write() as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS function_staleness (
-                    id TEXT PRIMARY KEY, file_path TEXT, function_name TEXT,
-                    line_start INTEGER, line_end INTEGER, stale_reason TEXT,
-                    stale_since TEXT, run_id TEXT
-                )
-            """)
-            await db.execute("""
-                INSERT OR REPLACE INTO function_staleness
+            await db.execute(
+                """
+                INSERT INTO function_staleness
                     (id, file_path, function_name, line_start, line_end,
                      stale_reason, stale_since, run_id)
                 VALUES (?,?,?,?,?,?,?,?)
-            """, (
-                mark.id, mark.file_path, mark.function_name,
-                mark.line_start, mark.line_end, mark.stale_reason,
-                mark.stale_since.isoformat(), mark.run_id,
-            ))
+                ON CONFLICT(file_path, function_name) DO UPDATE SET
+                    stale_reason = excluded.stale_reason,
+                    stale_since  = excluded.stale_since,
+                    run_id       = excluded.run_id,
+                    line_start   = excluded.line_start,
+                    line_end     = excluded.line_end
+                """,
+                (
+                    mark.id, mark.file_path, mark.function_name,
+                    mark.line_start, mark.line_end, mark.stale_reason,
+                    mark.stale_since.isoformat(), mark.run_id,
+                ),
+            )
             await db.commit()
 
     async def list_stale_functions(self, file_path: str = "", run_id: str = "") -> list:
         from brain.schemas import FunctionStalenessMark
         async with self._conn() as db:
             try:
-                q = "SELECT * FROM function_staleness WHERE 1=1"
-                params: list = []
+                conditions: list[str] = []
+                params:     list      = []
                 if file_path:
-                    q += " AND file_path=?"; params.append(file_path)
+                    conditions.append("file_path=?"); params.append(file_path)
                 if run_id:
-                    q += " AND run_id=?"; params.append(run_id)
-                async with db.execute(q, params) as cur:
+                    conditions.append("run_id=?");    params.append(run_id)
+                where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+                sql   = f"SELECT * FROM function_staleness {where} ORDER BY stale_since"
+                async with db.execute(sql, params) as cur:
                     rows = await cur.fetchall()
-                    return [FunctionStalenessMark(
-                        id=r["id"], file_path=r["file_path"],
+                return [
+                    FunctionStalenessMark(
+                        id=r["id"],
+                        file_path=r["file_path"],
                         function_name=r["function_name"],
                         line_start=r["line_start"] or 0,
                         line_end=r["line_end"] or 0,
                         stale_reason=r["stale_reason"] or "",
                         run_id=r["run_id"] or "",
-                    ) for r in rows]
+                    )
+                    for r in rows
+                ]
             except Exception:
                 return []
 
@@ -1617,6 +1719,154 @@ class SQLiteBrainStorage(BrainStorage):
                 await db.commit()
             except Exception:
                 pass
+
+    # ── Commit-audit records (Gap 4) ─────────────────────────────────────────
+
+    async def upsert_commit_audit_record(self, record: "CommitAuditRecord") -> None:  # type: ignore[override]
+        async with self._write() as db:
+            await db.execute(
+                """
+                INSERT INTO commit_audit_records (
+                    id, run_id, commit_hash, branch, author, commit_message,
+                    changed_files, changed_functions, all_changed_functions,
+                    new_functions, deleted_functions, impact_functions,
+                    impact_files, audit_targets,
+                    total_changed_functions, total_impact_functions,
+                    total_functions_to_audit, test_files_to_run,
+                    test_functions_to_run, status, cpg_updated,
+                    joern_update_status, error_detail,
+                    created_at, started_at, finished_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status                   = excluded.status,
+                    cpg_updated              = excluded.cpg_updated,
+                    joern_update_status      = excluded.joern_update_status,
+                    error_detail             = excluded.error_detail,
+                    impact_functions         = excluded.impact_functions,
+                    impact_files             = excluded.impact_files,
+                    audit_targets            = excluded.audit_targets,
+                    total_changed_functions  = excluded.total_changed_functions,
+                    total_impact_functions   = excluded.total_impact_functions,
+                    total_functions_to_audit = excluded.total_functions_to_audit,
+                    test_files_to_run        = excluded.test_files_to_run,
+                    test_functions_to_run    = excluded.test_functions_to_run,
+                    started_at               = excluded.started_at,
+                    finished_at              = excluded.finished_at
+                """,
+                (
+                    record.id, record.run_id, record.commit_hash,
+                    record.branch, record.author, record.commit_message,
+                    json.dumps(record.changed_files),
+                    json.dumps(record.changed_functions),
+                    json.dumps(record.all_changed_functions),
+                    json.dumps(record.new_functions),
+                    json.dumps(record.deleted_functions),
+                    json.dumps(record.impact_functions),
+                    json.dumps(record.impact_files),
+                    json.dumps(record.audit_targets),
+                    record.total_changed_functions,
+                    record.total_impact_functions,
+                    record.total_functions_to_audit,
+                    json.dumps(record.test_files_to_run),
+                    json.dumps(record.test_functions_to_run),
+                    record.status.value,
+                    int(record.cpg_updated),
+                    record.joern_update_status,
+                    record.error_detail,
+                    record.created_at.isoformat(),
+                    record.started_at.isoformat() if record.started_at else None,
+                    record.finished_at.isoformat() if record.finished_at else None,
+                ),
+            )
+            await db.commit()
+
+    def _row_to_commit_audit_record(self, row: aiosqlite.Row) -> "CommitAuditRecord":
+        from brain.schemas import CommitAuditRecord, CommitAuditStatus
+        return CommitAuditRecord(
+            id=row["id"],
+            run_id=row["run_id"] or "",
+            commit_hash=row["commit_hash"] or "",
+            branch=row["branch"] or "",
+            author=row["author"] or "",
+            commit_message=row["commit_message"] or "",
+            changed_files=json.loads(row["changed_files"] or "[]"),
+            changed_functions=json.loads(row["changed_functions"] or "{}"),
+            all_changed_functions=json.loads(row["all_changed_functions"] or "[]"),
+            new_functions=json.loads(row["new_functions"] or "[]"),
+            deleted_functions=json.loads(row["deleted_functions"] or "[]"),
+            impact_functions=json.loads(row["impact_functions"] or "[]"),
+            impact_files=json.loads(row["impact_files"] or "[]"),
+            audit_targets=json.loads(row["audit_targets"] or "[]"),
+            total_changed_functions=row["total_changed_functions"] or 0,
+            total_impact_functions=row["total_impact_functions"] or 0,
+            total_functions_to_audit=row["total_functions_to_audit"] or 0,
+            test_files_to_run=json.loads(row["test_files_to_run"] or "[]"),
+            test_functions_to_run=json.loads(row["test_functions_to_run"] or "[]"),
+            status=CommitAuditStatus(row["status"]),
+            cpg_updated=bool(row["cpg_updated"]),
+            joern_update_status=row["joern_update_status"] or "",
+            error_detail=row["error_detail"] or "",
+            created_at=_require_dt(row["created_at"]),
+            started_at=_parse_dt(row["started_at"]),
+            finished_at=_parse_dt(row["finished_at"]),
+        )
+
+    async def get_commit_audit_record(self, record_id: str) -> "CommitAuditRecord | None":
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM commit_audit_records WHERE id=?", (record_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return self._row_to_commit_audit_record(row) if row else None
+
+    async def get_commit_audit_record_by_hash(
+        self, commit_hash: str, run_id: str = ""
+    ) -> "CommitAuditRecord | None":
+        async with self._conn() as db:
+            try:
+                if run_id:
+                    sql    = ("SELECT * FROM commit_audit_records "
+                              "WHERE commit_hash=? AND run_id=? "
+                              "ORDER BY created_at DESC LIMIT 1")
+                    params = (commit_hash, run_id)
+                else:
+                    sql    = ("SELECT * FROM commit_audit_records "
+                              "WHERE commit_hash=? ORDER BY created_at DESC LIMIT 1")
+                    params = (commit_hash,)
+                async with db.execute(sql, params) as cur:
+                    row = await cur.fetchone()
+                    return self._row_to_commit_audit_record(row) if row else None
+            except Exception:
+                return None
+
+    async def list_commit_audit_records(
+        self,
+        run_id: str = "",
+        status: "CommitAuditStatus | None" = None,
+        limit: int = 100,
+    ) -> list:
+        from brain.schemas import CommitAuditStatus as _CAS
+        async with self._conn() as db:
+            try:
+                conditions: list[str] = []
+                params:     list      = []
+                if run_id:
+                    conditions.append("run_id=?");   params.append(run_id)
+                if status is not None:
+                    conditions.append("status=?");   params.append(status.value)
+                where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+                params.append(limit)
+                sql = (
+                    f"SELECT * FROM commit_audit_records {where} "
+                    f"ORDER BY created_at DESC LIMIT ?"
+                )
+                async with db.execute(sql, params) as cur:
+                    rows = await cur.fetchall()
+                return [self._row_to_commit_audit_record(r) for r in rows]
+            except Exception:
+                return []
+
+
 
                                                                       
     async def upsert_ldra_finding(self, finding) -> None:

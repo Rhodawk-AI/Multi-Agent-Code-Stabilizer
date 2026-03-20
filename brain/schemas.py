@@ -806,6 +806,128 @@ class ConvergenceRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Review / LLM session types
+# ---------------------------------------------------------------------------
+
+class ReviewDecision(BaseModel):
+    """Per-issue verdict produced by ReviewerAgent."""
+    issue_id:       str           = ''
+    fix_path:       str           = ''
+    verdict:        ReviewVerdict = ReviewVerdict.REJECTED
+    confidence:     float         = Field(ge=0.0, le=1.0, default=0.5)
+    reason:         str           = ''
+    concerns:       list[str]     = Field(default_factory=list)
+    cross_file_ok:  bool          = True
+
+
+class ReviewResult(BaseModel):
+    """Aggregated review outcome for a single FixAttempt."""
+    review_id:         str                   = Field(default_factory=_new_id)
+    fix_attempt_id:    str                   = ''
+    decisions:         list[ReviewDecision]  = Field(default_factory=list)
+    overall_score:     float                 = 0.0
+    overall_note:      str                   = ''
+    approve_for_commit: bool                 = False
+    reviewed_at:       datetime              = Field(default_factory=_utcnow)
+
+    def compute_approval(self) -> None:
+        """
+        Approve for commit iff every decision is APPROVED or APPROVED_WARNING
+        and at least one decision exists.  Sets overall_score to the mean
+        confidence of all decisions.
+        """
+        if not self.decisions:
+            self.approve_for_commit = False
+            self.overall_score      = 0.0
+            return
+        approved_verdicts = {ReviewVerdict.APPROVED, ReviewVerdict.APPROVED_WARNING}
+        all_approved       = all(d.verdict in approved_verdicts for d in self.decisions)
+        self.approve_for_commit = all_approved
+        self.overall_score      = sum(d.confidence for d in self.decisions) / len(self.decisions)
+
+
+class LLMSession(BaseModel):
+    """Record of a single LLM API call for cost tracking and audit trail."""
+    id:                str           = Field(default_factory=_new_id)
+    run_id:            str           = ''
+    agent_type:        ExecutorType  = ExecutorType.GENERAL
+    model:             str           = ''
+    prompt_tokens:     int           = 0
+    completion_tokens: int           = 0
+    cost_usd:          float         = 0.0
+    duration_ms:       int           = 0
+    success:           bool          = True
+    error:             str           = ''
+    started_at:        datetime      = Field(default_factory=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Gap 4: Commit-granularity incremental audit tracking
+# ---------------------------------------------------------------------------
+
+class CommitAuditStatus(str, Enum):
+    PENDING   = 'PENDING'    # diff parsed, impact set queued
+    RUNNING   = 'RUNNING'    # auditing impact set functions
+    DONE      = 'DONE'       # all impact-set functions re-audited
+    FAILED    = 'FAILED'     # scheduler encountered a fatal error
+    SKIPPED   = 'SKIPPED'    # no changed functions found in diff
+
+
+class CommitAuditRecord(BaseModel):
+    """
+    Persists the state of a single commit-triggered incremental audit.
+
+    One record is created per commit that reaches the system (via webhook,
+    CI push, or post-fix commit).  The scheduler uses this record to resume
+    interrupted audits and to report compute savings (functions_to_audit vs
+    full codebase line count).
+    """
+    id: str = Field(default_factory=_new_id)
+    run_id: str = ''
+
+    # Git provenance
+    commit_hash: str = ''
+    branch: str = ''
+    author: str = ''
+    commit_message: str = ''
+
+    # Diff statistics (function-granularity, not file-granularity)
+    changed_files: list[str] = Field(default_factory=list)
+    changed_functions: dict[str, list[str]] = Field(default_factory=dict)
+    # flat list derived from changed_functions for easy querying
+    all_changed_functions: list[str] = Field(default_factory=list)
+    new_functions: list[str] = Field(default_factory=list)
+    deleted_functions: list[str] = Field(default_factory=list)
+
+    # CPG impact set (transitive dependents to depth 3)
+    impact_functions: list[str] = Field(default_factory=list)
+    impact_files: list[str] = Field(default_factory=list)
+
+    # Audit scope — the minimal set fed to re-audit
+    audit_targets: list[dict] = Field(default_factory=list)
+
+    # Counts for compute-savings reporting
+    total_changed_functions: int = 0
+    total_impact_functions: int = 0
+    total_functions_to_audit: int = 0
+
+    # Test re-run scope
+    test_files_to_run: list[str] = Field(default_factory=list)
+    test_functions_to_run: list[str] = Field(default_factory=list)
+
+    # Execution state
+    status: CommitAuditStatus = CommitAuditStatus.PENDING
+    cpg_updated: bool = False
+    joern_update_status: str = ''
+    error_detail: str = ''
+
+    # Timing
+    created_at: datetime = Field(default_factory=_utcnow)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
 # Backward-compatible alias
 # ---------------------------------------------------------------------------
 # Tests and external callers import `Escalation` rather than `EscalationRecord`.
