@@ -423,9 +423,13 @@ class FixMemory:
         from qdrant_client.models import PointStruct  # type: ignore
         vec = self._embed(text)
         uid = abs(hash(text + meta.get("created_at", ""))) % (10 ** 9)
+        # Overwrite run_id in the payload with the stable repo-scoped user_id
+        # so _qdrant_retrieve's namespace filter matches on the correct key.
+        # The original run_id (a transient run UUID) is preserved as audit_run_id.
+        payload = {**meta, "run_id": self._user_id, "audit_run_id": meta.get("run_id", "")}
         self._client.upsert(
             collection_name=_MEMORY_COLLECTION,
-            points=[PointStruct(id=uid, vector=vec, payload=meta)],
+            points=[PointStruct(id=uid, vector=vec, payload=payload)],
         )
 
     def _qdrant_retrieve(
@@ -436,6 +440,10 @@ class FixMemory:
             collection_name=_MEMORY_COLLECTION,
             query_vector=vec,
             limit=n,
+            # Scope results to this repository's user_id so fix memories from
+            # repo A never appear as few-shot examples for repo B.  The filter
+            # was previously disabled with `if False else None`, causing
+            # cross-repo memory bleed under any multi-repo Qdrant deployment.
             query_filter={
                 "must": [
                     {
@@ -443,7 +451,7 @@ class FixMemory:
                         "match": {"value": self._user_id},
                     }
                 ]
-            } if False else None,    # skip filter for now — all repos share one store
+            },
         )
         return [
             FixMemoryEntry(
