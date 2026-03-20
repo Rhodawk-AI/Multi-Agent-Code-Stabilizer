@@ -540,6 +540,125 @@ class JoernClient:
                 log.debug(f"JoernClient.find_vulnerability_patterns: {exc}")
         return results
 
+    async def get_importing_files(
+        self,
+        symbol_names: list[str],
+        file_paths:   list[str] | None = None,
+    ) -> list[dict]:
+        """Return files that import any of the given symbols without necessarily
+        calling them.
+
+        This closes the Gap 3 underestimate: a module that does
+        ``from payment_service import PaymentResult`` is affected by a type
+        change to ``PaymentResult`` even if it never *calls* a changed function.
+        The call graph misses these; the import graph catches them.
+
+        Joern models import/dependency edges via ``cpg.imports`` (for languages
+        with explicit import statements, e.g. Python, JS, Java) and via
+        ``cpg.dependency`` (for package-level deps).  Both are queried and
+        deduplicated.
+
+        Returns a list of dicts with keys:
+            importer_file, imported_symbol, relationship
+        """
+        if not self.is_ready or not symbol_names:
+            return []
+
+        results: dict[str, dict] = {}
+
+        for sym in symbol_names:
+            # --- cpg.imports: explicit import statements ----------------------
+            # Joern IMPORT nodes carry .importedAs (alias) and .code (full stmt)
+            # Their enclosing FILE node gives the importer path.
+            try:
+                q_imports = (
+                    f'cpg.imports.importedAs("{_esc(sym)}")' "\n"
+                    ".map(i => Map("
+                    '  "importerFile" -> i.file.name.headOption.getOrElse("<unknown>"),'
+                    f' "importedSymbol" -> "{_esc(sym)}",'
+                    '  "relationship"  -> "import_reference"'
+                    ")).l"
+                )
+                raw = await self._query(q_imports)
+                for r in raw:
+                    fp = r.get("importerFile", "")
+                    if fp and fp != "<unknown>":
+                        key = f"{fp}::{sym}"
+                        results[key] = {
+                            "importer_file":    fp,
+                            "imported_symbol":  sym,
+                            "relationship":     "import_reference",
+                        }
+            except Exception as exc:
+                log.debug(f"JoernClient.get_importing_files (imports pass) for {sym}: {exc}")
+
+            # --- cpg.dependency: package-level references ---------------------
+            # Covers ``require``/``import`` at the module resolver level
+            # (e.g. ``const x = require('payment_service')`` in JS).
+            try:
+                q_deps = (
+                    f'cpg.dependency.name("{_esc(sym)}")' "\n"
+                    ".map(d => Map("
+                    '  "importerFile" -> d.file.name.headOption.getOrElse("<unknown>"),'
+                    f' "importedSymbol" -> "{_esc(sym)}",'
+                    '  "relationship"  -> "dependency_reference"'
+                    ")).l"
+                )
+                raw = await self._query(q_deps)
+                for r in raw:
+                    fp = r.get("importerFile", "")
+                    if fp and fp != "<unknown>":
+                        key = f"{fp}::{sym}::dep"
+                        if key not in results:
+                            results[key] = {
+                                "importer_file":   fp,
+                                "imported_symbol": sym,
+                                "relationship":    "dependency_reference",
+                            }
+            except Exception as exc:
+                log.debug(f"JoernClient.get_importing_files (dependency pass) for {sym}: {exc}")
+
+            # --- Fallback: file-level endsWith match --------------------------
+            # When cpg.imports / cpg.dependency return nothing (e.g. a language
+            # Joern indexes without an explicit IMPORT layer), fall back to a
+            # broader AST-level code search on the symbol name.  This may produce
+            # false positives for very short names, so it is applied only when
+            # both structured passes returned zero results for this symbol.
+            if not any(r["imported_symbol"] == sym for r in results.values()):
+                try:
+                    q_fallback = (
+                        f'cpg.file.where(_.ast.code(".*{_esc(sym)}.*"))' "\n"
+                        ".map(f => Map("
+                        '  "importerFile"   -> f.name,'
+                        f' "importedSymbol" -> "{_esc(sym)}",'
+                        '  "relationship"   -> "ast_text_reference"'
+                        ")).l"
+                    )
+                    raw = await self._query(q_fallback)
+                    for r in raw:
+                        fp = r.get("importerFile", "")
+                        # Skip the file that DEFINES the symbol — it is not an
+                        # importer of itself.
+                        if fp and fp != "<unknown>":
+                            skip = False
+                            if file_paths:
+                                for src_fp in file_paths:
+                                    if fp.endswith(src_fp) or src_fp.endswith(fp):
+                                        skip = True
+                                        break
+                            if not skip:
+                                key = f"{fp}::{sym}::ast"
+                                if key not in results:
+                                    results[key] = {
+                                        "importer_file":   fp,
+                                        "imported_symbol": sym,
+                                        "relationship":    "ast_text_reference",
+                                    }
+                except Exception as exc:
+                    log.debug(f"JoernClient.get_importing_files (AST fallback) for {sym}: {exc}")
+
+        return list(results.values())
+
     async def compute_impact_set(self, function_names: list[str], depth: int = 3) -> list[dict]:
         if not self.is_ready or not function_names:
             return []

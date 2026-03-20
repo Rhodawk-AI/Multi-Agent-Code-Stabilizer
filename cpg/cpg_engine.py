@@ -41,6 +41,13 @@ class CPGBlastRadius:
     affected_function_count: int        = 0
     affected_file_count:     int        = 0
     test_files_affected:     list[str]  = field(default_factory=list)
+    # Import-only references: modules that import a changed symbol without
+    # calling any changed function.  These are invisible to the call graph
+    # but are broken by type changes, constant renames, and signature shifts.
+    # Tracked separately so the blast score can weight them appropriately
+    # (lower than a direct caller, but not zero).
+    importing_modules:       list[str]  = field(default_factory=list)
+    importing_module_count:  int        = 0
     blast_radius_score:      float      = 0.0
     requires_human_review:   bool       = False
     source:                  str        = "cpg"
@@ -283,6 +290,7 @@ class CPGEngine:
         blast = CPGBlastRadius(changed_functions=function_names)
 
         if self.is_available and self._client:
+            # ── Call graph: callers + callees ─────────────────────────────────
             affected = await self._client.compute_impact_set(function_names=function_names, depth=depth)
             blast.affected_functions      = affected
             blast.affected_function_count = len(affected)
@@ -291,6 +299,34 @@ class CPGEngine:
             ))
             blast.affected_file_count     = len(blast.affected_files)
             blast.source = "cpg"
+
+            # ── Import graph: pure import references -─────────────────────────
+            # A file that imports a changed symbol but never calls any changed
+            # function is broken by type / signature changes and must be included
+            # in the blast radius.  The call-graph pass above misses these
+            # entirely; this pass fills the gap.
+            import_hits = await self._client.get_importing_files(
+                symbol_names=function_names,
+                file_paths=file_paths or [],
+            )
+            # De-duplicate against files already captured by the call graph.
+            call_graph_files: set[str] = set(blast.affected_files)
+            import_only_files: list[str] = sorted(set(
+                h["importer_file"]
+                for h in import_hits
+                if h.get("importer_file")
+                and h["importer_file"] not in call_graph_files
+            ))
+            blast.importing_modules      = import_only_files
+            blast.importing_module_count = len(import_only_files)
+
+            if blast.importing_module_count:
+                log.info(
+                    f"CPGEngine.compute_blast_radius: import graph adds "
+                    f"{blast.importing_module_count} import-only files "
+                    f"(call graph had {blast.affected_file_count})"
+                )
+
         elif self.has_fallback:
             affected_files: set[str] = set()
             for fp in (file_paths or []):
@@ -312,17 +348,41 @@ class CPGEngine:
                 f"{_estimated_fn_count} functions). Blast radius gate may fire "
                 f"conservatively. Start Joern for exact CPG results."
             )
+            # The graph_fallback impact_radius already traverses import edges
+            # (it walks the full dependency graph), so importing_module_count
+            # is not separately computable here — leave at 0.
 
         blast.test_files_affected = [
             f for f in blast.affected_files if "test" in f.lower() or "spec" in f.lower()
         ]
-        blast.blast_radius_score    = min(blast.affected_function_count / 200.0, 1.0)
-        blast.requires_human_review = blast.affected_function_count >= self.blast_radius_threshold
+
+        # ── Blast radius score ────────────────────────────────────────────────
+        # Score formula:
+        #   base     = affected_function_count / 200   (call graph — full weight)
+        #   import   = importing_module_count  / 400   (half weight: import-only
+        #              modules are less immediately broken than direct callers,
+        #              but still contribute risk at 10M-line scale)
+        # Both terms are clamped to [0.0, 1.0] independently, then averaged.
+        # This prevents a pathological codebase with 10k import-only files from
+        # inflating the score above what the call graph alone would produce.
+        call_score   = min(blast.affected_function_count / 200.0, 1.0)
+        import_score = min(blast.importing_module_count  / 400.0, 1.0)
+        # Weight: call graph contributes 80%, import graph contributes 20%.
+        # Rationale: an import-only reference is broken by type/signature changes
+        # but not by pure logic changes — it deserves less weight than a caller.
+        blast.blast_radius_score = round(0.8 * call_score + 0.2 * import_score, 4)
+
+        # Human review gate fires when the TOTAL affected surface (callers +
+        # importers) exceeds the threshold.  Importers are counted at 0.5 weight
+        # because a pure import reference requires less rework than a call site.
+        weighted_total = blast.affected_function_count + int(blast.importing_module_count * 0.5)
+        blast.requires_human_review = weighted_total >= self.blast_radius_threshold
 
         log.info(
             f"CPGEngine.compute_blast_radius: changed={len(function_names)} → "
             f"affected={blast.affected_function_count} fns/{blast.affected_file_count} files "
-            f"score={blast.blast_radius_score:.2f} human_review={blast.requires_human_review} "
+            f"importing_only={blast.importing_module_count} "
+            f"score={blast.blast_radius_score:.4f} human_review={blast.requires_human_review} "
             f"source={blast.source}"
         )
         return blast
