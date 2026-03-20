@@ -1723,6 +1723,33 @@ class StabilizerController:
                 reason="Test regression after commit"
             )
 
+        # ── Persist the reverted approach so the Fixer never repeats it ────────
+        if self._fix_memory:
+            try:
+                issues = await self.storage.list_issues(run_id=self.run.id)
+                issue_map = {i.id: i for i in issues}
+                for ff in fix.fixed_files:
+                    # Collect the issue types that this fix was addressing
+                    issue_types = ", ".join(
+                        issue_map[iid].description[:80]
+                        for iid in fix.issue_ids
+                        if iid in issue_map
+                    ) or "unknown"
+                    fix_approach = ff.diff_summary or ff.changes_made or "patch applied"
+                    self._fix_memory.store_failure(
+                        issue_type=issue_types,
+                        file_context=ff.path,
+                        fix_approach=fix_approach,
+                        failure_reason="Test regression detected post-commit; fix reverted",
+                        run_id=self.run.id,
+                    )
+                self.log.info(
+                    f"[revert] Stored {len(fix.fixed_files)} reverted fix pattern(s) "
+                    f"in FixMemory for fix {fix.id[:12]}"
+                )
+            except Exception as exc:
+                self.log.warning(f"[revert] FixMemory.store_failure failed (non-fatal): {exc}")
+
     # ── Staleness and dependency re-queue ──────────────────────────────────────
 
     async def _requeue_stale_functions(self, changed: set[str]) -> None:
