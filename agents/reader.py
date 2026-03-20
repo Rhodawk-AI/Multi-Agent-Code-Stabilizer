@@ -49,10 +49,10 @@ class ReaderAgent(BaseAgent):
         chunk_concurrency: int                = 4,
         vector_brain:      Any | None         = None,
         # ── Antagonist additions ─────────────────────────────────────────────
-        hybrid_retriever:  Any | None         = None,  # brain.hybrid_retriever.HybridRetriever
-        repo_map:          Any | None         = None,  # context.repo_map.RepoMap
+        hybrid_retriever:  Any | None         = None,
+        repo_map:          Any | None         = None,
         # ── Gap 1: CPG engine ────────────────────────────────────────────────
-        cpg_engine:        Any | None         = None,  # cpg.cpg_engine.CPGEngine
+        cpg_engine:        Any | None         = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root         = Path(repo_root)
@@ -60,16 +60,13 @@ class ReaderAgent(BaseAgent):
         self.concurrency       = concurrency
         self.chunk_concurrency = chunk_concurrency
         self.vector_brain      = vector_brain
-        # Antagonist
         self.hybrid_retriever  = hybrid_retriever
         self.repo_map          = repo_map
-        # Gap 1
         self.cpg_engine        = cpg_engine
 
     async def run(
         self, force_reread: set[str] | None = None, **kwargs: Any
     ) -> list[FileRecord]:
-        # Collect files in executor (blocks on fs scan)
         loop = asyncio.get_event_loop()
         all_files = await loop.run_in_executor(None, self._collect_files)
 
@@ -85,10 +82,6 @@ class ReaderAgent(BaseAgent):
             self.log.warning(f"[reader] {errors} files failed to process")
         self.log.info(f"[reader] Processed {len(processed)} files")
 
-        # ANTAGONIST: Invalidate the repo-map cache after every read pass so
-        # the next FixerAgent call regenerates the map against the fresh
-        # file tree.  The invalidation is cheap — it just clears the in-process
-        # dict; no Qdrant/DB interaction required.
         if self.repo_map is not None:
             try:
                 self.repo_map.invalidate()
@@ -99,31 +92,18 @@ class ReaderAgent(BaseAgent):
             except Exception as exc:
                 self.log.debug(f"[reader] RepoMap invalidate failed (non-fatal): {exc}")
 
-        # GAP 1: Trigger Joern CPG import/update after the read pass.
-        # On the first run this imports the entire codebase into Joern and
-        # builds the CPG.  On subsequent runs Joern updates only the changed
-        # files (incremental overlay).  This is non-blocking — the import
-        # runs in the background and queries return empty results until ready.
         if self.cpg_engine is not None:
             try:
                 if not self.cpg_engine.is_available:
-                    # First initialisation — connect to Joern
                     await self.cpg_engine.initialise(
                         repo_path=str(self.repo_root),
                         project_name="rhodawk",
                     )
                 else:
-                    # Already connected — invalidate stale cache entries
-                    # (full CPG update triggered by IncrementalCPGUpdater
-                    #  in controller._phase_commit())
                     self.cpg_engine.invalidate_cache()
-                    self.log.debug(
-                        "[reader] CPG cache invalidated after read pass"
-                    )
+                    self.log.debug("[reader] CPG cache invalidated after read pass")
             except Exception as exc:
-                self.log.debug(
-                    f"[reader] CPG init/invalidate failed (non-fatal): {exc}"
-                )
+                self.log.debug(f"[reader] CPG init/invalidate failed (non-fatal): {exc}")
 
         return processed
 
@@ -149,7 +129,6 @@ class ReaderAgent(BaseAgent):
             )
             file_hash = hashlib.sha256(content.encode()).hexdigest()
 
-            # Incremental check
             existing = await self.storage.get_file(rel_path)
             if (
                 self.incremental
@@ -158,9 +137,24 @@ class ReaderAgent(BaseAgent):
                 and existing.status == FileStatus.READ
                 and (force_reread is None or rel_path not in force_reread)
             ):
-                # Check if any stale functions need re-chunking
+                # GAP 4 FIX: query staleness marks WITHOUT run_id filter.
+                #
+                # The original code filtered by self.run_id:
+                #   list_stale_functions(file_path=rel_path, run_id=self.run_id)
+                #
+                # This silently dropped all staleness marks written by the
+                # CommitAuditScheduler invoked from a CI webhook, because the
+                # webhook Celery task receives its own run_id parameter which
+                # differs from the current read-phase run_id.  The reader
+                # never saw those marks, so files touched by a webhook-triggered
+                # incremental update were never re-read — defeating the entire
+                # Gap 4 mechanism in production webhook flows.
+                #
+                # Fix: query ALL marks for this file path, regardless of which
+                # run wrote them.  A staleness mark from any run means the file
+                # has changed functions that need re-auditing.
                 stale = await self.storage.list_stale_functions(
-                    file_path=rel_path, run_id=self.run_id
+                    file_path=rel_path
                 )
                 if not stale:
                     return existing
@@ -180,12 +174,10 @@ class ReaderAgent(BaseAgent):
             record.status     = FileStatus.READING
             await self.storage.upsert_file(record)
 
-            # Chunk the file
             chunks = await asyncio.get_event_loop().run_in_executor(
                 None, self._chunk_file, rel_path, content, language, line_count
             )
 
-            # Store chunks (with BM25+dense hybrid indexing if available)
             chunk_sem = asyncio.Semaphore(self.chunk_concurrency)
             chunk_tasks = [
                 self._store_chunk(chunk, chunk_sem)
@@ -196,10 +188,12 @@ class ReaderAgent(BaseAgent):
             record.chunk_count     = len(chunks)
             record.status          = FileStatus.READ
             record.known_functions = self._extract_function_names(content, language)
-            record.stale_functions = []   # Cleared after re-read
+            record.stale_functions = []
             await self.storage.upsert_file(record)
 
-            # Clear staleness marks
+            # GAP 4 FIX: clear without run_id filter for the same reason we
+            # query without it — marks from any run should be consumed once
+            # the file has been re-read.
             for fn_name in record.known_functions:
                 await self.storage.clear_staleness_mark(rel_path, fn_name)
 
@@ -219,7 +213,6 @@ class ReaderAgent(BaseAgent):
         else:
             strategy = ChunkStrategy.FULL
 
-        # Use FUNCTION strategy for C/C++ when tree-sitter available
         if language in {"c", "cpp"} and line_count <= 10_000:
             from startup.feature_matrix import is_available
             if is_available("tree_sitter_language_pack"):
@@ -239,7 +232,6 @@ class ReaderAgent(BaseAgent):
         async with sem:
             await self.storage.upsert_chunk(chunk)
 
-            # ANTAGONIST: prefer HybridRetriever (BM25 + dense) over plain VectorBrain
             if self.hybrid_retriever and self.hybrid_retriever.is_available:
                 try:
                     self.hybrid_retriever.index_chunk_hybrid(
@@ -251,14 +243,13 @@ class ReaderAgent(BaseAgent):
                         summary=chunk.summary,
                         observations=chunk.raw_observations,
                     )
-                    return   # HybridRetriever also calls VectorBrain internally
+                    return
                 except Exception as exc:
                     self.log.debug(
                         f"HybridRetriever index failed for chunk {chunk.id}: {exc}"
                         " — falling back to VectorBrain"
                     )
 
-            # Fallback: plain dense-only VectorBrain
             if self.vector_brain and self.vector_brain.is_available:
                 try:
                     self.vector_brain.index_chunk(
@@ -290,6 +281,27 @@ class ReaderAgent(BaseAgent):
         return ext_map.get(path.suffix.lower(), "unknown")
 
     def _extract_function_names(self, content: str, language: str) -> list[str]:
+        """
+        Extract all function and method names from source content.
+
+        GAP 4 FIX: method names are now qualified as ``ClassName.method_name``
+        so that:
+
+        1. Two classes with identically-named methods (e.g. both have
+           ``__init__``, ``run``, or ``validate``) produce *distinct* entries
+           in ``known_functions`` and therefore produce distinct
+           ``FunctionStalenessMark`` rows per (file, class, method) triple.
+
+        2. ``clear_staleness_mark`` is called with the same qualified name
+           that ``IncrementalCPGUpdater._ts_changed_functions`` writes, so
+           marks are correctly consumed after a file is re-read rather than
+           cleared wholesale by the first matching bare name.
+
+        Original bug: bare method names were stored, so
+        ``clear_staleness_mark(rel_path, "__init__")`` cleared marks for
+        EVERY class in the file at once, and only the last ``__init__`` seen
+        was kept in ``known_functions`` (dict-key collision).
+        """
         try:
             from startup.feature_matrix import is_available
             if not is_available("tree_sitter_language_pack"):
@@ -307,16 +319,36 @@ class ReaderAgent(BaseAgent):
             tree   = parser.parse(content.encode())
             names: list[str] = []
 
-            def _walk(node) -> None:
+            def _walk(node, class_name: str = "") -> None:
+                # Track the enclosing class name so method names are qualified.
+                current_class = class_name
+                if node.type in {
+                    "class_definition", "class_declaration",
+                    "struct_item", "impl_item",
+                }:
+                    for child in node.children:
+                        if child.type in {"identifier", "name", "type_identifier"}:
+                            current_class = child.text.decode(errors="replace")
+                            break
+
                 if node.type in {
                     "function_definition", "function_declaration",
                     "method_definition", "function_item",
                 }:
+                    fn_name = ""
                     for child in node.children:
                         if child.type in {"identifier", "name"}:
-                            names.append(child.text.decode(errors="replace"))
+                            fn_name = child.text.decode(errors="replace")
+                            break
+                    if fn_name:
+                        qualified = (
+                            f"{current_class}.{fn_name}"
+                            if current_class else fn_name
+                        )
+                        names.append(qualified)
+
                 for child in node.children:
-                    _walk(child)
+                    _walk(child, current_class)
 
             _walk(tree.root_node)
             return names
