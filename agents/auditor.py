@@ -246,11 +246,48 @@ class AuditorAgent(BaseAgent):
         self.jsf_enabled        = jsf_enabled
         self._master_prompt: str = ""
 
-    async def run(self, **kwargs: Any) -> list[Issue]:
+    async def run(self, stale_only: bool = False, **kwargs: Any) -> list[Issue]:
+        """
+        Audit code chunks and return Issues.
+
+        Parameters
+        ----------
+        stale_only:
+            When True (set by the controller during commit-triggered incremental
+            cycles) the auditor calls storage.get_stale_observations() instead
+            of get_all_observations().  This scopes the audit to the CPG-computed
+            impact set written by CommitAuditScheduler — typically 50-200
+            functions rather than the full codebase.
+
+            If get_stale_observations() returns an empty list (staleness table is
+            empty or the run has no marks yet) we automatically fall back to
+            get_all_observations() so the first full audit cycle still works.
+        """
         self._master_prompt = self._load_master_prompt()
-        chunks = await self.storage.get_all_observations()
+
+        if stale_only:
+            chunks = await self.storage.get_stale_observations(
+                run_id=self.run_id
+            )
+            if not chunks:
+                # Staleness table empty — this is either the first cycle or
+                # marks were already cleared.  Fall back to full audit.
+                self.log.debug(
+                    "[%s] stale_only=True but no stale marks found — "
+                    "falling back to full get_all_observations()",
+                    self.agent_name,
+                )
+                chunks = await self.storage.get_all_observations()
+        else:
+            chunks = await self.storage.get_all_observations()
+
         if not chunks:
             return []
+
+        self.log.info(
+            "[%s] auditing %d chunk(s) (stale_only=%s)",
+            self.agent_name, len(chunks), stale_only,
+        )
 
         sem = asyncio.Semaphore(4)
         tasks = [self._audit_chunk(chunk, sem) for chunk in chunks]
