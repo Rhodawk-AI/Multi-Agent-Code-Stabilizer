@@ -106,6 +106,12 @@ def create_app() -> FastAPI:
         # with compound metadata buried in the description string.
         # This route exposes them structurally with all compound-specific fields parsed out.
         ("api.routes.compound_findings", "router"),
+        # GAP 3 FIX: refactor proposals as first-class API objects.
+        # When the FixerAgent blast-radius gate fires (>50 downstream functions),
+        # a RefactorProposal is persisted and an escalation is raised.  Without
+        # this router those proposals were unreachable from outside the process —
+        # dashboards and human reviewers had no REST surface to query or act on them.
+        ("api.routes.refactor_proposals", "router"),
     ]:
         try:
             import importlib
