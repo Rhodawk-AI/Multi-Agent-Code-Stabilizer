@@ -15,6 +15,35 @@ PRODUCTION FIXES vs audit report
 • ConsensusRule.minimum_agents enforced — insufficient votes → ESCALATE.
 • evaluate_issues() is synchronous (pure data processing — no I/O).
 • All consensus logic is deterministic given the same input votes.
+
+GAP 2 FIX — ExecutorType.SYNTHESIS handling
+─────────────────────────────────────────────
+SYNTHESIS issues are compound findings produced by SynthesisAgent after
+cross-domain analysis of SECURITY + ARCHITECTURE + STANDARDS findings.
+Two bugs in the original consensus path always escalated them:
+
+  BUG 1 — min_agents check: _build_votes() creates a single synthetic vote
+    because compound findings originate from one deliberate synthesis pass.
+    total_votes (1) < min_agents (2) → every compound finding was escalated.
+
+  BUG 2 — CRITICAL security-confirmation check: votes are tagged
+    agent=ExecutorType.SYNTHESIS, never ExecutorType.SECURITY, so
+    `security_confirmed` was always False → all CRITICAL compound findings
+    were escalated regardless of confidence.
+
+FIX: SYNTHESIS issues are routed through _evaluate_synthesis() before either
+check runs. The security signal IS embedded by construction — SynthesisAgent
+already consumed the SECURITY auditor's output to create each compound finding.
+Requiring a second security vote would be double-counting the same signal.
+
+Rules that still apply for SYNTHESIS:
+  • Confidence floor (domain-aware)
+  • MISRA mandatory rule escalation
+  • High-centrality file floor uplift
+
+Rules intentionally bypassed for SYNTHESIS:
+  • min_agents: one deliberate synthesis pass IS the consensus step
+  • security_confirmed: security domain already aggregated in compound analysis
 """
 from __future__ import annotations
 
@@ -95,6 +124,12 @@ class ConsensusEngine:
         }
 
     def _evaluate_one(self, issue: Issue) -> ConsensusResult:
+        # ── GAP 2 FIX: SYNTHESIS issues route through dedicated path ─────────
+        # Compound findings already embed multi-domain reasoning; they cannot
+        # and must not pass through the standard multi-auditor vote checks.
+        if issue.executor_type == ExecutorType.SYNTHESIS:
+            return self._evaluate_synthesis(issue)
+
         # Build synthetic votes from the data we have
         votes = self._build_votes(issue)
 
@@ -176,6 +211,82 @@ class ConsensusEngine:
             escalation_required=False,
         )
 
+    # ── GAP 2: SYNTHESIS-specific consensus path ──────────────────────────────
+
+    def _evaluate_synthesis(self, issue: Issue) -> ConsensusResult:
+        """
+        Dedicated consensus path for compound findings (executor_type=SYNTHESIS).
+
+        Bypasses min_agents and security_confirmed checks because:
+          • min_agents: compound findings require ≥2 domain auditors' outputs
+            to be CREATED — by the time one exists, it already passed a stricter
+            cross-domain gate than the standard per-auditor check.
+          • security_confirmed: SynthesisAgent consumed the SECURITY auditor's
+            full output.  Its contributing_issue_ids always include SECURITY
+            domain findings.  Requiring a second SECURITY vote is double-counting.
+
+        What still applies:
+          • Domain-aware confidence floor (same _get_confidence_floor logic)
+          • MISRA mandatory rule escalation (compliance, non-negotiable)
+          • High-centrality file floor uplift
+        """
+        final_confidence = issue.confidence if issue.confidence > 0.0 else 0.9
+        floor = self._get_confidence_floor(issue)
+        high_centrality = self._is_high_centrality(issue.file_path)
+
+        # Record one authoritative synthesis vote for the audit trail
+        votes = [ConsensusVote(
+            agent=ExecutorType.SYNTHESIS,
+            confirmed=True,
+            confidence=final_confidence,
+            notes="compound-finding: cross-domain synthesis pass (SECURITY+ARCHITECTURE+STANDARDS)",
+        )]
+
+        # MISRA mandatory rules still escalate — compliance always wins
+        if issue.misra_rule in _MISRA_MANDATORY_RULES:
+            log.info(
+                f"[consensus] SYNTHESIS {issue.id[:12]}: "
+                f"MISRA mandatory {issue.misra_rule} → ESCALATE_HUMAN"
+            )
+            return ConsensusResult(
+                issue_fingerprint=issue.fingerprint,
+                votes=votes,
+                final_confidence=final_confidence,
+                approved=True,
+                disagreement_action=DisagreementAction.ESCALATE_HUMAN,
+                high_centrality=high_centrality,
+                escalation_required=True,
+            )
+
+        # Confidence below domain floor → escalate (same as normal findings)
+        if final_confidence < floor:
+            log.warning(
+                f"[consensus] SYNTHESIS {issue.id[:12]} "
+                f"[{issue.severity.value}]: "
+                f"confidence {final_confidence:.2f} < floor {floor:.2f} → ESCALATE"
+            )
+            return self._escalate_result(
+                issue,
+                f"Compound finding confidence {final_confidence:.2f} < "
+                f"domain floor {floor:.2f}",
+            )
+
+        # Approved — compound finding passes consensus
+        log.info(
+            f"[consensus] SYNTHESIS {issue.id[:12]} "
+            f"[{issue.severity.value}] AUTO_RESOLVE "
+            f"confidence={final_confidence:.2f} floor={floor:.2f}"
+        )
+        return ConsensusResult(
+            issue_fingerprint=issue.fingerprint,
+            votes=votes,
+            final_confidence=final_confidence,
+            approved=True,
+            disagreement_action=DisagreementAction.AUTO_RESOLVE,
+            high_centrality=high_centrality,
+            escalation_required=False,
+        )
+
     def _get_confidence_floor(self, issue: Issue) -> float:
         floor = self._base_floor
         # High-centrality files require higher confidence
@@ -201,6 +312,9 @@ class ConsensusEngine:
         In a real run, votes come from multiple parallel AuditorAgent instances.
         Here we synthesise from the consensus_votes and consensus_confidence
         fields that were set during the audit phase.
+
+        NOTE: SYNTHESIS issues never reach this method — they are intercepted
+        by _evaluate_synthesis() in _evaluate_one() before _build_votes runs.
         """
         if not issue.consensus_votes:
             # Single-auditor mode — create one synthetic vote

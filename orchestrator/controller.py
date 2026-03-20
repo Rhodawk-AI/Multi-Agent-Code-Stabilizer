@@ -859,6 +859,27 @@ class StabilizerController:
                 or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
                 or self.config.critical_fix_model
             )
+
+            # ── GAP 2 FIX: warn when synthesis falls back to same model family ──
+            # The spec requires synthesis to use a DIFFERENT family from the
+            # auditors so cross-domain reasoning comes from genuinely fresh eyes.
+            # When synthesis_model is blank it silently uses critical_fix_model
+            # (potentially the same Anthropic/Ollama/etc. family as the auditors).
+            _synthesis_model_is_default = not (
+                self.config.synthesis_model
+                or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
+            )
+            if _synthesis_model_is_default:
+                self.log.warning(
+                    "[audit] synthesis_model is not configured — falling back to "
+                    f"critical_fix_model ({self.config.critical_fix_model}). "
+                    "This may be the same model family as the auditors and reduces "
+                    "cross-domain reasoning independence. "
+                    "Set synthesis_model in [synthesis] config or "
+                    "RHODAWK_SYNTHESIS_MODEL env var to a different family "
+                    "(e.g. DeepSeek-Coder-V2 or Qwen2.5-Coder-32B) for best results."
+                )
+
             synthesis_agent = SynthesisAgent(
                 storage=self.storage,
                 run_id=self.run.id,
@@ -871,10 +892,15 @@ class StabilizerController:
                 compound_enabled=self.config.synthesis_compound_enabled,
                 max_compound_findings=self.config.synthesis_max_compound,
             )
+            _synthesis_start = datetime.now(tz=timezone.utc)
             try:
                 deduped_issues, compound_findings = await synthesis_agent.run(
                     issues=all_issues
                 )
+                _synthesis_duration_s = (
+                    datetime.now(tz=timezone.utc) - _synthesis_start
+                ).total_seconds()
+
                 # Persist compound findings for report exporter and DeerFlow
                 self._last_compound_findings = compound_findings
 
@@ -898,6 +924,47 @@ class StabilizerController:
                     f"(deduped) + {len(compound_issues)} compound findings "
                     f"= {len(all_issues)} total"
                 )
+
+                # ── GAP 2 FIX: Build and persist SynthesisReport ─────────────
+                # Previously SynthesisReport was defined in schemas.py and
+                # imported in controller.py but NEVER CONSTRUCTED at runtime.
+                # Per-run dedup/compound metrics (dedup count, compound count,
+                # compound_critical_count, duration_s) were only written to
+                # log.info and lost forever.  This block closes that gap.
+                compound_critical = sum(
+                    1 for cf in compound_findings
+                    if cf.severity == Severity.CRITICAL
+                )
+                total_deduped = raw_count - len(deduped_issues)
+                synthesis_report = SynthesisReport(
+                    run_id=self.run.id,
+                    cycle=self.run.cycle_count,
+                    raw_issue_count=raw_count,
+                    fingerprint_dedup_count=total_deduped,
+                    semantic_dedup_count=0,   # aggregate tracked in fingerprint_dedup_count
+                    final_issue_count=len(deduped_issues),
+                    compound_finding_count=len(compound_findings),
+                    compound_critical_count=compound_critical,
+                    synthesis_model=synthesis_model,
+                    dedup_enabled=self.config.synthesis_dedup_enabled,
+                    compound_enabled=self.config.synthesis_compound_enabled,
+                    duration_s=_synthesis_duration_s,
+                )
+                try:
+                    await self.storage.upsert_synthesis_report(synthesis_report)
+                    self.log.info(
+                        f"[audit] SynthesisReport persisted: "
+                        f"raw={raw_count} deduped={len(deduped_issues)} "
+                        f"compound={len(compound_findings)} "
+                        f"(critical={compound_critical}) "
+                        f"duration={_synthesis_duration_s:.1f}s"
+                    )
+                except Exception as report_exc:
+                    # Non-fatal — log but never block the pipeline
+                    self.log.warning(
+                        f"[audit] SynthesisReport persist failed (non-fatal): {report_exc}"
+                    )
+
             except Exception as exc:
                 self.log.error(
                     f"[audit] SynthesisAgent failed — using raw undeduped findings: {exc}"
