@@ -330,7 +330,11 @@ class FixerAgent(BaseAgent):
             return ''
         try:
             query = ' '.join((i.description[:100] for i in issues[:3]))
-            entries = self.fix_memory.retrieve(query, n=3)
+            # Gap 3 Defect 3 fix: pass max_age_days=180 so reverts from years
+            # ago are excluded.  The retrieve() signature accepts max_age_days;
+            # callers that omitted it got the default but without the explicit
+            # call the intent was invisible and could change accidentally.
+            entries = self.fix_memory.retrieve(query, n=3, max_age_days=180)
             return self.fix_memory.format_as_few_shot(entries)
         except Exception as exc:
             self.log.debug(f'_get_memory_examples: {exc}')
