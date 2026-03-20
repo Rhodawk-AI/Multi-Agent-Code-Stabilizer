@@ -14,6 +14,7 @@ from brain.schemas import (
     Issue, IssueStatus,
     LdraFinding, PatrolEvent,
     PlannerRecord, PolyspaceFinding,
+    RefactorProposal,
     RequirementTraceability, ReviewerIndependenceRecord,
     RunStatus, SoftwareAccomplishmentSummary,
     SoftwareConfigurationIndex, SynthesisReport, TestRunResult,
@@ -32,8 +33,7 @@ class BrainStorage(ABC):
     • All writes must be atomic at the row level.
     """
 
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def initialise(self) -> None:
         """Create schema if not exists. Must be idempotent."""
@@ -42,8 +42,7 @@ class BrainStorage(ABC):
     async def close(self) -> None:
         """Flush and release all connections."""
 
-    # ── Run ────────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_run(self, run: AuditRun) -> None: ...
 
@@ -56,8 +55,7 @@ class BrainStorage(ABC):
     @abstractmethod
     async def append_score(self, score: AuditScore) -> None: ...
 
-    # ── Files ──────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_file(self, record: FileRecord) -> None: ...
 
@@ -78,8 +76,7 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_all_observations(self) -> list[dict[str, Any]]: ...
 
-    # ── Issues ─────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_issue(self, issue: Issue) -> None: ...
 
@@ -99,8 +96,7 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_total_cost(self, run_id: str) -> float: ...
 
-    # ── Fixes ──────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_fix(self, fix: FixAttempt) -> None: ...
 
@@ -110,13 +106,11 @@ class BrainStorage(ABC):
     @abstractmethod
     async def list_fixes(self, run_id: str = "") -> list[FixAttempt]: ...
 
-    # ── Planner ────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_planner_record(self, record: PlannerRecord) -> None: ...
 
-    # ── Audit trail ────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def append_audit_trail(self, entry: AuditTrailEntry) -> None: ...
 
@@ -125,23 +119,19 @@ class BrainStorage(ABC):
         self, run_id: str, limit: int = 1000
     ) -> list[AuditTrailEntry]: ...
 
-    # ── Patrol ─────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def append_patrol_event(self, event: PatrolEvent) -> None: ...
 
-    # ── Tests ──────────────────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_test_result(self, result: TestRunResult) -> None: ...
 
-    # ── Formal verification ────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_formal_result(self, result: FormalVerificationResult) -> None: ...
 
-    # ── ESCALATION (DO-178C 6.3.4 / MIL-STD-882E Task 402) ───────────────────
-
+                                                                               
     @abstractmethod
     async def upsert_escalation(self, esc: EscalationRecord) -> None:
         """Persist an escalation record.  Must be idempotent on id."""
@@ -158,8 +148,20 @@ class BrainStorage(ABC):
     ) -> list[EscalationRecord]:
         """List escalations, optionally filtered by run_id and/or status."""
 
-    # ── BASELINE (DO-178C Sec. 11) ─────────────────────────────────────────────
+                                                                                
+    @abstractmethod
+    async def upsert_refactor_proposal(self, proposal: RefactorProposal) -> None:
+        """Persist a refactor proposal.  Must be idempotent on id."""
 
+    @abstractmethod
+    async def get_refactor_proposal(self, proposal_id: str) -> RefactorProposal | None:
+        """Return the refactor proposal with the given id, or None."""
+
+    @abstractmethod
+    async def list_refactor_proposals(self, run_id: str = "") -> list[RefactorProposal]:
+        """List all refactor proposals for a run."""
+
+                                                                                 
     @abstractmethod
     async def upsert_baseline(self, baseline: BaselineRecord) -> None:
         """Persist a baseline record."""
@@ -176,8 +178,7 @@ class BrainStorage(ABC):
     async def list_baselines(self, run_id: str = "") -> list[BaselineRecord]:
         """List all baselines, optionally filtered by run_id."""
 
-    # ── FUNCTION STALENESS ─────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_staleness_mark(self, mark: FunctionStalenessMark) -> None:
         """Record a function as stale, requiring targeted re-audit."""
@@ -192,8 +193,7 @@ class BrainStorage(ABC):
     async def clear_staleness_mark(self, file_path: str, function_name: str) -> None:
         """Remove a staleness mark after re-audit completes."""
 
-    # ── COMPLIANCE FINDINGS ────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_ldra_finding(self, finding: LdraFinding) -> None: ...
 
@@ -216,8 +216,7 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_cbmc_result(self, result_id: str) -> CbmcVerificationResult | None: ...
 
-    # ── REQUIREMENT TRACEABILITY (DO-178C Table A-5) ───────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_rtm_entry(self, entry: RequirementTraceability) -> None: ...
 
@@ -231,8 +230,7 @@ class BrainStorage(ABC):
         self, run_id: str = ""
     ) -> list[RequirementTraceability]: ...
 
-    # ── REVIEWER INDEPENDENCE (DO-178C 6.3.4) ─────────────────────────────────
-
+                                                                                
     @abstractmethod
     async def upsert_independence_record(
         self, record: ReviewerIndependenceRecord
@@ -243,24 +241,21 @@ class BrainStorage(ABC):
         self, fix_attempt_id: str
     ) -> ReviewerIndependenceRecord | None: ...
 
-    # ── SOFTWARE ACCOMPLISHMENT SUMMARY (DO-178C Sec. 11.20) ──────────────────
-
+                                                                                
     @abstractmethod
     async def upsert_sas(self, sas: SoftwareAccomplishmentSummary) -> None: ...
 
     @abstractmethod
     async def get_sas(self, run_id: str) -> SoftwareAccomplishmentSummary | None: ...
 
-    # ── SOFTWARE CONFIGURATION INDEX ──────────────────────────────────────────
-
+                                                                                
     @abstractmethod
     async def upsert_sci(self, sci: SoftwareConfigurationIndex) -> None: ...
 
     @abstractmethod
     async def get_sci(self, baseline_id: str) -> SoftwareConfigurationIndex | None: ...
 
-    # ── CONVERGENCE (multi-cycle loop) ─────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:
         """Persist a convergence check result for audit trail and resume logic."""
@@ -273,8 +268,7 @@ class BrainStorage(ABC):
         """Return all convergence records for a run, ordered by cycle ascending."""
         ...
 
-    # ── LLM SESSION LOGGING ────────────────────────────────────────────────────
-
+                                                                                 
     @abstractmethod
     async def log_llm_session(self, session: dict) -> None:
         """
@@ -284,8 +278,7 @@ class BrainStorage(ABC):
         """
         ...
 
-    # ── GAP 2: SYNTHESIS AGENT (cross-domain compound findings) ───────────────
-
+                                                                                
     @abstractmethod
     async def upsert_synthesis_report(self, report: SynthesisReport) -> None:
         """

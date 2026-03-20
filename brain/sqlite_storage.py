@@ -46,10 +46,7 @@ from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DDL — initial schema
-# ──────────────────────────────────────────────────────────────────────────────
-
+                                                                                
 DDL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -295,30 +292,23 @@ CREATE TABLE IF NOT EXISTS audit_trail (
 CREATE INDEX IF NOT EXISTS idx_trail_run ON audit_trail(run_id);
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Migration DDL — adds columns to existing databases without data loss
-# ──────────────────────────────────────────────────────────────────────────────
-
+                                                                                
 _MIGRATIONS = [
-    # audit_runs
+                
     "ALTER TABLE audit_runs ADD COLUMN domain_mode TEXT NOT NULL DEFAULT 'general'",
     "ALTER TABLE audit_runs ADD COLUMN graph_built INTEGER DEFAULT 0",
-    # issues
+            
     "ALTER TABLE issues ADD COLUMN consensus_votes INTEGER DEFAULT 0",
     "ALTER TABLE issues ADD COLUMN consensus_confidence REAL DEFAULT 0.0",
     "ALTER TABLE issues ADD COLUMN regressed_from TEXT",
-    # fix_attempts
+                  
     "ALTER TABLE fix_attempts ADD COLUMN test_run_id TEXT",
     "ALTER TABLE fix_attempts ADD COLUMN formal_proofs TEXT DEFAULT '[]'",
-    # planner_records
+                     
     "ALTER TABLE planner_records ADD COLUMN formal_proof_available INTEGER DEFAULT 0",
     "ALTER TABLE planner_records ADD COLUMN formal_proof_id TEXT DEFAULT ''",
 ]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -335,10 +325,6 @@ def _require_dt(v: str) -> datetime:
     dt = datetime.fromisoformat(v)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Storage implementation
-# ──────────────────────────────────────────────────────────────────────────────
 
 class SQLiteBrainStorage(BrainStorage):
 
@@ -377,7 +363,7 @@ class SQLiteBrainStorage(BrainStorage):
                 await self._db.execute(stmt)
                 await self._db.commit()
             except Exception:
-                # Column already exists — safe to ignore
+                                                        
                 pass
 
     async def close(self) -> None:
@@ -385,8 +371,7 @@ class SQLiteBrainStorage(BrainStorage):
             await self._db.close()
             self._db = None
 
-    # ── AuditRun ─────────────────────────────────────────────────────────────
-
+                                                                               
     async def upsert_run(self, run: AuditRun) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -469,8 +454,7 @@ class SQLiteBrainStorage(BrainStorage):
             )
             await db.commit()
 
-    # ── Scores ───────────────────────────────────────────────────────────────
-
+                                                                               
     async def append_score(self, score: AuditScore) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -511,8 +495,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Files ────────────────────────────────────────────────────────────────
-
+                                                                               
     async def upsert_file(self, record: FileRecord) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -651,8 +634,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Issues ───────────────────────────────────────────────────────────────
-
+                                                                               
     async def upsert_issue(self, issue: Issue) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -776,8 +758,7 @@ class SQLiteBrainStorage(BrainStorage):
                 row = await cur.fetchone()
                 return row["fix_attempt_count"] if row else 0
 
-    # ── Fingerprints ─────────────────────────────────────────────────────────
-
+                                                                               
     async def get_fingerprint(self, fingerprint: str) -> IssueFingerprint | None:
         async with self._conn() as db:
             async with db.execute(
@@ -809,8 +790,7 @@ class SQLiteBrainStorage(BrainStorage):
             ))
             await db.commit()
 
-    # ── Fix attempts ──────────────────────────────────────────────────────────
-
+                                                                                
     async def upsert_fix(self, fix: FixAttempt) -> None:
         async with self._write() as db:
             planner_approved = None if fix.planner_approved is None else int(fix.planner_approved)
@@ -869,8 +849,8 @@ class SQLiteBrainStorage(BrainStorage):
         """
         async with self._conn() as db:
             if issue_id:
-                # JSON_EACH unpacks the issue_ids JSON array into rows; we
-                # filter with a join so only matching fix_attempts are returned.
+                                                                          
+                                                                                
                 async with db.execute("""
                     SELECT DISTINCT fa.*
                     FROM fix_attempts fa, JSON_EACH(fa.issue_ids) je
@@ -889,8 +869,7 @@ class SQLiteBrainStorage(BrainStorage):
         files_data = json.loads(row["fixed_files"] or "[]")
         keys       = row.keys()
 
-        # planner_approved: None means not yet evaluated; 0/1 means False/True
-        # Previous code treated None and False identically due to bool(None) == False
+                                                                              
         pa_raw          = row["planner_approved"]
         planner_approved: bool | None = None if pa_raw is None else bool(pa_raw)
 
@@ -917,8 +896,7 @@ class SQLiteBrainStorage(BrainStorage):
             committed_at=_parse_dt(row["committed_at"]),
         )
 
-    # ── Reviews ───────────────────────────────────────────────────────────────
-
+                                                                                
     async def upsert_review(self, review: ReviewResult) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -961,8 +939,7 @@ class SQLiteBrainStorage(BrainStorage):
                     reviewed_at=_require_dt(row["reviewed_at"]),
                 )
 
-    # ── Planner records ───────────────────────────────────────────────────────
-
+                                                                                
     async def upsert_planner_record(self, record: PlannerRecord) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -1016,8 +993,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Graph edges (NEW) ────────────────────────────────────────────────────
-
+                                                                               
     async def store_graph_edges(self, run_id: str, edges: list[GraphEdge]) -> None:
         """Persist graph edges for a run.  Existing edges for the run are replaced."""
         async with self._write() as db:
@@ -1050,8 +1026,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Formal verification (NEW) ────────────────────────────────────────────
-
+                                                                               
     async def store_formal_result(self, result: FormalVerificationResult) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -1094,8 +1069,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Test run results (NEW) ────────────────────────────────────────────────
-
+                                                                                
     async def store_test_run(self, result: TestRunResult) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -1137,8 +1111,7 @@ class SQLiteBrainStorage(BrainStorage):
                     created_at=_require_dt(row["created_at"]),
                 )
 
-    # ── Patrol / LLM / audit trail ────────────────────────────────────────────
-
+                                                                                
     async def log_patrol_event(self, event: PatrolEvent) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -1236,8 +1209,7 @@ class SQLiteBrainStorage(BrainStorage):
                     for r in rows
                 ]
 
-    # ── Convenience helpers ───────────────────────────────────────────────────
-
+                                                                                
     async def count_open_critical(self, run_id: str | None = None) -> int:
         issues = await self.list_issues(run_id=run_id, status="OPEN", severity=Severity.CRITICAL)
         return len(issues)
@@ -1246,8 +1218,7 @@ class SQLiteBrainStorage(BrainStorage):
         files = await self.list_files()
         return all(f.fully_read for f in files) if files else False
 
-    # ── NEW: Abstract method implementations for compliance/escalation ─────────
-
+                                                                                 
     async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list[AuditTrailEntry]:
         return (await self.get_audit_trail(run_id))[:limit]
 
@@ -1363,7 +1334,108 @@ class SQLiteBrainStorage(BrainStorage):
             notified_via=_json.loads(row["notified_via"] or "[]"),
         )
 
-    # Baseline
+                                                                                 
+    async def upsert_refactor_proposal(self, proposal) -> None:
+        import json as _json
+        async with self._write() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS refactor_proposals (
+                    id TEXT PRIMARY KEY,
+                    fix_attempt_id TEXT,
+                    run_id TEXT,
+                    issue_ids TEXT,
+                    changed_functions TEXT,
+                    affected_function_count INTEGER,
+                    affected_file_count INTEGER,
+                    test_files_affected TEXT,
+                    blast_radius_score REAL,
+                    affected_components TEXT,
+                    proposed_refactoring TEXT,
+                    migration_steps TEXT,
+                    estimated_scope TEXT,
+                    risks TEXT,
+                    recommendation TEXT,
+                    escalation_id TEXT,
+                    requires_human_review INTEGER,
+                    created_at TEXT
+                )
+            """)
+            await db.execute("""
+                INSERT OR REPLACE INTO refactor_proposals
+                    (id, fix_attempt_id, run_id, issue_ids, changed_functions,
+                     affected_function_count, affected_file_count, test_files_affected,
+                     blast_radius_score, affected_components, proposed_refactoring,
+                     migration_steps, estimated_scope, risks, recommendation,
+                     escalation_id, requires_human_review, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                proposal.id, proposal.fix_attempt_id, proposal.run_id,
+                _json.dumps(proposal.issue_ids),
+                _json.dumps(proposal.changed_functions),
+                proposal.affected_function_count,
+                proposal.affected_file_count,
+                _json.dumps(proposal.test_files_affected),
+                proposal.blast_radius_score,
+                _json.dumps(proposal.affected_components),
+                proposal.proposed_refactoring,
+                _json.dumps(proposal.migration_steps),
+                proposal.estimated_scope,
+                _json.dumps(proposal.risks),
+                proposal.recommendation,
+                proposal.escalation_id,
+                1 if proposal.requires_human_review else 0,
+                proposal.created_at.isoformat(),
+            ))
+            await db.commit()
+
+    async def get_refactor_proposal(self, proposal_id: str):
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT * FROM refactor_proposals WHERE id=?", (proposal_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    return self._row_to_refactor_proposal(row) if row else None
+            except Exception:
+                return None
+
+    async def list_refactor_proposals(self, run_id: str = "") -> list:
+        async with self._conn() as db:
+            try:
+                if run_id:
+                    sql = "SELECT * FROM refactor_proposals WHERE run_id=? ORDER BY created_at DESC"
+                    params: list = [run_id]
+                else:
+                    sql = "SELECT * FROM refactor_proposals ORDER BY created_at DESC"
+                    params = []
+                async with db.execute(sql, params) as cur:
+                    rows = await cur.fetchall()
+                    return [self._row_to_refactor_proposal(r) for r in rows if r]
+            except Exception:
+                return []
+
+    def _row_to_refactor_proposal(self, row):
+        from brain.schemas import RefactorProposal
+        import json as _json
+        return RefactorProposal(
+            id=row["id"],
+            fix_attempt_id=row["fix_attempt_id"] or "",
+            run_id=row["run_id"] or "",
+            issue_ids=_json.loads(row["issue_ids"] or "[]"),
+            changed_functions=_json.loads(row["changed_functions"] or "[]"),
+            affected_function_count=row["affected_function_count"] or 0,
+            affected_file_count=row["affected_file_count"] or 0,
+            test_files_affected=_json.loads(row["test_files_affected"] or "[]"),
+            blast_radius_score=row["blast_radius_score"] or 0.0,
+            affected_components=_json.loads(row["affected_components"] or "[]"),
+            proposed_refactoring=row["proposed_refactoring"] or "",
+            migration_steps=_json.loads(row["migration_steps"] or "[]"),
+            estimated_scope=row["estimated_scope"] or "",
+            risks=_json.loads(row["risks"] or "[]"),
+            recommendation=row["recommendation"] or "",
+            escalation_id=row["escalation_id"] or "",
+            requires_human_review=bool(row["requires_human_review"]),
+        )
     async def upsert_baseline(self, baseline) -> None:
         await self._ensure_baselines_table()
         async with self._write() as db:
@@ -1443,7 +1515,7 @@ class SQLiteBrainStorage(BrainStorage):
             is_active=bool(row["is_active"]),
         )
 
-    # Function staleness
+                        
     async def upsert_staleness_mark(self, mark) -> None:
         async with self._write() as db:
             await db.execute("""
@@ -1499,7 +1571,7 @@ class SQLiteBrainStorage(BrainStorage):
             except Exception:
                 pass
 
-    # Compliance findings — stub implementations (store as JSON blobs)
+                                                                      
     async def upsert_ldra_finding(self, finding) -> None:
         await self._upsert_json_table("ldra_findings", finding.id, finding.model_dump_json())
 
@@ -1597,7 +1669,7 @@ class SQLiteBrainStorage(BrainStorage):
                 pass
         return None
 
-    # Generic JSON blob table helpers
+                                     
     async def _upsert_json_table(self, table: str, id_: str, data: str) -> None:
         async with self._write() as db:
             await db.execute(f"""
@@ -1646,9 +1718,8 @@ class SQLiteBrainStorage(BrainStorage):
             )
             await db.commit()
 
-    # ── CONVERGENCE ────────────────────────────────────────────────────────────
-
-    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:  # type: ignore[override]
+                                                                                 
+    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:                          
         from brain.schemas import ConvergenceRecord as _CR
         async with self._write() as db:
             await db.execute(
@@ -1661,7 +1732,7 @@ class SQLiteBrainStorage(BrainStorage):
             )
             await db.commit()
 
-    async def list_convergence_records(self, run_id: str) -> list["ConvergenceRecord"]:  # type: ignore[override]
+    async def list_convergence_records(self, run_id: str) -> list["ConvergenceRecord"]:                          
         from brain.schemas import ConvergenceRecord as _CR
         async with self._read() as db:
             try:
@@ -1684,8 +1755,7 @@ class SQLiteBrainStorage(BrainStorage):
             except Exception:
                 return []
 
-    # ── GAP 2: SynthesisReport persistence ────────────────────────────────────
-
+                                                                                
     async def _ensure_synthesis_reports_table(self, db) -> None:
         """Create synthesis_reports table if it does not exist."""
         await db.execute("""
@@ -1704,7 +1774,7 @@ class SQLiteBrainStorage(BrainStorage):
         except Exception:
             pass
 
-    async def upsert_synthesis_report(self, report: "SynthesisReport") -> None:  # type: ignore[override]
+    async def upsert_synthesis_report(self, report: "SynthesisReport") -> None:                          
         """
         Persist a SynthesisReport produced by SynthesisAgent after each
         synthesis pass.  One report per run per cycle — the id field is the
@@ -1725,7 +1795,7 @@ class SQLiteBrainStorage(BrainStorage):
             )
             await db.commit()
 
-    async def get_synthesis_report(self, run_id: str, cycle: int | None = None) -> "SynthesisReport | None":  # type: ignore[override]
+    async def get_synthesis_report(self, run_id: str, cycle: int | None = None) -> "SynthesisReport | None":                          
         """
         Retrieve the SynthesisReport for a run.
 
@@ -1756,7 +1826,7 @@ class SQLiteBrainStorage(BrainStorage):
                 pass
         return None
 
-    async def list_synthesis_reports(self, run_id: str | None = None) -> "list[SynthesisReport]":  # type: ignore[override]
+    async def list_synthesis_reports(self, run_id: str | None = None) -> "list[SynthesisReport]":                          
         """
         List all SynthesisReports, optionally filtered by run_id.
         Ordered by run_id ASC, cycle ASC.
@@ -1786,8 +1856,7 @@ class SQLiteBrainStorage(BrainStorage):
             except Exception:
                 return []
 
-    # ── GAP 2: Compound findings query ────────────────────────────────────────
-
+                                                                                
     async def list_compound_findings(
         self,
         run_id: str | None = None,
