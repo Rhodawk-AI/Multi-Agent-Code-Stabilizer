@@ -258,6 +258,8 @@ class StabilizerController:
         self._program_slicer:       Any | None         = None
         self._cpg_context_selector: Any | None         = None
         self._incremental_updater:  Any | None         = None
+        # ── Gap 4: CommitAuditScheduler ───────────────────────────────────────
+        self._commit_audit_scheduler: Any | None       = None
         # ── Gap 2: Synthesis Agent state ─────────────────────────────────────
         # Compound findings detected in the last synthesis pass.
         # Persisted here so DeerFlow steps and the report exporter can read them.
@@ -574,15 +576,30 @@ class StabilizerController:
                 storage=self.storage,
             )
 
+            # CommitAuditScheduler: Gap 4 full orchestration path
+            # Wraps IncrementalCPGUpdater with idempotency, staleness marks,
+            # scoped test re-runs, and CommitAuditRecord persistence.
+            from orchestrator.commit_audit_scheduler import CommitAuditScheduler
+            self._commit_audit_scheduler = CommitAuditScheduler(
+                storage=self.storage,
+                incremental_updater=self._incremental_updater,
+                test_runner=None,          # populated after test runner is built
+                run_id=self.run.id,
+                repo_root=self.config.repo_root,
+                cpg_engine=self._cpg_engine,
+                graph_engine=self.graph_engine,
+            )
+
         except Exception as exc:
             self.log.warning(
                 f"CPG subsystem init failed (non-fatal): {exc} — "
                 "continuing without CPG"
             )
-            self._cpg_engine           = None
-            self._program_slicer       = None
-            self._cpg_context_selector = None
-            self._incremental_updater  = None
+            self._cpg_engine             = None
+            self._program_slicer         = None
+            self._cpg_context_selector   = None
+            self._incremental_updater    = None
+            self._commit_audit_scheduler = None
 
     # ── Main entry point ───────────────────────────────────────────────────────
 
@@ -1492,25 +1509,73 @@ class StabilizerController:
         await self._requeue_stale_functions(committed)
         await self._requeue_transitive_dependents(committed)
 
-        # Gap 1/4: Incremental CPG update after commit
-        # Computes the 50–200 function audit target set for the next cycle.
-        # This is the Gap 4 fix: instead of re-auditing 10M lines, we audit
-        # only the functions in the CPG impact set of the changed functions.
-        if self._incremental_updater and committed:
+        # Gap 4: Incremental CPG update after commit.
+        # Uses CommitAuditScheduler when available (full Gap 4 path), otherwise
+        # falls back to the raw IncrementalCPGUpdater.  Both paths write
+        # FunctionStalenessMark rows so the next read phase audits only the
+        # 50–200 functions in the CPG impact set rather than the full codebase.
+        if self._commit_audit_scheduler and committed:
+            try:
+                car = await self._commit_audit_scheduler.schedule_commit_audit(
+                    commit_hash="",
+                    changed_files=committed,
+                    branch=getattr(self.run, "branch", ""),
+                    author="Rhodawk AI (auto-fix)",
+                    commit_message="",
+                )
+                self.log.info(
+                    "[Gap4] CommitAuditScheduler: changed=%d fns, impact=%d fns, "
+                    "audit_targets=%d (status=%s)",
+                    car.total_changed_functions,
+                    car.total_impact_functions,
+                    car.total_functions_to_audit,
+                    car.status.value,
+                )
+            except Exception as exc:
+                self.log.warning("[Gap4] CommitAuditScheduler failed (non-fatal): %s", exc)
+
+        elif self._incremental_updater and committed:
             try:
                 update_result = await self._incremental_updater.update_after_commit(
                     changed_files=committed,
                     run_id=self.run.id,
                 )
+                # Gap 4 fix: feed audit_targets back as FunctionStalenessMark rows
+                # so the next cycle picks up exactly the impacted functions.
+                # Previously the result was computed but never persisted back into
+                # stale marks — the incremental updater wrote them internally but
+                # the controller ignored the returned audit_targets entirely.
+                for target in update_result.audit_targets:
+                    fn_name = target.get("function_name", "")
+                    fp      = target.get("file_path", "")
+                    if not fn_name or not fp:
+                        continue
+                    try:
+                        mark = FunctionStalenessMark(
+                            file_path=fp,
+                            function_name=fn_name,
+                            line_start=target.get("line_number", 0),
+                            stale_reason=target.get("relationship", "cpg_impact"),
+                            run_id=self.run.id,
+                        )
+                        await self.storage.upsert_staleness_mark(mark)
+                    except Exception:
+                        pass
+
+                total_lines = sum(
+                    getattr(r, "line_count", 0)
+                    for r in await self.storage.list_files()
+                )
                 self.log.info(
-                    f"[CPG] Incremental update: "
-                    f"changed={update_result.total_functions_changed} fns, "
-                    f"impact={update_result.total_functions_affected} fns, "
-                    f"audit_targets={update_result.total_functions_to_audit} fns "
-                    f"(vs {sum(r.line_count for r in await self.storage.list_files())} total lines)"
+                    "[Gap4] IncrementalCPGUpdater: changed=%d fns, impact=%d fns, "
+                    "audit_targets=%d (vs %d total lines)",
+                    update_result.total_functions_changed,
+                    update_result.total_functions_affected,
+                    update_result.total_functions_to_audit,
+                    total_lines,
                 )
             except Exception as exc:
-                self.log.warning(f"[CPG] Incremental update failed (non-fatal): {exc}")
+                self.log.warning("[Gap4] Incremental update failed (non-fatal): %s", exc)
 
     def _module_for_fix(self, fix) -> str:
         paths = [ff.path for ff in fix.fixed_files]
@@ -1797,7 +1862,69 @@ class StabilizerController:
             return []
 
     async def _requeue_transitive_dependents(self, changed: set[str]) -> None:
+        """
+        Gap 4 fix: use CPG function-level impact when available; fall back to
+        the file-level import-graph blast radius only when CPG is absent.
+
+        The previous implementation always used the file-level graph, which
+        marks entire files as STALE even when only one function changed.  With
+        the CPG we compute the exact set of downstream functions to depth 3
+        and emit FunctionStalenessMark rows rather than coarse FileStatus.STALE.
+        """
         assert self.storage
+
+        # ── CPG path: function-granularity impact ────────────────────────────
+        if self._cpg_engine and self._incremental_updater and changed:
+            try:
+                all_fns: list[str] = []
+                for path in changed:
+                    rec = await self.storage.get_file(path)
+                    if rec and rec.known_functions:
+                        all_fns.extend(rec.known_functions)
+
+                if all_fns:
+                    impact = await self._cpg_engine.compute_blast_radius(
+                        function_names=all_fns,
+                        file_paths=list(changed),
+                        depth=3,
+                    )
+                    impacted_fns   = impact.affected_functions
+                    impacted_files = set(impact.affected_files) - changed
+                    added = 0
+                    for item in impacted_fns:
+                        fn = item.get("function_name", "")
+                        fp = item.get("file_path", "")
+                        if not fn or not fp or fp in changed:
+                            continue
+                        try:
+                            mark = FunctionStalenessMark(
+                                file_path=fp,
+                                function_name=fn,
+                                stale_reason="transitive_cpg_impact",
+                                run_id=self.run.id,
+                            )
+                            await self.storage.upsert_staleness_mark(mark)
+                            added += 1
+                        except Exception:
+                            pass
+                    # Still mark impacted files STALE for the read phase
+                    for path in impacted_files:
+                        rec = await self.storage.get_file(path)
+                        if rec:
+                            from brain.schemas import FileStatus
+                            rec.status = FileStatus.STALE
+                            await self.storage.upsert_file(rec)
+                    self.log.info(
+                        "[Gap4] CPG transitive impact: %d function marks, %d files",
+                        added, len(impacted_files),
+                    )
+                    return
+            except Exception as exc:
+                self.log.debug(
+                    "[Gap4] CPG transitive impact failed, falling back to graph: %s", exc
+                )
+
+        # ── Fallback: file-level import graph ────────────────────────────────
         if not self.graph_engine.is_built:
             return
         affected = set()
@@ -1812,7 +1939,11 @@ class StabilizerController:
                 from brain.schemas import FileStatus
                 rec.status = FileStatus.STALE
                 await self.storage.upsert_file(rec)
-        self.log.info(f"Requeued {len(affected)} transitive dependents as STALE")
+        self.log.info(
+            "[Gap4] file-graph transitive dependents: %d files marked STALE",
+            len(affected),
+        )
+
 
     # ── Score and finalization ─────────────────────────────────────────────────
 
