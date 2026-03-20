@@ -606,17 +606,6 @@ class FixerAgent(BaseAgent):
         file_paths: list[str],
         repo_map_text:   str = "",
         memory_examples: str = "",
-    ) -> PatchResponse:
-        prompt_parts = []
-    async def _generate_patch_fix(
-        self,
-        issue_summary: str,
-        file_context:  str,
-        vector_context: str,
-        model: str,
-        file_paths: list[str],
-        repo_map_text:   str = "",
-        memory_examples: str = "",
         cpg_context:     str = "",
     ) -> PatchResponse:
         prompt_parts = []
