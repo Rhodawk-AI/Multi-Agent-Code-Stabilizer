@@ -143,9 +143,52 @@ try:
             storage = SQLiteBrainStorage(db_path=db_path)
             await storage.initialise()
 
+            # ── Build CPGEngine from config ───────────────────────────────────
+            # Previously this was hardcoded to None, which meant the depth-3
+            # transitive impact set was never computed in production webhook
+            # flows — the worker fell back to regex diff only and never
+            # queried Joern.  We now attempt to connect and fall back
+            # gracefully if Joern is not reachable from this worker.
+            cpg_engine = None
+            if getattr(cfg, "cpg_enabled", False):
+                try:
+                    from cpg.cpg_engine import CPGEngine
+                    joern_url = (
+                        os.environ.get("JOERN_URL")
+                        or getattr(cfg, "joern_url", "http://localhost:8080")
+                    )
+                    blast_threshold = getattr(cfg, "cpg_blast_radius_threshold", 50)
+                    _cpg = CPGEngine(
+                        joern_url=joern_url,
+                        blast_radius_threshold=blast_threshold,
+                    )
+                    connected = await _cpg.initialise(
+                        repo_path=str(repo_root),
+                        project_name=getattr(cfg, "joern_project_name", "rhodawk"),
+                        joern_url=joern_url,
+                    )
+                    if connected:
+                        cpg_engine = _cpg
+                        log.info(
+                            "commit_audit_task: CPGEngine connected at %s "
+                            "(blast_threshold=%d)",
+                            joern_url, blast_threshold,
+                        )
+                    else:
+                        log.info(
+                            "commit_audit_task: Joern not reachable at %s — "
+                            "impact set will use git+regex path only",
+                            joern_url,
+                        )
+                except Exception as cpg_exc:
+                    log.warning(
+                        "commit_audit_task: CPGEngine init failed (non-fatal): %s",
+                        cpg_exc,
+                    )
+
             try:
                 updater = IncrementalCPGUpdater(
-                    cpg_engine=None,   # CPG not available in worker; uses git+regex path
+                    cpg_engine=cpg_engine,
                     repo_root=repo_root,
                     storage=storage,
                 )
@@ -155,7 +198,7 @@ try:
                     test_runner=None,
                     run_id=run_id,
                     repo_root=repo_root,
-                    cpg_engine=None,
+                    cpg_engine=cpg_engine,
                     graph_engine=None,
                 )
                 record = await scheduler.schedule_from_webhook(
@@ -176,6 +219,11 @@ try:
                 log.error("commit_audit_task failed for %s: %s", commit_hash[:12], exc)
                 raise self.retry(exc=exc, countdown=2 ** self.request.retries)
             finally:
+                if cpg_engine is not None:
+                    try:
+                        await cpg_engine.close()
+                    except Exception:
+                        pass
                 await storage.close()
 
         return asyncio.run(_run())
