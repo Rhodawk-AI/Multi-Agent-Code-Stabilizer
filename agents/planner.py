@@ -31,6 +31,14 @@ class CausalChainResponse(BaseModel):
     risk_score: float = Field(ge=0.0, le=1.0, default=1.0)
     causal_risks: list[str] = Field(default_factory=list)
     simulation_summary: str = ''
+    # Gap 3 — Proactive architectural smell detection.
+    # Set True when the LLM determines this bug is a SYMPTOM of a structural
+    # design problem (over-coupling, missing abstraction boundary, repeated
+    # bug class) that a patch cannot eliminate.  When True the planner blocks
+    # the fix and triggers an ARCHITECTURAL_SYMPTOM_DETECTED escalation,
+    # regardless of blast radius score.
+    is_architectural_symptom: bool = False
+    architectural_reason: str = ''
 
 class PlannerAgent(BaseAgent):
     agent_type = ExecutorType.PLANNER
@@ -84,13 +92,41 @@ class PlannerAgent(BaseAgent):
         if rev_confidence < 0.6:
             rev_class = ReversibilityClass.IRREVERSIBLE
         try:
-            coherent, risk_score, concerns, sim_summary = await self._assess_coherence(file_summary, rev_class)
+            coherent, risk_score, concerns, sim_summary, is_arch_symptom, arch_reason = await self._assess_coherence(file_summary, rev_class)
         except Exception as exc:
             self.log.error(f'[planner] Goal coherence failed: {exc}')
             record = self._make_blocked_record(fix, reason=f'Coherence check exception: {exc}')
             await self.storage.upsert_planner_record(record)
             return record
         block = rev_class == ReversibilityClass.IRREVERSIBLE or not coherent or risk_score >= self.risk_block_threshold
+        # ── Gap 3: Architectural symptom block ────────────────────────────────
+        # When the coherence LLM determines this bug is a symptom of a
+        # structural design problem, block the patch and escalate immediately.
+        # This fires even when blast_radius_score is below the numeric gate —
+        # it catches the "small surface, structurally broken" blind spot.
+        if is_arch_symptom:
+            risk_score = max(risk_score, self.risk_escalate_threshold)
+            block = True
+            self.log.warning(
+                f'[planner] ARCHITECTURAL SYMPTOM BLOCK: {arch_reason}'
+            )
+            if self.escalation_manager:
+                try:
+                    from brain.schemas import Severity as _Sev
+                    await self.escalation_manager.create_escalation(
+                        escalation_type='ARCHITECTURAL_SYMPTOM_DETECTED',
+                        description=(
+                            f'The planner has determined this fix addresses a symptom '
+                            f'rather than the root cause. Architectural reason: {arch_reason}. '
+                            f'A patch is unlikely to prevent recurrence. '
+                            f'Human architectural review is required before any commit.'
+                        ),
+                        issue_ids=fix.issue_ids,
+                        severity=_Sev.CRITICAL,
+                        fix_attempt_id=fix.id,
+                    )
+                except Exception as exc:
+                    self.log.error(f'[planner] Failed to create arch-symptom escalation: {exc}')
         if cpg_blast_override is not None:
             if _cpg_blast_obj is not None:
                 test_count = len(_cpg_blast_obj.test_files_affected)
@@ -121,6 +157,8 @@ class PlannerAgent(BaseAgent):
         if concerns:
             reason_parts.append('Concerns: ' + '; '.join(concerns[:5]))
         reason_parts.append(f'Risk={risk_score:.2f}')
+        if is_arch_symptom and arch_reason:
+            reason_parts.append(f'ArchSymptom: {arch_reason[:200]}')
         if cpg_blast_summary:
             reason_parts.append(cpg_blast_summary)
         record = PlannerRecord(fix_attempt_id=fix.id, run_id=self.run_id, file_path=fix.fixed_files[0].path if fix.fixed_files else '', verdict=verdict, reversibility=rev_class, goal_coherent=coherent, risk_score=risk_score, block_commit=block, reason=' | '.join(reason_parts), simulation_summary=sim_summary)
@@ -144,10 +182,10 @@ class PlannerAgent(BaseAgent):
             cls = ReversibilityClass.IRREVERSIBLE
         return (cls, resp.confidence, resp.rationale)
 
-    async def _assess_coherence(self, file_summary: str, rev_class: ReversibilityClass) -> tuple[bool, float, list[str], str]:
-        prompt = f'Reversibility: {rev_class.value}\n\nProposed changes:\n{file_summary}\n\nEvaluate:\n1. Do these changes coherently address the stated issues without    introducing new risks?\n2. What is the causal risk score (0.0=safe, 1.0=dangerous)?\n3. What downstream effects (positive or negative) could these    changes cause in a safety-critical system?\n\nAssign risk_score >= 0.85 for: changes that touch shared state, security controls, authentication, authorization, cryptography, database schemas, network protocols, or interrupt handlers.\nReturn: coherent (bool), risk_score, concerns (list), simulation_summary (2-3 sentences).'
-        resp = await self.call_llm_structured_deterministic(prompt=prompt, response_model=CausalChainResponse, system='You are a safety-critical software consequence analyst. Be conservative — prefer false positives over missed risks.')
-        return (resp.safe, resp.risk_score, resp.causal_risks, resp.simulation_summary)
+    async def _assess_coherence(self, file_summary: str, rev_class: ReversibilityClass) -> tuple[bool, float, list[str], str, bool, str]:
+        prompt = f'Reversibility: {rev_class.value}\n\nProposed changes:\n{file_summary}\n\nEvaluate:\n1. Do these changes coherently address the stated issues without    introducing new risks?\n2. What is the causal risk score (0.0=safe, 1.0=dangerous)?\n3. What downstream effects (positive or negative) could these    changes cause in a safety-critical system?\n\nAssign risk_score >= 0.85 for: changes that touch shared state, security controls, authentication, authorization, cryptography, database schemas, network protocols, or interrupt handlers.\n\n4. ARCHITECTURAL SYMPTOM ANALYSIS (critical):\n   Examine whether this bug is a SYMPTOM of a deeper structural problem that\n   a patch will not eliminate.  Set is_architectural_symptom=true when ANY of\n   the following apply:\n   - The changed function is called from many unrelated modules with no\n     abstraction boundary between them (over-coupling smell).\n   - The description implies this same bug class has been fixed before in this\n     file or function (recurrence smell — phrases like "again", "still", "once\n     more", repeated null-deref or bounds-check pattern in the same location).\n   - The fix changes a shared contract (return type, parameter meaning, error\n     handling convention) that all callers silently depend on, meaning the\n     root cause is a missing interface definition rather than a coding error.\n   - The patch treats a symptom (e.g. adding a null check) without addressing\n     why null is being produced in the first place by an upstream caller.\n   If is_architectural_symptom=true, set architectural_reason to a specific\n   1-2 sentence description of the structural problem.\n\nReturn: safe (bool), risk_score, causal_risks (list), simulation_summary\n(2-3 sentences), is_architectural_symptom (bool), architectural_reason (str).'
+        resp = await self.call_llm_structured_deterministic(prompt=prompt, response_model=CausalChainResponse, system='You are a safety-critical software consequence analyst. Be conservative — prefer false positives over missed risks. Pay special attention to whether a fix addresses the root structural cause or merely treats a symptom.')
+        return (resp.safe, resp.risk_score, resp.causal_risks, resp.simulation_summary, resp.is_architectural_symptom, resp.architectural_reason)
 
     def _make_blocked_record(self, fix: FixAttempt, reason: str) -> PlannerRecord:
         return PlannerRecord(fix_attempt_id=fix.id, run_id=self.run_id, file_path=fix.fixed_files[0].path if fix.fixed_files else '', verdict=PlannerVerdict.UNSAFE, reversibility=ReversibilityClass.IRREVERSIBLE, goal_coherent=False, risk_score=1.0, block_commit=True, reason=reason)

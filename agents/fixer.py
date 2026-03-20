@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from pydantic import BaseModel, Field
 from agents.base import AgentConfig, BaseAgent, wrap_content
-from brain.schemas import ExecutorType, FixAttempt, FixedFile, IssueStatus, PatchMode, RefactorProposal, Severity
+from brain.schemas import BugRecurrenceSignal, ExecutorType, FixAttempt, FixedFile, IssueStatus, PatchMode, RefactorProposal, Severity
 from brain.storage import BrainStorage
 from verification.independence_enforcer import extract_model_family
 try:
@@ -20,6 +20,15 @@ except ImportError:
 log = logging.getLogger(__name__)
 _DEFAULT_SURGICAL_THRESHOLD = 2000
 _AST_REWRITE_THRESHOLD = 500
+
+# ── Gap 3 proactive architectural smell thresholds ────────────────────────────
+# Recurrence: if the same bug class has been patched this many times (or more)
+# within the memory window, escalate to a refactor proposal instead of patching.
+_RECURRENCE_ESCALATION_THRESHOLD = 3
+# Coupling: if the changed functions are called from this many distinct
+# directory-level modules or more, the design is over-coupled and a patch will
+# not fix the structural cause.
+_COUPLING_MODULE_THRESHOLD = 5
 
 class FixedFileFullResponse(BaseModel):
     path: str
@@ -165,10 +174,73 @@ class FixerAgent(BaseAgent):
         issue_summary = '\n'.join((f'- [{i.severity.value}] {i.description} ({i.file_path}:{i.line_start})' for i in issues[:10]))
         repo_map_text = self._get_repo_map_context(file_paths)
         memory_examples = await self._get_memory_examples(issues)
+
+        # ── Gap 3: Proactive architectural smell check (BEFORE blast radius) ──
+        # Extract the function names for the coupling query.  We reuse the same
+        # tree-sitter symbol extraction that _get_forward_impact_context uses so
+        # the two gates operate on consistent symbol sets.
+        all_symbols: list[str] = []
+        for fp in file_paths:
+            syms = await self._extract_file_symbols(fp)
+            all_symbols.extend(sorted(syms)[:20])
+
+        recurrence_signal = await self._check_bug_recurrence(
+            issues=issues,
+            file_paths=file_paths,
+            function_names=all_symbols or file_paths,
+            window_days=180,
+        )
+        if recurrence_signal.is_structural:
+            # Build a minimal blast object so _generate_refactor_proposal has
+            # required fields.  If cpg_engine is available we try a real blast
+            # compute first; otherwise we stub a zero-score blast so the
+            # proposal is still generated with the recurrence/coupling context.
+            stub_blast = None
+            if self.cpg_engine and self.cpg_engine.is_available:
+                try:
+                    stub_blast = await self.cpg_engine.compute_blast_radius(
+                        function_names=all_symbols or file_paths,
+                        file_paths=file_paths,
+                        depth=3,
+                    )
+                except Exception as exc:
+                    self.log.debug(f'[Fixer] recurrence gate blast compute failed: {exc}')
+
+            if stub_blast is None:
+                from cpg.cpg_engine import CPGBlastRadius
+                stub_blast = CPGBlastRadius(
+                    changed_functions=all_symbols or file_paths,
+                    blast_radius_score=recurrence_signal.coupling_score
+                    if recurrence_signal.coupling_score >= 0 else 0.0,
+                    requires_human_review=True,
+                )
+
+            # Determine trigger source label for the RefactorProposal.
+            has_recurrence = recurrence_signal.recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD
+            has_coupling   = recurrence_signal.distinct_caller_modules >= _COUPLING_MODULE_THRESHOLD
+            if has_recurrence and has_coupling:
+                trigger = 'combined'
+            elif has_recurrence:
+                trigger = 'recurrence'
+            else:
+                trigger = 'coupling_smell'
+
+            self.log.warning(
+                f'[Fixer] Gap 3 proactive gate ({trigger}): aborting patch, '
+                f'generating refactor proposal. reason={recurrence_signal.escalation_reason}'
+            )
+            return await self._generate_refactor_proposal(
+                issues, file_paths, stub_blast,
+                forward_impact_context=recurrence_signal.escalation_reason,
+                model=model,
+                recurrence_signal=recurrence_signal,
+                trigger_source=trigger,
+            )
+
         forward_impact_context, blast = await self._get_forward_impact_context(file_paths, issues)
         if blast is not None and blast.requires_human_review:
             self.log.warning(f'[Fixer] Gap 3 gate: blast_radius={blast.affected_function_count} functions across {blast.affected_file_count} files — aborting patch, generating refactor proposal')
-            return await self._generate_refactor_proposal(issues, file_paths, blast, forward_impact_context, model)
+            return await self._generate_refactor_proposal(issues, file_paths, blast, forward_impact_context, model, recurrence_signal=None, trigger_source='blast_radius')
         cpg_context = await self._get_cpg_context(issues)
         file_context = await self._build_file_context(file_paths, file_contents, patch_modes)
         vector_context = await self._get_vector_context(issues)
@@ -225,6 +297,139 @@ class FixerAgent(BaseAgent):
             issue.status = IssueStatus.FIX_GENERATED
             await self.storage.upsert_issue(issue)
         return fix
+
+    async def _check_bug_recurrence(
+        self,
+        issues:         list,
+        file_paths:     list[str],
+        function_names: list[str],
+        window_days:    int = 180,
+    ) -> BugRecurrenceSignal:
+        """Gap 3 — Proactive Architectural Smell Detection.
+
+        Check two independent structural signals BEFORE generating a patch:
+
+        Signal 1 — Recurrence (fix_memory)
+        ------------------------------------
+        Query fix_memory for historical fix entries whose issue_type is
+        semantically similar to the current issue description.  Count:
+          - successful (non-reverted) fixes  → ``recurrence_count``
+          - reverted fixes                   → ``reverted_count``
+
+        If recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD the same bug
+        class has been patched enough times that the code has a structural
+        problem a patch will not eliminate.
+
+        Signal 2 — CPG Coupling (Joern)
+        --------------------------------
+        Query the CPG for the number of distinct directory-level modules that
+        call the functions being fixed.  A function called from 5+ unrelated
+        modules has no ownership boundary — any change to it is architecturally
+        unsafe regardless of how small the numeric blast radius is.
+
+        If distinct_caller_modules >= _COUPLING_MODULE_THRESHOLD the design is
+        over-coupled and the caller should escalate to a refactor proposal.
+
+        Returns
+        -------
+        BugRecurrenceSignal
+            ``is_structural=True`` when either signal fires.
+            ``escalation_reason`` explains which signal(s) triggered.
+        """
+        signal = BugRecurrenceSignal(
+            window_days=window_days,
+            coupling_module_threshold=_COUPLING_MODULE_THRESHOLD,
+        )
+
+        # ── Signal 1: recurrence check ────────────────────────────────────────
+        if self.fix_memory:
+            try:
+                query = ' '.join(i.description[:100] for i in issues[:3])
+                # Retrieve a generous set so we can count without trimming.
+                entries = self.fix_memory.retrieve(
+                    query, n=20, max_age_days=window_days
+                )
+                successful = [
+                    e for e in entries
+                    if not getattr(e, 'fix_approach', '').startswith('[REVERTED]')
+                ]
+                reverted = [
+                    e for e in entries
+                    if getattr(e, 'fix_approach', '').startswith('[REVERTED]')
+                ]
+                signal.recurrence_count = len(successful)
+                signal.reverted_count   = len(reverted)
+
+                # Most common file context across historical entries.
+                ctx_counts: dict[str, int] = {}
+                for e in entries:
+                    fc = getattr(e, 'file_context', '') or ''
+                    if fc:
+                        ctx_counts[fc] = ctx_counts.get(fc, 0) + 1
+                if ctx_counts:
+                    signal.dominant_file_context = max(
+                        ctx_counts, key=ctx_counts.__getitem__
+                    )
+
+                if signal.recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD:
+                    signal.is_structural = True
+                    signal.escalation_reason = (
+                        f'recurrence: this bug class has been patched '
+                        f'{signal.recurrence_count} time(s) in the last '
+                        f'{window_days} days'
+                        + (
+                            f' ({signal.reverted_count} revert(s))'
+                            if signal.reverted_count else ''
+                        )
+                        + f'. Dominant file context: {signal.dominant_file_context!r}.'
+                        f' A structural fix is required.'
+                    )
+                    self.log.warning(
+                        f'[Fixer] Gap 3 recurrence gate: '
+                        f'recurrence_count={signal.recurrence_count} '
+                        f'>= threshold={_RECURRENCE_ESCALATION_THRESHOLD} '
+                        f'— escalating to refactor proposal'
+                    )
+            except Exception as exc:
+                self.log.debug(f'_check_bug_recurrence (fix_memory): {exc}')
+
+        # ── Signal 2: CPG coupling smell ──────────────────────────────────────
+        if self.cpg_engine and self.cpg_engine.is_available:
+            try:
+                coupling = await self.cpg_engine.compute_coupling_smell(
+                    function_names=function_names,
+                    coupling_module_threshold=_COUPLING_MODULE_THRESHOLD,
+                )
+                signal.coupling_score          = coupling.get('coupling_score', -1.0)
+                signal.distinct_caller_modules = coupling.get('distinct_caller_modules', 0)
+
+                if coupling.get('is_smell', False):
+                    dominant = coupling.get('dominant_caller_module', '')
+                    coupling_reason = (
+                        f'coupling_smell: the changed function(s) are called from '
+                        f'{signal.distinct_caller_modules} distinct module(s) '
+                        f'(threshold={_COUPLING_MODULE_THRESHOLD}), '
+                        f'indicating no ownership boundary exists '
+                        + (f'(dominant caller module: {dominant!r}). ' if dominant else '. ')
+                        + 'A patch is locally correct but structurally unsound.'
+                    )
+                    if signal.is_structural:
+                        # Append to existing recurrence reason.
+                        signal.escalation_reason += ' | ' + coupling_reason
+                    else:
+                        signal.is_structural      = True
+                        signal.escalation_reason  = coupling_reason
+                    self.log.warning(
+                        f'[Fixer] Gap 3 coupling smell gate: '
+                        f'distinct_modules={signal.distinct_caller_modules} '
+                        f'>= threshold={_COUPLING_MODULE_THRESHOLD} '
+                        f'coupling_score={signal.coupling_score:.4f} '
+                        f'— escalating to refactor proposal'
+                    )
+            except Exception as exc:
+                self.log.debug(f'_check_bug_recurrence (coupling): {exc}')
+
+        return signal
 
     def _get_repo_map_context(self, target_files: list[str]) -> str:
         if not self.repo_map:
@@ -351,7 +556,7 @@ class FixerAgent(BaseAgent):
             self.log.debug(f'_get_forward_impact_context: {exc}')
             return ('', None)
 
-    async def _generate_refactor_proposal(self, issues: list, file_paths: list[str], blast: Any, forward_impact_context: str, model: str) -> FixAttempt:
+    async def _generate_refactor_proposal(self, issues: list, file_paths: list[str], blast: Any, forward_impact_context: str, model: str, recurrence_signal: 'BugRecurrenceSignal | None' = None, trigger_source: str = 'blast_radius') -> FixAttempt:
         from pydantic import BaseModel as _BM, Field as _F
 
         class _RefactorResponse(_BM):
@@ -368,7 +573,7 @@ class FixerAgent(BaseAgent):
         except Exception as exc:
             self.log.error(f'[Fixer] _generate_refactor_proposal LLM call failed: {exc}')
             resp = _RefactorResponse(proposed_refactoring='LLM generation failed — manual review required.', recommendation='Route to senior engineer for manual refactor planning.')
-        proposal = RefactorProposal(run_id=self.run_id, issue_ids=[i.id for i in issues], changed_functions=blast.changed_functions, affected_function_count=blast.affected_function_count, affected_file_count=blast.affected_file_count, test_files_affected=blast.test_files_affected, blast_radius_score=blast.blast_radius_score, importing_modules=blast.importing_modules, importing_module_count=blast.importing_module_count, affected_components=resp.affected_components, proposed_refactoring=resp.proposed_refactoring, migration_steps=resp.migration_steps, estimated_scope=resp.estimated_scope, risks=resp.risks, recommendation=resp.recommendation, requires_human_review=True)
+        proposal = RefactorProposal(run_id=self.run_id, issue_ids=[i.id for i in issues], changed_functions=blast.changed_functions, affected_function_count=blast.affected_function_count, affected_file_count=blast.affected_file_count, test_files_affected=blast.test_files_affected, blast_radius_score=blast.blast_radius_score, importing_modules=blast.importing_modules, importing_module_count=blast.importing_module_count, affected_components=resp.affected_components, proposed_refactoring=resp.proposed_refactoring, migration_steps=resp.migration_steps, estimated_scope=resp.estimated_scope, risks=resp.risks, recommendation=resp.recommendation, requires_human_review=True, trigger_source=trigger_source, recurrence_count=recurrence_signal.recurrence_count if recurrence_signal else 0, reverted_count=recurrence_signal.reverted_count if recurrence_signal else 0, distinct_caller_modules=recurrence_signal.distinct_caller_modules if recurrence_signal else 0, coupling_score=recurrence_signal.coupling_score if recurrence_signal else -1.0, recurrence_escalation_reason=recurrence_signal.escalation_reason if recurrence_signal else '')
         if hasattr(self.storage, 'upsert_refactor_proposal'):
             await self.storage.upsert_refactor_proposal(proposal)
         escalation_id = ''
