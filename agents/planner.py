@@ -1,21 +1,3 @@
-"""
-agents/planner.py
-=================
-Consequence reasoning and fix approval agent.
-
-PRODUCTION FIXES vs audit report
-──────────────────────────────────
-• All gate decisions use deterministic LLM calls (temperature=0.0) for
-  DO-178C reproducibility.
-• IRREVERSIBLE_INDICATORS pre-screen is deterministic (no LLM) — runs first.
-• Risk score threshold is 0.85 (configurable). Scores ≥ 0.95 trigger
-  mandatory human escalation via EscalationManager.
-• ConsequenceSimulator fatal paths now raise PlannerHardBlock (not silently
-  log and continue).
-• MIL-STD-882E risk category assigned based on risk_score.
-• PlannerRecord written to storage on every evaluation for audit trail.
-• fail-closed: any exception in reasoning → IRREVERSIBLE / BLOCK.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +20,8 @@ log = logging.getLogger(__name__)
 RISK_BLOCK_THRESHOLD = 0.85
 # Risk score at or above which human escalation is mandatory
 RISK_ESCALATE_THRESHOLD = 0.95
+# Blast radius function count above which fix routes to human review (Gap 1/3)
+BLAST_RADIUS_HUMAN_THRESHOLD = 50
 
 # Patterns that classify a fix as IRREVERSIBLE without any LLM call.
 # These are deterministic string checks — fast and fail-closed.
@@ -96,10 +80,13 @@ class PlannerAgent(BaseAgent):
         mcp_manager: Any | None = None,
         risk_block_threshold:     float = RISK_BLOCK_THRESHOLD,
         risk_escalate_threshold:  float = RISK_ESCALATE_THRESHOLD,
+        # Gap 1/3: CPG-based blast radius replaces heuristic risk_score
+        cpg_engine: Any | None = None,   # cpg.cpg_engine.CPGEngine
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.risk_block_threshold    = risk_block_threshold
         self.risk_escalate_threshold = risk_escalate_threshold
+        self.cpg_engine              = cpg_engine
 
     async def run(self, fix_attempt_id: str = "", **kwargs: Any) -> PlannerRecord:
         if not fix_attempt_id:
@@ -110,18 +97,44 @@ class PlannerAgent(BaseAgent):
         return await self.evaluate(fix)
 
     async def evaluate(self, fix: FixAttempt) -> PlannerRecord:
-        """
-        Three-tier evaluation pipeline:
-          1. Deterministic IRREVERSIBLE_INDICATORS pre-screen (no LLM)
-          2. Deterministic reversibility classification (LLM, temp=0.0)
-          3. Deterministic goal coherence + risk scoring (LLM, temp=0.0)
-
-        fail-closed: any exception → IRREVERSIBLE / block_commit=True
-        """
+        """Three-tier evaluation pipeline:"""
         file_summary = "\n".join(
             f"  {ff.path}: {ff.changes_made[:200]}"
             for ff in fix.fixed_files
         )
+
+        # ── Gap 1/3: CPG blast radius computation ──────────────────────────────
+        # Compute the ACTUAL blast radius of this fix using the CPG call graph.
+        # This replaces the heuristic risk_score for large-blast-radius fixes:
+        #   blast_radius_score = affected_functions / 200  (normalized)
+        # A fix touching >50 functions downstream requires human review.
+        cpg_blast_override: float | None = None
+        cpg_blast_human_review           = False
+        cpg_blast_summary                = ""
+        if self.cpg_engine and self.cpg_engine.is_available:
+            try:
+                changed_fns = [
+                    ff.path.replace("/", ".").replace(".py", "")
+                    for ff in fix.fixed_files
+                ]
+                changed_file_paths = [ff.path for ff in fix.fixed_files]
+                blast = await self.cpg_engine.compute_blast_radius(
+                    function_names=changed_fns,
+                    file_paths=changed_file_paths,
+                    depth=3,
+                )
+                cpg_blast_override    = blast.blast_radius_score
+                cpg_blast_human_review = blast.requires_human_review
+                cpg_blast_summary = (
+                    f"CPG blast radius: {blast.affected_function_count} functions "
+                    f"across {blast.affected_file_count} files "
+                    f"(score={blast.blast_radius_score:.2f}, "
+                    f"human_review={blast.requires_human_review})"
+                )
+                self.log.info(f"[planner] {cpg_blast_summary}")
+            except Exception as exc:
+                self.log.debug(f"[planner] CPG blast radius failed (non-fatal): {exc}")
+
         issue_ids = fix.issue_ids
 
         # ── Tier 1: Hard pre-screen (deterministic, no LLM) ──────────────────
@@ -179,6 +192,24 @@ class PlannerAgent(BaseAgent):
             or risk_score >= self.risk_block_threshold
         )
 
+        # Gap 1/3: CPG blast radius override
+        # If CPG says this fix touches >50 downstream functions, escalate
+        # regardless of the LLM risk score — the LLM cannot see the full graph.
+        if cpg_blast_human_review and not block:
+            # Don't hard-block but raise risk score to require human review
+            risk_score = max(risk_score, self.risk_escalate_threshold)
+            block = risk_score >= self.risk_block_threshold
+            if cpg_blast_summary:
+                self.log.warning(
+                    f"[planner] CPG blast radius override: {cpg_blast_summary}"
+                )
+
+        # Blend CPG blast score into LLM risk score (weighted average)
+        if cpg_blast_override is not None:
+            # 60% LLM + 40% CPG blast radius (CPG is more objective)
+            risk_score = 0.6 * risk_score + 0.4 * cpg_blast_override
+            block = block or (risk_score >= self.risk_block_threshold)
+
         if block:
             verdict = PlannerVerdict.UNSAFE
         elif risk_score >= 0.5:
@@ -190,6 +221,8 @@ class PlannerAgent(BaseAgent):
         if concerns:
             reason_parts.append("Concerns: " + "; ".join(concerns[:5]))
         reason_parts.append(f"Risk={risk_score:.2f}")
+        if cpg_blast_summary:
+            reason_parts.append(cpg_blast_summary)
 
         record = PlannerRecord(
             fix_attempt_id=fix.id,

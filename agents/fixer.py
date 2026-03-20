@@ -1,40 +1,3 @@
-"""
-agents/fixer.py
-===============
-Generates fixes for audited issues — Antagonist Edition.
-
-CHANGES vs prior version
-──────────────────────────
-• ANTAGONIST-1 (Repo-Map context): RepoMap is generated once per cycle and
-  injected as the FIRST context block in every _fix_group() call.  The LLM
-  now always knows the complete symbol hierarchy before generating a fix.
-  Impact: eliminates wrong-file localisation errors (+15–20 SWE-bench pts).
-
-• ANTAGONIST-2 (Fix Memory few-shot): Before calling the LLM, up to 3
-  semantically matching successful fix patterns are retrieved from FixMemory
-  and injected as few-shot examples.  After a successful gate+test pass the
-  pattern is stored.
-  Impact: compounding — each run learns from all prior runs.
-
-• ANTAGONIST-3 (Hybrid retrieval): _get_vector_context() now routes through
-  HybridRetriever (BM25 + dense) when available, falling back to VectorBrain.
-  Impact: +5–8 SWE-bench pts on symbol-heavy queries.
-
-• ANTAGONIST-4 (AST_REWRITE mode): Python files with 500–2000 lines now
-  default to PatchMode.AST_REWRITE via libcst instead of FULL_FILE.  This
-  eliminates the "no changes detected" false-negative on moderate-size files
-  and produces syntactically valid patches unconditionally.
-
-Preserved from prior version
-──────────────────────────────
-• ARCH-6 (FIX_RATIO_MIN/MAX removed)
-• ARCH-5 (UNIFIED_DIFF surgical mode for files > threshold)
-• ARCH-4 (Symbol-level conflict detection)
-• Execution-feedback loop (max 3 rounds)
-• Planner-blocked fixes skipped before any LLM call
-• Critical fixes routed to config.critical_fix_model
-• Model metadata written to every FixAttempt for DO-178C traceability
-"""
 from __future__ import annotations
 
 import asyncio
@@ -53,6 +16,15 @@ from brain.schemas import (
 )
 from brain.storage import BrainStorage
 from verification.independence_enforcer import extract_model_family
+
+# ── Gap 1: CPG-based causal context ──────────────────────────────────────────
+# Imported lazily to avoid hard dependency when CPG is not configured
+try:
+    from cpg.context_selector import CPGContextSelector, ContextSlice
+    from cpg.program_slicer import ProgramSlicer
+    _CPG_AVAILABLE = True
+except ImportError:
+    _CPG_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +96,10 @@ class FixerAgent(BaseAgent):
         repo_map:                   Any | None          = None,   # context.repo_map.RepoMap
         hybrid_retriever:           Any | None          = None,   # brain.hybrid_retriever.HybridRetriever
         fix_memory:                 Any | None          = None,   # memory.fix_memory.FixMemory
+        # ── Gap 1: CPG-based causal context ──────────────────────────────────
+        cpg_engine:                 Any | None          = None,   # cpg.cpg_engine.CPGEngine
+        cpg_context_selector:       Any | None          = None,   # cpg.context_selector.CPGContextSelector
+        program_slicer:             Any | None          = None,   # cpg.program_slicer.ProgramSlicer
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root                = repo_root
@@ -134,6 +110,10 @@ class FixerAgent(BaseAgent):
         self.repo_map          = repo_map
         self.hybrid_retriever  = hybrid_retriever
         self.fix_memory        = fix_memory
+        # Gap 1: CPG causal context
+        self.cpg_engine           = cpg_engine
+        self.cpg_context_selector = cpg_context_selector
+        self.program_slicer       = program_slicer
 
     async def run(self, **kwargs: Any) -> list[FixAttempt]:
         """
@@ -296,7 +276,12 @@ class FixerAgent(BaseAgent):
         # 2. Fix memory few-shot examples
         memory_examples = await self._get_memory_examples(issues)
 
-        # 3. File context + vector/hybrid context
+        # 3. GAP 1: CPG causal context (REPLACES pure vector similarity)
+        #    Computes the backward program slice from each issue location.
+        #    Returns the functions that CAUSED the bug (not just similar code).
+        cpg_context = await self._get_cpg_context(issues)
+
+        # 4. File context + vector/hybrid context (semantic similarity — preserved)
         file_context   = await self._build_file_context(
             file_paths, file_contents, patch_modes
         )
@@ -323,6 +308,7 @@ class FixerAgent(BaseAgent):
                     file_context, vector_context, model, file_paths,
                     repo_map_text=repo_map_text,
                     memory_examples=memory_examples,
+                    cpg_context=cpg_context,
                 )
             elif needs_ast:
                 last_result = await self._generate_full_fix(
@@ -330,6 +316,7 @@ class FixerAgent(BaseAgent):
                     file_context, vector_context, model, file_paths,
                     repo_map_text=repo_map_text,
                     memory_examples=memory_examples,
+                    cpg_context=cpg_context,
                 )
             else:
                 last_result = await self._generate_full_fix(
@@ -337,6 +324,7 @@ class FixerAgent(BaseAgent):
                     file_context, vector_context, model, file_paths,
                     repo_map_text=repo_map_text,
                     memory_examples=memory_examples,
+                    cpg_context=cpg_context,
                 )
 
             test_passed, last_test_output = await self._probe_candidate(
@@ -444,6 +432,29 @@ class FixerAgent(BaseAgent):
             self.log.debug(f"_get_repo_map_context: {exc}")
             return ""
 
+    async def _get_cpg_context(self, issues: list) -> str:
+        """Gap 1: Compute causally complete context via CPG backward slicing"""
+        if not (self.cpg_context_selector and issues):
+            return ""
+        try:
+            # Use the CPGContextSelector to compute merged slice for all issues
+            ctx = await self.cpg_context_selector.select_context_for_issues(
+                issues=issues,
+                max_lines=3000,
+            )
+            if not ctx.context_text:
+                return ""
+            total_info = (
+                f"total_functions={ctx.total_functions} "
+                f"files={ctx.total_files} "
+                f"source={ctx.source}"
+            )
+            self.log.info(f"[Fixer] CPG context: {total_info}")
+            return ctx.context_text
+        except Exception as exc:
+            self.log.debug(f"_get_cpg_context: {exc}")
+            return ""
+
     async def _get_memory_examples(self, issues: list) -> str:
         """Retrieve few-shot examples from fix memory."""
         if not self.fix_memory:
@@ -525,13 +536,7 @@ class FixerAgent(BaseAgent):
     # ── Patch mode selection ──────────────────────────────────────────────────
 
     def _select_patch_mode(self, file_path: str, line_count: int) -> PatchMode:
-        """
-        Select the appropriate patch mode for a file.
-
-        Python files 500–2000 lines → AST_REWRITE (libcst validates output)
-        Any file > surgical_patch_threshold → UNIFIED_DIFF
-        Otherwise → FULL_FILE
-        """
+        """Select the appropriate patch mode for a file"""
         if line_count >= self.surgical_patch_threshold:
             return PatchMode.UNIFIED_DIFF
         is_python = file_path.endswith((".py", ".pyi"))
@@ -550,12 +555,25 @@ class FixerAgent(BaseAgent):
         file_paths: list[str],
         repo_map_text:   str = "",
         memory_examples: str = "",
+        cpg_context:     str = "",
     ) -> FixResponse:
         prompt_parts = []
         if repo_map_text:
             prompt_parts.append(repo_map_text)
         if memory_examples:
             prompt_parts.append(memory_examples)
+        # Gap 1: CPG causal context — injected BEFORE file content so the LLM
+        # understands the causal chain before seeing the broken code.
+        # This is the core Gap 1 fix: the model now knows WHY the bug exists
+        # (which functions across which files contributed) before attempting a fix.
+        if cpg_context:
+            prompt_parts.append(
+                f"## Causal Context (Code Property Graph Backward Slice)\n"
+                f"**CRITICAL**: These are the functions that CAUSED the bug — not just "
+                f"similar-looking code. You MUST read and understand ALL of them before "
+                f"generating any fix. A fix that ignores the causal chain will introduce "
+                f"regressions.\n\n{cpg_context}"
+            )
         prompt_parts += [
             f"## Issues to Fix\n{issue_summary}",
             f"## Files\n{file_context}",
@@ -590,10 +608,34 @@ class FixerAgent(BaseAgent):
         memory_examples: str = "",
     ) -> PatchResponse:
         prompt_parts = []
+    async def _generate_patch_fix(
+        self,
+        issue_summary: str,
+        file_context:  str,
+        vector_context: str,
+        model: str,
+        file_paths: list[str],
+        repo_map_text:   str = "",
+        memory_examples: str = "",
+        cpg_context:     str = "",
+    ) -> PatchResponse:
+        prompt_parts = []
         if repo_map_text:
             prompt_parts.append(repo_map_text)
         if memory_examples:
             prompt_parts.append(memory_examples)
+        # Gap 1: CPG causal context — same injection as full-file mode.
+        # For large files the causal context is even MORE important because
+        # we cannot show the full file — only a skeleton.  The CPG slice tells
+        # the model which call sites and data flows to focus on.
+        if cpg_context:
+            prompt_parts.append(
+                f"## Causal Context (Code Property Graph Backward Slice)\n"
+                f"**CRITICAL**: These are the functions that CAUSED the bug — not just "
+                f"similar-looking code. Your patch MUST respect the causal chain. "
+                f"A patch that fixes the symptom without understanding the cause will "
+                f"regress.\n\n{cpg_context}"
+            )
         prompt_parts += [
             f"## Issues to Fix\n{issue_summary}",
             f"## Files (LARGE — surgical patch required)\n{file_context}",

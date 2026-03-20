@@ -1,33 +1,3 @@
-"""
-agents/reader.py
-================
-File reader and chunker agent for Rhodawk AI Code Stabilizer.
-
-CHANGES vs prior version
-──────────────────────────
-• ANTAGONIST-1 (Repo-map integration): After the full file-collection pass
-  completes, the RepoMap cache is invalidated so the next FixerAgent call
-  gets a fresh map reflecting any newly read / changed files.
-  The RepoMap itself is NOT generated here — it is generated lazily in
-  FixerAgent._fix_group() so the token budget is allocated per-group with
-  the correct target_files list.
-
-• ANTAGONIST-2 (Hybrid retriever indexing): When a HybridRetriever is
-  attached, _store_chunk() calls index_chunk_hybrid() instead of the plain
-  VectorBrain.index_chunk(), so every chunk is indexed with both BM25 sparse
-  and dense vectors from the first read pass.
-
-Both additions are opt-in via constructor parameters so the existing
-VectorBrain path is fully preserved as the fallback.
-
-Preserved from prior version
-──────────────────────────────
-• Function-level chunking (FUNCTION strategy) for C/C++
-• Preprocessed chunking skeleton
-• Incremental read / stale-function re-read
-• Graph async build runs serially after chunks
-• All chunk strategies (SKELETON_ONLY → FULL)
-"""
 from __future__ import annotations
 
 import asyncio
@@ -81,6 +51,8 @@ class ReaderAgent(BaseAgent):
         # ── Antagonist additions ─────────────────────────────────────────────
         hybrid_retriever:  Any | None         = None,  # brain.hybrid_retriever.HybridRetriever
         repo_map:          Any | None         = None,  # context.repo_map.RepoMap
+        # ── Gap 1: CPG engine ────────────────────────────────────────────────
+        cpg_engine:        Any | None         = None,  # cpg.cpg_engine.CPGEngine
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root         = Path(repo_root)
@@ -91,6 +63,8 @@ class ReaderAgent(BaseAgent):
         # Antagonist
         self.hybrid_retriever  = hybrid_retriever
         self.repo_map          = repo_map
+        # Gap 1
+        self.cpg_engine        = cpg_engine
 
     async def run(
         self, force_reread: set[str] | None = None, **kwargs: Any
@@ -124,6 +98,32 @@ class ReaderAgent(BaseAgent):
                 )
             except Exception as exc:
                 self.log.debug(f"[reader] RepoMap invalidate failed (non-fatal): {exc}")
+
+        # GAP 1: Trigger Joern CPG import/update after the read pass.
+        # On the first run this imports the entire codebase into Joern and
+        # builds the CPG.  On subsequent runs Joern updates only the changed
+        # files (incremental overlay).  This is non-blocking — the import
+        # runs in the background and queries return empty results until ready.
+        if self.cpg_engine is not None:
+            try:
+                if not self.cpg_engine.is_available:
+                    # First initialisation — connect to Joern
+                    await self.cpg_engine.initialise(
+                        repo_path=str(self.repo_root),
+                        project_name="rhodawk",
+                    )
+                else:
+                    # Already connected — invalidate stale cache entries
+                    # (full CPG update triggered by IncrementalCPGUpdater
+                    #  in controller._phase_commit())
+                    self.cpg_engine.invalidate_cache()
+                    self.log.debug(
+                        "[reader] CPG cache invalidated after read pass"
+                    )
+            except Exception as exc:
+                self.log.debug(
+                    f"[reader] CPG init/invalidate failed (non-fatal): {exc}"
+                )
 
         return processed
 
