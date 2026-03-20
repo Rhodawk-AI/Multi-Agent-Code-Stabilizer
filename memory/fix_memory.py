@@ -202,6 +202,51 @@ class FixMemory:
         except Exception as exc:
             log.warning(f"FixMemory.store_success: {exc}")
 
+    def store_failure(
+        self,
+        issue_type:   str,
+        file_context: str,
+        fix_approach: str,
+        failure_reason: str,
+        run_id:       str = "",
+    ) -> None:
+        """
+        Persist a fix approach that caused a test regression and was reverted.
+
+        The fixer retrieves these alongside successes so it never re-applies
+        an approach that was previously reverted for the same issue type and
+        file context.  The ``fix_approach`` field is prefixed with
+        ``[REVERTED]`` so the LLM prompt makes the negative signal unambiguous.
+        """
+        entry_text = (
+            f"Issue: {issue_type}\n"
+            f"Context: {file_context}\n"
+            f"Fix (REVERTED — do NOT repeat): {fix_approach}\n"
+            f"Failure reason: {failure_reason}"
+        )
+        meta = {
+            "issue_type":     issue_type,
+            "file_context":   file_context,
+            "fix_approach":   f"[REVERTED] {fix_approach}",
+            "test_result":    f"REGRESSION: {failure_reason}",
+            "run_id":         run_id,
+            "created_at":     datetime.now(timezone.utc).isoformat(),
+            "reverted":       True,
+        }
+        try:
+            if self._backend == "mem0":
+                self._client.add(
+                    messages=[{"role": "assistant", "content": entry_text}],
+                    user_id=self._user_id,
+                    metadata=meta,
+                )
+            elif self._backend == "qdrant":
+                self._qdrant_store(entry_text, meta)
+            elif self._backend == "json":
+                self._json_store(meta)
+        except Exception as exc:
+            log.warning(f"FixMemory.store_failure: {exc}")
+
     def retrieve(
         self,
         issue_description: str,
@@ -225,19 +270,41 @@ class FixMemory:
     def format_as_few_shot(self, entries: list[FixMemoryEntry]) -> str:
         """
         Format retrieved entries as few-shot examples for LLM injection.
+
+        Successful patterns are labeled as positive examples.
+        Reverted patterns are labeled as explicit negative examples — the LLM
+        is instructed never to repeat an approach marked [REVERTED].
         Designed to be prepended to the fix prompt.
         """
         if not entries:
             return ""
-        parts = ["## Successful Fix Patterns From Memory (use as reference)\n"]
-        for i, e in enumerate(entries, 1):
+        positives = [e for e in entries if not e.fix_approach.startswith("[REVERTED]")]
+        negatives = [e for e in entries if e.fix_approach.startswith("[REVERTED]")]
+        parts: list[str] = []
+        if positives:
+            parts.append("## Successful Fix Patterns From Memory (use as reference)\n")
+            for i, e in enumerate(positives, 1):
+                parts.append(
+                    f"### Example {i} (relevance={e.score:.2f})\n"
+                    f"Issue type: {e.issue_type}\n"
+                    f"Context: {e.file_context}\n"
+                    f"Approach used: {e.fix_approach}\n"
+                    f"Outcome: {e.test_result}\n"
+                )
+        if negatives:
             parts.append(
-                f"### Example {i} (relevance={e.score:.2f})\n"
-                f"Issue type: {e.issue_type}\n"
-                f"Context: {e.file_context}\n"
-                f"Approach used: {e.fix_approach}\n"
-                f"Outcome: {e.test_result}\n"
+                "## Previously Reverted Fix Approaches — DO NOT REPEAT\n"
+                "The following approaches were applied, caused test regressions, "
+                "and were reverted. You MUST NOT use these approaches.\n"
             )
+            for i, e in enumerate(negatives, 1):
+                parts.append(
+                    f"### Reverted Example {i} (relevance={e.score:.2f})\n"
+                    f"Issue type: {e.issue_type}\n"
+                    f"Context: {e.file_context}\n"
+                    f"Approach attempted: {e.fix_approach}\n"
+                    f"Why it failed: {e.test_result}\n"
+                )
         return "\n".join(parts)
 
     # ── mem0 backend ──────────────────────────────────────────────────────────
