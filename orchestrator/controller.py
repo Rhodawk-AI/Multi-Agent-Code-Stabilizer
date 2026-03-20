@@ -579,11 +579,30 @@ class StabilizerController:
             # CommitAuditScheduler: Gap 4 full orchestration path
             # Wraps IncrementalCPGUpdater with idempotency, staleness marks,
             # scoped test re-runs, and CommitAuditRecord persistence.
+            #
+            # GAP 4 FIX: the test_runner parameter was previously hardcoded to
+            # None, which meant the scoped test re-run step inside
+            # CommitAuditScheduler._run_scoped_tests() always logged
+            # "no test runner configured — skipping tests" and returned
+            # immediately.  None of the Gap 4 requirement #4 (re-run only test
+            # cases that cover the changed functions) ever fired.
+            #
+            # Fix: build a TestRunnerAgent and pass it in.  The test runner is
+            # cheap to construct and its _detect_and_run() falls back gracefully
+            # when no test framework is detected, so there is no downside to
+            # always wiring it.
+            from agents.test_runner import TestRunnerAgent as _TestRunnerAgent
+            _test_runner_for_scheduler = _TestRunnerAgent(
+                storage=self.storage,
+                run_id=self.run.id,
+                repo_root=self.config.repo_root,
+            )
+
             from orchestrator.commit_audit_scheduler import CommitAuditScheduler
             self._commit_audit_scheduler = CommitAuditScheduler(
                 storage=self.storage,
                 incremental_updater=self._incremental_updater,
-                test_runner=None,          # populated after test runner is built
+                test_runner=_test_runner_for_scheduler,
                 run_id=self.run.id,
                 repo_root=self.config.repo_root,
                 cpg_engine=self._cpg_engine,
@@ -1890,6 +1909,29 @@ class StabilizerController:
                     )
                     impacted_fns   = impact.affected_functions
                     impacted_files = set(impact.affected_files) - changed
+
+                    # GAP 4 FIX: cap the per-function staleness mark count to
+                    # _MAX_BLAST_CAP.  A widely-used utility can have thousands
+                    # of callers at depth 3.  Emitting thousands of staleness
+                    # marks per commit degrades storage and makes the next read
+                    # phase re-audit more code than a full scan would.
+                    #
+                    # When the cap is hit, function-level marks are emitted only
+                    # for the first _MAX_BLAST_CAP functions.  The remaining
+                    # impacted FILES are still marked STALE so they get
+                    # re-audited at file granularity — coarser but correct.
+                    _MAX_BLAST_CAP = 500
+                    if len(impacted_fns) > _MAX_BLAST_CAP:
+                        self.log.warning(
+                            "[Gap4] CPG blast radius %d exceeds cap %d for "
+                            "changed files %s — truncating function-level "
+                            "marks to cap; remaining files fall back to "
+                            "file-level STALE.",
+                            len(impacted_fns), _MAX_BLAST_CAP,
+                            sorted(changed)[:3],
+                        )
+                        impacted_fns = impacted_fns[:_MAX_BLAST_CAP]
+
                     added = 0
                     for item in impacted_fns:
                         fn = item.get("function_name", "")
