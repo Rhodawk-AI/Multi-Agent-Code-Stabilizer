@@ -1,24 +1,3 @@
-"""
-brain/sqlite_storage.py
-=======================
-SQLite implementation of BrainStorage.
-
-FIXES vs previous version
-──────────────────────────
-• GAP-9 CRITICAL: list_fixes(issue_id) was doing a full-table scan in Python.
-  Now uses SQL JSON_EACH to filter in the database engine — O(log n) at scale.
-• Added graph_edges table + store_graph_edges() / get_graph_edges() methods.
-• Added formal_verification_results table + store/fetch methods.
-• Added test_run_results table + store/fetch methods.
-• Added domain_mode column to audit_runs.
-• Added graph_built column to audit_runs.
-• Added consensus_votes + consensus_confidence columns to issues.
-• DDL is additive: new columns use ALTER TABLE … ADD COLUMN IF NOT EXISTS so
-  existing databases are auto-migrated without data loss.
-• _row_to_fix: planner_approved None-vs-False ambiguity fixed.
-• _write lock: moved to per-statement acquire rather than per-call to reduce
-  contention under high-concurrency reads.
-"""
 from __future__ import annotations
 
 import asyncio
