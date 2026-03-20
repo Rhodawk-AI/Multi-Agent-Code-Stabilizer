@@ -251,18 +251,45 @@ class FixMemory:
         self,
         issue_description: str,
         n:                 int = 3,
+        max_age_days:      int | None = 180,
     ) -> list[FixMemoryEntry]:
         """
-        Retrieve the top-n most relevant successful fix patterns.
-        Returns an empty list if no memories exist or backend is unavailable.
+        Retrieve the top-n most relevant fix patterns (successes + failures).
+
+        Parameters
+        ----------
+        issue_description:
+            Natural-language description of the issue being fixed.  Used as
+            the semantic search query.
+        n:
+            Maximum number of entries to return.
+        max_age_days:
+            Discard entries older than this many days.  Defaults to 180 (six
+            months) — satisfies the Gap 3 audit requirement that a revert from
+            years ago does not rank identically to a recent one.  Set to
+            None to disable the filter and return all matching entries
+            regardless of age.
+
+        Returns
+        -------
+        list[FixMemoryEntry]
+            Empty list if no memories exist or the backend is unavailable.
         """
         try:
             if self._backend == "mem0":
-                return self._mem0_retrieve(issue_description, n)
+                entries = self._mem0_retrieve(issue_description, n * 2)
             elif self._backend == "qdrant":
-                return self._qdrant_retrieve(issue_description, n)
+                entries = self._qdrant_retrieve(issue_description, n * 2)
             elif self._backend == "json":
-                return self._json_retrieve(issue_description, n)
+                entries = self._json_retrieve(issue_description, n * 2)
+            else:
+                return []
+            # max_age_days=None or max_age_days=0 both mean "no age filter".
+            # 0 is treated as unlimited because callers often store the value
+            # as a plain int config field where 0 conventionally means "off".
+            if max_age_days is not None and max_age_days > 0:
+                entries = self._filter_by_age(entries, max_age_days)
+            return entries[:n]
         except Exception as exc:
             log.debug(f"FixMemory.retrieve: {exc}")
         return []
@@ -306,6 +333,52 @@ class FixMemory:
                     f"Why it failed: {e.test_result}\n"
                 )
         return "\n".join(parts)
+
+    # ── Age filter ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _filter_by_age(
+        entries: list[FixMemoryEntry],
+        max_age_days: int,
+    ) -> list[FixMemoryEntry]:
+        """
+        Remove entries whose created_at timestamp is older than
+        max_age_days.
+
+        Design notes
+        ~~~~~~~~~~~~
+        * Entries without a parseable created_at are retained — they
+          predate the timestamp field and should not be silently dropped.
+        * The comparison is done in UTC so DST and local offsets cannot cause
+          an entry to be incorrectly excluded.
+        * This is the fix for Gap 3 Defect 3: without this filter, a revert
+          from three years ago ranked identically to a recent one (pure vector
+          similarity, no time decay).
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        kept: list[FixMemoryEntry] = []
+        for entry in entries:
+            if not entry.created_at:
+                # No timestamp — retain (backward-compat with old entries).
+                kept.append(entry)
+                continue
+            try:
+                ts_str = entry.created_at
+                # Handle both offset-aware ("...+00:00") and naive ISO strings.
+                if ts_str.endswith("Z"):
+                    ts_str = ts_str[:-1] + "+00:00"
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    # Treat naive timestamps as UTC (consistent with store_success).
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts >= cutoff:
+                    kept.append(entry)
+            except (ValueError, TypeError):
+                # Unparseable timestamp — retain defensively.
+                kept.append(entry)
+        return kept
 
     # ── mem0 backend ──────────────────────────────────────────────────────────
 
