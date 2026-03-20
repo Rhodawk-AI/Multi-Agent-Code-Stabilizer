@@ -1,0 +1,302 @@
+"""
+brain/storage.py
+================
+Abstract storage interface for Rhodawk AI Code Stabilizer.
+
+PRODUCTION FIXES vs audit report
+──────────────────────────────────
+• Added escalation CRUD (upsert_escalation, get_escalation, list_escalations)
+• Added baseline CRUD (upsert_baseline, get_active_baseline, list_baselines)
+• Added function staleness CRUD (upsert_staleness_mark, list_stale_functions)
+• Added compliance finding storage (upsert_ldra_finding, upsert_polyspace_finding,
+  upsert_cbmc_result)
+• Added requirement traceability CRUD (upsert_rtm_entry, get_rtm_for_issue)
+• Added reviewer independence record storage
+• Added SAS and SCI storage
+• All abstract methods documented with purpose and expected semantics
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+from brain.schemas import (
+    AuditRun, AuditScore, AuditTrailEntry,
+    BaselineRecord, CbmcVerificationResult,
+    ConvergenceRecord,
+    EscalationRecord, EscalationStatus,
+    FileChunkRecord, FileRecord,
+    FixAttempt, FormalVerificationResult,
+    FunctionStalenessMark,
+    Issue, IssueStatus,
+    LdraFinding, PatrolEvent,
+    PlannerRecord, PolyspaceFinding,
+    RequirementTraceability, ReviewerIndependenceRecord,
+    RunStatus, SoftwareAccomplishmentSummary,
+    SoftwareConfigurationIndex, TestRunResult,
+)
+
+
+class BrainStorage(ABC):
+    """
+    Abstract persistence layer.  All methods are async.
+
+    Implementation contract:
+    • upsert_* methods must be idempotent — calling twice with the same
+      object must produce the same stored state as calling once.
+    • list_* methods return empty lists (not None) when no records exist.
+    • get_* methods return None when the record does not exist.
+    • All writes must be atomic at the row level.
+    """
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def initialise(self) -> None:
+        """Create schema if not exists. Must be idempotent."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Flush and release all connections."""
+
+    # ── Run ────────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_run(self, run: AuditRun) -> None: ...
+
+    @abstractmethod
+    async def get_run(self, run_id: str) -> AuditRun | None: ...
+
+    @abstractmethod
+    async def update_run_status(self, run_id: str, status: RunStatus) -> None: ...
+
+    @abstractmethod
+    async def append_score(self, score: AuditScore) -> None: ...
+
+    # ── Files ──────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_file(self, record: FileRecord) -> None: ...
+
+    @abstractmethod
+    async def get_file(self, path: str) -> FileRecord | None: ...
+
+    @abstractmethod
+    async def list_files(self, run_id: str = "") -> list[FileRecord]: ...
+
+    @abstractmethod
+    async def upsert_chunk(self, chunk: FileChunkRecord) -> None: ...
+
+    @abstractmethod
+    async def list_chunks(
+        self, file_path: str, run_id: str = ""
+    ) -> list[FileChunkRecord]: ...
+
+    @abstractmethod
+    async def get_all_observations(self) -> list[dict[str, Any]]: ...
+
+    # ── Issues ─────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_issue(self, issue: Issue) -> None: ...
+
+    @abstractmethod
+    async def get_issue(self, issue_id: str) -> Issue | None: ...
+
+    @abstractmethod
+    async def list_issues(
+        self, run_id: str = "", status: str | None = None
+    ) -> list[Issue]: ...
+
+    @abstractmethod
+    async def update_issue_status(
+        self, issue_id: str, status: str, reason: str = ""
+    ) -> None: ...
+
+    @abstractmethod
+    async def get_total_cost(self, run_id: str) -> float: ...
+
+    # ── Fixes ──────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_fix(self, fix: FixAttempt) -> None: ...
+
+    @abstractmethod
+    async def get_fix(self, fix_id: str) -> FixAttempt | None: ...
+
+    @abstractmethod
+    async def list_fixes(self, run_id: str = "") -> list[FixAttempt]: ...
+
+    # ── Planner ────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_planner_record(self, record: PlannerRecord) -> None: ...
+
+    # ── Audit trail ────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def append_audit_trail(self, entry: AuditTrailEntry) -> None: ...
+
+    @abstractmethod
+    async def list_audit_trail(
+        self, run_id: str, limit: int = 1000
+    ) -> list[AuditTrailEntry]: ...
+
+    # ── Patrol ─────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def append_patrol_event(self, event: PatrolEvent) -> None: ...
+
+    # ── Tests ──────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_test_result(self, result: TestRunResult) -> None: ...
+
+    # ── Formal verification ────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_formal_result(self, result: FormalVerificationResult) -> None: ...
+
+    # ── ESCALATION (DO-178C 6.3.4 / MIL-STD-882E Task 402) ───────────────────
+
+    @abstractmethod
+    async def upsert_escalation(self, esc: EscalationRecord) -> None:
+        """Persist an escalation record.  Must be idempotent on id."""
+
+    @abstractmethod
+    async def get_escalation(self, escalation_id: str) -> EscalationRecord | None:
+        """Return the escalation with the given id, or None."""
+
+    @abstractmethod
+    async def list_escalations(
+        self,
+        run_id: str = "",
+        status: EscalationStatus | None = None,
+    ) -> list[EscalationRecord]:
+        """List escalations, optionally filtered by run_id and/or status."""
+
+    # ── BASELINE (DO-178C Sec. 11) ─────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_baseline(self, baseline: BaselineRecord) -> None:
+        """Persist a baseline record."""
+
+    @abstractmethod
+    async def get_baseline(self, baseline_id: str) -> BaselineRecord | None:
+        """Return the baseline with the given id, or None."""
+
+    @abstractmethod
+    async def get_active_baseline(self, run_id: str = "") -> BaselineRecord | None:
+        """Return the currently active (is_active=True) baseline for a run."""
+
+    @abstractmethod
+    async def list_baselines(self, run_id: str = "") -> list[BaselineRecord]:
+        """List all baselines, optionally filtered by run_id."""
+
+    # ── FUNCTION STALENESS ─────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_staleness_mark(self, mark: FunctionStalenessMark) -> None:
+        """Record a function as stale, requiring targeted re-audit."""
+
+    @abstractmethod
+    async def list_stale_functions(
+        self, file_path: str = "", run_id: str = ""
+    ) -> list[FunctionStalenessMark]:
+        """List all stale function marks, optionally filtered."""
+
+    @abstractmethod
+    async def clear_staleness_mark(self, file_path: str, function_name: str) -> None:
+        """Remove a staleness mark after re-audit completes."""
+
+    # ── COMPLIANCE FINDINGS ────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_ldra_finding(self, finding: LdraFinding) -> None: ...
+
+    @abstractmethod
+    async def list_ldra_findings(
+        self, run_id: str = "", file_path: str = ""
+    ) -> list[LdraFinding]: ...
+
+    @abstractmethod
+    async def upsert_polyspace_finding(self, finding: PolyspaceFinding) -> None: ...
+
+    @abstractmethod
+    async def list_polyspace_findings(
+        self, run_id: str = ""
+    ) -> list[PolyspaceFinding]: ...
+
+    @abstractmethod
+    async def upsert_cbmc_result(self, result: CbmcVerificationResult) -> None: ...
+
+    @abstractmethod
+    async def get_cbmc_result(self, result_id: str) -> CbmcVerificationResult | None: ...
+
+    # ── REQUIREMENT TRACEABILITY (DO-178C Table A-5) ───────────────────────────
+
+    @abstractmethod
+    async def upsert_rtm_entry(self, entry: RequirementTraceability) -> None: ...
+
+    @abstractmethod
+    async def get_rtm_for_issue(
+        self, issue_id: str
+    ) -> RequirementTraceability | None: ...
+
+    @abstractmethod
+    async def list_rtm_entries(
+        self, run_id: str = ""
+    ) -> list[RequirementTraceability]: ...
+
+    # ── REVIEWER INDEPENDENCE (DO-178C 6.3.4) ─────────────────────────────────
+
+    @abstractmethod
+    async def upsert_independence_record(
+        self, record: ReviewerIndependenceRecord
+    ) -> None: ...
+
+    @abstractmethod
+    async def get_independence_record(
+        self, fix_attempt_id: str
+    ) -> ReviewerIndependenceRecord | None: ...
+
+    # ── SOFTWARE ACCOMPLISHMENT SUMMARY (DO-178C Sec. 11.20) ──────────────────
+
+    @abstractmethod
+    async def upsert_sas(self, sas: SoftwareAccomplishmentSummary) -> None: ...
+
+    @abstractmethod
+    async def get_sas(self, run_id: str) -> SoftwareAccomplishmentSummary | None: ...
+
+    # ── SOFTWARE CONFIGURATION INDEX ──────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_sci(self, sci: SoftwareConfigurationIndex) -> None: ...
+
+    @abstractmethod
+    async def get_sci(self, baseline_id: str) -> SoftwareConfigurationIndex | None: ...
+
+    # ── CONVERGENCE (multi-cycle loop) ─────────────────────────────────────────
+
+    @abstractmethod
+    async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:
+        """Persist a convergence check result for audit trail and resume logic."""
+        ...
+
+    @abstractmethod
+    async def list_convergence_records(
+        self, run_id: str
+    ) -> list["ConvergenceRecord"]:
+        """Return all convergence records for a run, ordered by cycle ascending."""
+        ...
+
+    # ── LLM SESSION LOGGING ────────────────────────────────────────────────────
+
+    @abstractmethod
+    async def log_llm_session(self, session: dict) -> None:
+        """
+        Persist an LLM call record for cost tracking and reproducibility.
+        The session dict contains: run_id, agent_type, model, prompt_tokens,
+        completion_tokens, cost_usd, duration_ms, success, error.
+        """
+        ...
