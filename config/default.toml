@@ -183,3 +183,62 @@ max_slice_nodes        = 50
 # Caps I/O at context-selection time.  Increase for highly modular codebases
 # where a bug spans many small files.
 max_files_in_slice     = 30
+
+# ─── Synthesis Agent — Gap 2 (Cross-domain compound finding detection) ───────
+#
+# Three AuditorAgent instances run in parallel — SECURITY, ARCHITECTURE,
+# STANDARDS — all calling the same LLM with different prompts.  Without
+# synthesis, this produces duplicate findings and misses cross-domain bugs.
+#
+# The SynthesisAgent sits between the audit phase and the consensus phase:
+#
+#   AuditorAgent(SECURITY)     ─┐
+#   AuditorAgent(ARCHITECTURE) ─┼──→  SynthesisAgent ──→ ConsensusEngine
+#   AuditorAgent(STANDARDS)    ─┘
+#
+# It performs two operations:
+#
+#   1. DEDUPLICATION — fingerprint + LLM semantic pass removes findings
+#      that describe the same root defect from different angles.
+#
+#   2. COMPOUND FINDING DETECTION — identifies vulnerabilities that span
+#      domain boundaries.  A race condition (ARCHITECTURE) that enables a
+#      privilege escalation (SECURITY) is a CompoundFinding with amplification
+#      ≥ 3.0.  No commercial tool finds these.
+#
+# The synthesis_model should be a DIFFERENT model family from the auditors
+# (which default to primary_model).  Using a different family ensures the
+# synthesis pass brings genuinely fresh cross-domain reasoning.
+#
+# Quick start:
+#   Set synthesis_model in [synthesis] to a different family than primary.
+#   Leave synthesis_enabled = true (default) to activate immediately.
+#
+[synthesis]
+
+# Master switch.  Set false to skip synthesis and run the original three-
+# auditor pipeline unchanged (same behaviour as before Gap 2).
+enabled                = true
+
+# Fingerprint + LLM semantic deduplication of same-root-defect findings.
+# Disabling produces duplicate findings in the final issue list.
+dedup_enabled          = true
+
+# Cross-domain compound finding detection.
+# Set false to only run deduplication without compound analysis.
+compound_enabled       = true
+
+# Model used for synthesis reasoning.  MUST be a different family from
+# the primary auditors for genuine independence.
+#   Example: if primary = Qwen2.5-Coder (Alibaba), use:
+#     synthesis_model = "openrouter/deepseek/deepseek-coder-v2-0724"
+#   or for cloud deployment:
+#     synthesis_model = "claude-opus-4-20250514"
+# Defaults to critical_fix_model when blank.
+# Override with: RHODAWK_SYNTHESIS_MODEL=<model_id>
+synthesis_model        = ""
+
+# Maximum compound findings emitted per synthesis pass.
+# Compound findings are high-value but expensive to fix — cap prevents
+# overwhelming the fix queue on large codebases.
+max_compound_findings  = 20

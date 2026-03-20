@@ -113,6 +113,15 @@ def _flatten_toml(raw: dict) -> dict:
         "blast_radius_threshold": "cpg_blast_radius_threshold",
     })
 
+    # Gap 2: [synthesis] section
+    _map(out, raw.get("synthesis", {}), {
+        "enabled":               "synthesis_enabled",
+        "dedup_enabled":         "synthesis_dedup_enabled",
+        "compound_enabled":      "synthesis_compound_enabled",
+        "synthesis_model":       "synthesis_model",
+        "max_compound_findings": "synthesis_max_compound",
+    })
+
     _map(out, raw.get("github", {}), {
         "base_branch":   "base_branch",
         "branch_prefix": "branch_prefix",
@@ -155,6 +164,11 @@ _ENV_MAP: dict[str, tuple[str, str]] = {
     "CPG_BLAST_RADIUS_THRESHOLD": ("cpg_blast_radius_threshold",  "int"),
     "CPG_MAX_SLICE_NODES":        ("cpg_max_slice_nodes",         "int"),
     "CPG_MAX_FILES_IN_SLICE":     ("cpg_max_files_in_slice",      "int"),
+    # Gap 2
+    "RHODAWK_SYNTHESIS_MODEL":    ("synthesis_model",             "str"),
+    "RHODAWK_SYNTHESIS_ENABLED":  ("synthesis_enabled",           "bool"),
+    "RHODAWK_COMPOUND_ENABLED":   ("synthesis_compound_enabled",  "bool"),
+    "RHODAWK_SYNTHESIS_MAX":      ("synthesis_max_compound",      "int"),
 }
 
 
