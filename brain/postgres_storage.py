@@ -1,30 +1,3 @@
-"""
-brain/postgres_storage.py
-==========================
-PostgreSQL implementation of BrainStorage for 10M+ line scale.
-
-Replaces SQLite when RHODAWK_USE_POSTGRES=1 is set.
-
-Scale features
-───────────────
-• Table partitioning on issues (by run_id) for O(log n) queries
-• Partitioning on file_chunks (by file_path hash bucket)
-• Connection pooling via asyncpg (default pool size: 20)
-• Prepared statements for all hot-path queries
-• Full-text search index on issue descriptions
-• JSONB columns with GIN indexes for fix_attempts.fixed_files
-
-Environment variables
-──────────────────────
-DATABASE_URL            — PostgreSQL connection string (required when RHODAWK_USE_POSTGRES=1)
-                          Format: postgresql+asyncpg://user:pass@host:5432/rhodawk
-RHODAWK_PG_POOL_SIZE    — Connection pool size (default: 20)
-RHODAWK_PG_PARTITIONS   — Number of hash partitions for file_chunks (default: 16)
-
-Installation
-─────────────
-pip install asyncpg sqlalchemy[asyncio] alembic
-"""
 from __future__ import annotations
 
 import asyncio
