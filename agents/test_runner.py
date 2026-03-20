@@ -10,12 +10,27 @@ PRODUCTION FIXES vs audit report
 • MC/DC coverage tracking for DO-178C DAL A/B (via gcov when available).
 • Test result stored in storage and linked to FixAttempt.
 • FAILED test result triggers revert signal to controller.
+
+GAP 4 FIXES
+────────────
+• BUG-4a: _run_pytest() was passing ``--co -q`` (collect-only mode) whenever
+  changed_files were supplied.  ``--co`` instructs pytest to enumerate tests
+  but NOT execute them, so changed-file runs silently reported 0 passed / 0
+  failed and the coverage gate was never exercised.  Fixed: use file-path
+  scoping to limit collection without suppressing execution.
+
+• BUG-4b: No method existed to scope a test run to a specific set of
+  *function names*.  CommitAuditScheduler needs to run only the tests that
+  exercise the functions identified in the CPG impact set, not the full suite.
+  Fixed: ``run_for_functions()`` builds a pytest ``-k`` expression from the
+  function names and runs only matching tests.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,12 +51,14 @@ class TestRunnerAgent(BaseAgent):
         self,
         storage:     BrainStorage,
         run_id:      str,
-        repo_root:   Path | None    = None,
+        repo_root:   Path | None        = None,
         config:      AgentConfig | None = None,
-        mcp_manager: Any | None     = None,
+        mcp_manager: Any | None         = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root = repo_root or Path(".")
+
+    # ── Public entry points ───────────────────────────────────────────────────
 
     async def run(self, **kwargs: Any) -> TestRunResult:
         return await self._run_tests(fix_attempt_id="")
@@ -52,30 +69,56 @@ class TestRunnerAgent(BaseAgent):
             fix_attempt_id=fix.id, changed_files=changed_files
         )
 
+    async def run_for_functions(
+        self,
+        function_names: list[str],
+        fix_attempt_id: str = "",
+    ) -> TestRunResult:
+        """
+        GAP 4 entry point: run only the tests that cover the given function
+        names (CPG impact set).
+
+        Builds a pytest ``-k`` expression from the function names so only
+        tests whose node-id or parametrize marker contains one of those names
+        are collected and executed.  Falls back to a full suite run when the
+        function list is empty or pytest is unavailable.
+        """
+        return await self._run_tests(
+            fix_attempt_id=fix_attempt_id,
+            changed_files=[],
+            target_functions=function_names,
+        )
+
+    # ── Internal test execution ───────────────────────────────────────────────
+
     async def _run_tests(
         self,
-        fix_attempt_id: str = "",
-        changed_files:  list[str] | None = None,
+        fix_attempt_id:   str            = "",
+        changed_files:    list[str]      | None = None,
+        target_functions: list[str]      | None = None,
     ) -> TestRunResult:
-        loop = asyncio.get_event_loop()
+        loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, self._detect_and_run, changed_files or []
+            None,
+            self._detect_and_run,
+            changed_files    or [],
+            target_functions or [],
         )
-        result.run_id          = self.run_id
-        result.fix_attempt_id  = fix_attempt_id
+        result.run_id         = self.run_id
+        result.fix_attempt_id = fix_attempt_id
 
-        # FIX: populate mcdc_coverage from gcov output for C/C++ files.
-        # Previously this always defaulted to 0.0, making DO-178C DAL-A/B
-        # evidence for MC/DC impossible. We now query gcov via the MCP manager
-        # if C/C++ files were changed and gcov instrumentation is present.
+        # Populate mcdc_coverage from gcov for C/C++ (DO-178C DAL A/B).
         if changed_files and self.mcp:
-            c_files = [f for f in changed_files if f.endswith((".c", ".cpp", ".cc", ".h", ".hpp"))]
+            c_files = [
+                f for f in changed_files
+                if f.endswith((".c", ".cpp", ".cc", ".h", ".hpp"))
+            ]
             if c_files:
                 mcdc_values: list[float] = []
-                for cfile in c_files[:5]:   # limit to avoid long gate times
+                for cfile in c_files[:5]:
                     try:
                         cov = await self.mcp.get_coverage(cfile)
-                        mc = cov.get("mcdc_coverage_pct", 0.0)
+                        mc  = cov.get("mcdc_coverage_pct", 0.0)
                         if mc > 0.0:
                             mcdc_values.append(mc)
                     except Exception:
@@ -83,90 +126,134 @@ class TestRunnerAgent(BaseAgent):
                 if mcdc_values:
                     result.mcdc_coverage = sum(mcdc_values) / len(mcdc_values)
                     self.log.info(
-                        f"[test_runner] MC/DC coverage: {result.mcdc_coverage:.1f}% "
-                        f"(avg over {len(mcdc_values)} instrumented files)"
+                        "[test_runner] MC/DC coverage: %.1f%% (avg over %d files)",
+                        result.mcdc_coverage, len(mcdc_values),
                     )
 
         await self.storage.upsert_test_result(result)
         self.log.info(
-            f"[test_runner] {result.status.value} — "
-            f"passed={result.passed} failed={result.failed} "
-            f"coverage={result.coverage_pct:.1f}% "
-            f"mcdc={result.mcdc_coverage:.1f}%"
+            "[test_runner] %s — passed=%d failed=%d coverage=%.1f%% mcdc=%.1f%%",
+            result.status.value, result.passed, result.failed,
+            result.coverage_pct, result.mcdc_coverage,
         )
         return result
 
-    def _detect_and_run(self, changed_files: list[str]) -> TestRunResult:
-        # Python — pytest
+    def _detect_and_run(
+        self,
+        changed_files:    list[str],
+        target_functions: list[str],
+    ) -> TestRunResult:
         if shutil.which("pytest"):
-            return self._run_pytest(changed_files)
-        # C/C++ — make test
+            return self._run_pytest(changed_files, target_functions)
         if (self.repo_root / "Makefile").exists():
             return self._run_make_test()
         return TestRunResult(status=TestRunStatus.NO_TESTS)
 
-    def _run_pytest(self, changed_files: list[str]) -> TestRunResult:
-        import tempfile as _tf
-        _report_path = _tf.mktemp(suffix="_pytest.json")
-        cmd = ["pytest", "--tb=short", "-q", "--json-report",
-               f"--json-report-file={_report_path}"]
-        # Run only tests related to changed files when possible
-        if changed_files:
-            py_changed = [f for f in changed_files if f.endswith(".py")]
-            if py_changed:
-                cmd.extend(["--co", "-q"])  # collect only for scoping
+    def _run_pytest(
+        self,
+        changed_files:    list[str],
+        target_functions: list[str],
+    ) -> TestRunResult:
+        """
+        Run pytest, optionally scoped to changed files or target functions.
+
+        BUG-4a fix
+        ----------
+        The original code appended ``--co -q`` (collect-only) whenever
+        ``changed_files`` was non-empty.  ``--co`` suppresses actual test
+        execution — the suite ran zero tests while appearing to succeed.
+
+        Correct scoping:
+        • Function-targeted runs: build a ``-k`` expression and pass it.
+          pytest collects AND executes only matching tests.
+        • File-targeted runs: derive matching test file paths from source
+          stems using the ``test_<stem>.py`` convention; pass those paths
+          directly to pytest so it only collects from those files.  If no
+          matching test files are found, run the full suite — running
+          everything is always better than silently running nothing.
+        """
+        import time
+
+        report_path = tempfile.mktemp(suffix="_pytest.json")
+        cmd: list[str] = [
+            "pytest", "--tb=short", "-q",
+            "--json-report", f"--json-report-file={report_path}",
+        ]
+
+        if target_functions:
+            # BUG-4b: function-targeted run via -k expression.
+            clean_names = [f for f in target_functions if re.match(r"^\w+$", f)]
+            if clean_names:
+                k_expr = " or ".join(clean_names)
+                cmd.extend(["-k", k_expr])
+                log.debug("pytest -k %r (function-targeted, %d names)", k_expr, len(clean_names))
+
+        elif changed_files:
+            # BUG-4a: resolve test file paths, do NOT use --co.
+            test_paths: list[str] = []
+            for src in changed_files:
+                stem = Path(src).stem
+                for candidate in [
+                    f"tests/test_{stem}.py",
+                    f"tests/unit/test_{stem}.py",
+                    f"test_{stem}.py",
+                ]:
+                    if (self.repo_root / candidate).exists():
+                        test_paths.append(candidate)
+            if test_paths:
+                cmd.extend(test_paths)
+                log.debug("pytest scoped to %d test file(s): %s", len(test_paths), test_paths)
+            # If no matching files found, fall through to run full suite.
+
         try:
-            import time
-            start = time.monotonic()
-            result = subprocess.run(
+            start   = time.monotonic()
+            proc    = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=300, cwd=str(self.repo_root),
             )
             elapsed = time.monotonic() - start
-            # Parse JSON report
+
             passed = failed = errors = skipped = 0
             coverage = 0.0
+
             try:
-                report = json.loads(Path(_report_path).read_text())
+                report  = json.loads(Path(report_path).read_text())
                 summary = report.get("summary", {})
-                passed  = summary.get("passed", 0)
-                failed  = summary.get("failed", 0)
-                errors  = summary.get("error", 0)
+                passed  = summary.get("passed",  0)
+                failed  = summary.get("failed",  0)
+                errors  = summary.get("error",   0)
                 skipped = summary.get("skipped", 0)
+                pct = (
+                    report
+                    .get("coverage", {})
+                    .get("totals", {})
+                    .get("percent_covered", 0.0)
+                )
+                if pct:
+                    coverage = float(pct)
             except Exception:
-                # Parse from stdout
-                for line in result.stdout.splitlines():
+                for line in proc.stdout.splitlines():
                     if "passed" in line or "failed" in line:
-                        import re
                         m = re.search(r"(\d+) passed", line)
-                        if m: passed = int(m.group(1))
+                        if m:
+                            passed = int(m.group(1))
                         m = re.search(r"(\d+) failed", line)
-                        if m: failed = int(m.group(1))
+                        if m:
+                            failed = int(m.group(1))
 
             status = (
                 TestRunStatus.PASSED if failed == 0 and errors == 0
                 else TestRunStatus.FAILED
             )
-            # FIX: populate coverage_pct from pytest-cov JSON if available
-            try:
-                import json as _json
-                cov_file = Path(_report_path)
-                if cov_file.exists():
-                    rpt = _json.loads(cov_file.read_text())
-                    pct = rpt.get("coverage", {}).get("totals", {}).get("percent_covered", 0.0)
-                    if pct:
-                        coverage = float(pct)
-            except Exception:
-                pass
-
             return TestRunResult(
                 status=status,
                 passed=passed, failed=failed,
                 errors=errors, skipped=skipped,
                 coverage_pct=coverage,
-                output=result.stdout[-3000:],
+                output=proc.stdout[-3000:],
                 duration_s=elapsed,
             )
+
         except subprocess.TimeoutExpired:
             return TestRunResult(
                 status=TestRunStatus.ERROR,
