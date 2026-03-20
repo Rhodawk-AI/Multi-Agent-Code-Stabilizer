@@ -253,12 +253,45 @@ class FixerAgent(BaseAgent):
         if not (self.cpg_engine and self.cpg_engine.is_available):
             return ('', None)
         try:
+            # Joern stores method identifiers as fully qualified names whose
+            # exact format depends on the language, e.g.:
+            #   Python:  <module_path>.<ClassName>.<method_name>
+            #   C/C++:   namespace::ClassName::method_name
+            #
+            # Passing bare tree-sitter symbol names (e.g. "process_payment")
+            # to JoernClient.compute_impact_set() produces zero hits because
+            # no CPG node matches the unqualified form.  The fix: derive a
+            # dotted module path from the file path (the common Python/JS
+            # convention) and build both a bare name AND a qualified name for
+            # every symbol, then pass all candidates to compute_blast_radius.
+            # Joern's impact-set query applies an "endsWith" / "matches" filter
+            # so candidate lists are deduplicated server-side.
             function_names: list[str] = []
             for fp in file_paths:
                 syms = await self._extract_file_symbols(fp)
-                function_names.extend(sorted(syms)[:20])
+                # Build the module-qualified prefix: "a/b/c.py" → "a.b.c"
+                module_prefix = (
+                    Path(fp)
+                    .with_suffix('')
+                    .as_posix()
+                    .replace('/', '.')
+                )
+                for sym in sorted(syms)[:20]:
+                    # Always include the bare name (works for C/C++ globals
+                    # and short-path Python modules).
+                    function_names.append(sym)
+                    # Add the module-qualified form for Python / JS conventions.
+                    qualified = f"{module_prefix}.{sym}"
+                    if qualified not in function_names:
+                        function_names.append(qualified)
+
             if not function_names:
-                function_names = [fp.replace('/', '.').replace('\\', '.').removesuffix('.py') for fp in file_paths]
+                # Last-resort fallback: derive module path from file path alone.
+                function_names = [
+                    Path(fp).with_suffix('').as_posix().replace('/', '.')
+                    for fp in file_paths
+                ]
+
             blast = await self.cpg_engine.compute_blast_radius(function_names=function_names, file_paths=file_paths, depth=3)
             if not blast.affected_functions:
                 return ('', blast)
