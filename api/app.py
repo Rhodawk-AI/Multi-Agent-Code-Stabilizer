@@ -96,11 +96,16 @@ def create_app() -> FastAPI:
 
     # ── Core routes ──────────────────────────────────────────────────────────
     for module_name, attr in [
-        ("api.routes.runs",        "router"),
-        ("api.routes.issues",      "router"),
-        ("api.routes.fixes",       "router"),
-        ("api.routes.files",       "router"),
-        ("api.routes.escalations", "router"),
+        ("api.routes.runs",              "router"),
+        ("api.routes.issues",            "router"),
+        ("api.routes.fixes",             "router"),
+        ("api.routes.files",             "router"),
+        ("api.routes.escalations",       "router"),
+        # GAP 2 FIX: compound findings and synthesis reports as first-class API objects.
+        # Previously compound findings were only queryable via /api/issues/?executor_type=SYNTHESIS
+        # with compound metadata buried in the description string.
+        # This route exposes them structurally with all compound-specific fields parsed out.
+        ("api.routes.compound_findings", "router"),
     ]:
         try:
             import importlib
