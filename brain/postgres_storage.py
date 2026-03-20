@@ -318,6 +318,22 @@ CREATE TABLE IF NOT EXISTS audit_trail (
     timestamp      TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trail_run ON audit_trail(run_id);
+
+-- synthesis_reports (Gap 2: SynthesisAgent per-cycle dedup and compound metrics)
+-- Persists the statistics from each SynthesisAgent run: how many findings were
+-- deduped, how many compound cross-domain findings were detected, which model
+-- was used, and how long synthesis took.  The API layer reads these to expose
+-- trend data across cycles via GET /api/synthesis-reports/.
+CREATE TABLE IF NOT EXISTS synthesis_reports (
+    id         TEXT        PRIMARY KEY,
+    run_id     TEXT        NOT NULL,
+    cycle      INTEGER     NOT NULL DEFAULT 0,
+    data       JSONB       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (run_id, cycle)
+);
+CREATE INDEX IF NOT EXISTS idx_synthesis_reports_run
+    ON synthesis_reports(run_id);
 """
 
 
@@ -695,6 +711,211 @@ def get_storage(db_path: str = ".stabilizer/brain.db") -> BrainStorage:
     async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list:
         if self._fallback: return await self._fallback.list_audit_trail(run_id, limit)
         return []
+
+    # ── GAP 2: SYNTHESIS AGENT — SynthesisReport and compound findings ─────────
+    #
+    # These four methods are the production-blocking gap identified in the audit:
+    # brain/sqlite_storage.py implements them fully but postgres_storage.py was
+    # missing them entirely, causing SynthesisReport to be silently dropped and
+    # all /api/compound-findings/ and /api/synthesis-reports/ endpoints to return
+    # empty results when running with the production PostgreSQL backend.
+    #
+    # Implementation strategy:
+    #   • When Joern/PG is fully available: execute SQL directly via _execute/_exec
+    #   • When falling back to SQLite: delegate to self._fallback as all other
+    #     methods do — this ensures the methods always work regardless of backend
+    #
+    # The synthesis_reports table uses JSONB data column for schema flexibility:
+    # all SynthesisReport fields are stored as one JSON blob, same pattern as
+    # convergence_records above.  A UNIQUE (run_id, cycle) constraint ensures
+    # idempotency — re-running a cycle overwrites the previous report.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def upsert_synthesis_report(self, report: "SynthesisReport") -> None:  # type: ignore[override]
+        """
+        Gap 2 fix: Persist a SynthesisReport to synthesis_reports.
+
+        Idempotent on (run_id, cycle) — the UNIQUE constraint and ON CONFLICT
+        clause ensure re-running the same cycle overwrites the previous row.
+        Non-fatal: any exception is logged and swallowed so the audit pipeline
+        is never blocked by a metrics write failure.
+        """
+        from brain.schemas import SynthesisReport as _SR
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.upsert_synthesis_report(report)
+            return
+        try:
+            async with AsyncSession(self._engine) as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO synthesis_reports (id, run_id, cycle, data, created_at)
+                        VALUES (:id, :run_id, :cycle, :data::jsonb, NOW())
+                        ON CONFLICT (run_id, cycle) DO UPDATE
+                            SET data       = EXCLUDED.data,
+                                id         = EXCLUDED.id,
+                                created_at = NOW()
+                        """
+                    ),
+                    {
+                        "id":     report.id,
+                        "run_id": report.run_id,
+                        "cycle":  report.cycle,
+                        "data":   report.model_dump_json(),
+                    },
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(f"upsert_synthesis_report failed (non-fatal): {exc}")
+            if self._fallback:
+                await self._fallback.upsert_synthesis_report(report)
+
+    async def get_synthesis_report(
+        self,
+        run_id: str,
+        cycle: int | None = None,
+    ) -> "SynthesisReport | None":  # type: ignore[override]
+        """
+        Gap 2 fix: Retrieve a SynthesisReport from PostgreSQL.
+
+        When cycle is None, returns the report with the highest cycle number
+        for the run (i.e. the most recent pass).  When cycle is provided,
+        returns the report for that exact cycle or None if not found.
+        """
+        from brain.schemas import SynthesisReport as _SR
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.get_synthesis_report(run_id, cycle)
+            return None
+        try:
+            async with AsyncSession(self._engine) as session:
+                if cycle is not None:
+                    result = await session.execute(
+                        text(
+                            "SELECT data FROM synthesis_reports "
+                            "WHERE run_id = :run_id AND cycle = :cycle"
+                        ),
+                        {"run_id": run_id, "cycle": cycle},
+                    )
+                else:
+                    # Latest cycle for this run
+                    result = await session.execute(
+                        text(
+                            "SELECT data FROM synthesis_reports "
+                            "WHERE run_id = :run_id "
+                            "ORDER BY cycle DESC LIMIT 1"
+                        ),
+                        {"run_id": run_id},
+                    )
+                row = result.fetchone()
+            if row is None:
+                return None
+            raw = row[0]
+            return _SR.model_validate_json(
+                raw if isinstance(raw, str) else json.dumps(raw)
+            )
+        except Exception as exc:
+            log.warning(f"get_synthesis_report failed: {exc}")
+            if self._fallback:
+                return await self._fallback.get_synthesis_report(run_id, cycle)
+            return None
+
+    async def list_synthesis_reports(
+        self,
+        run_id: str | None = None,
+    ) -> "list[SynthesisReport]":  # type: ignore[override]
+        """
+        Gap 2 fix: List SynthesisReports, optionally filtered by run_id.
+
+        Returns results ordered by (run_id, cycle) ASC so callers can track
+        quality trends across cycles within a run.  Always returns an empty
+        list (never None) when no records exist.
+        """
+        from brain.schemas import SynthesisReport as _SR
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.list_synthesis_reports(run_id)
+            return []
+        try:
+            async with AsyncSession(self._engine) as session:
+                if run_id:
+                    result = await session.execute(
+                        text(
+                            "SELECT data FROM synthesis_reports "
+                            "WHERE run_id = :run_id "
+                            "ORDER BY run_id, cycle ASC"
+                        ),
+                        {"run_id": run_id},
+                    )
+                else:
+                    result = await session.execute(
+                        text(
+                            "SELECT data FROM synthesis_reports "
+                            "ORDER BY run_id, cycle ASC"
+                        )
+                    )
+                rows = result.fetchall()
+            out: list[_SR] = []
+            for row in rows:
+                try:
+                    raw = row[0]
+                    out.append(_SR.model_validate_json(
+                        raw if isinstance(raw, str) else json.dumps(raw)
+                    ))
+                except Exception as parse_exc:
+                    log.debug(f"list_synthesis_reports: skipping bad row: {parse_exc}")
+            return out
+        except Exception as exc:
+            log.warning(f"list_synthesis_reports failed: {exc}")
+            if self._fallback:
+                return await self._fallback.list_synthesis_reports(run_id)
+            return []
+
+    async def list_compound_findings(
+        self,
+        run_id: str | None = None,
+        severity: str | None = None,
+    ) -> list[Issue]:  # type: ignore[override]
+        """
+        Gap 2 fix: Return Issues with executor_type=SYNTHESIS from PostgreSQL.
+
+        These are the cross-domain compound vulnerabilities created by
+        SynthesisAgent.  They are stored as regular Issues (so they flow
+        through the normal pipeline) but are tagged with executor_type=SYNTHESIS
+        to distinguish them from single-domain auditor findings.
+
+        Optionally filtered by run_id and/or severity string ('CRITICAL', etc.).
+        """
+        if not _PG_AVAILABLE or not self._engine:
+            if self._fallback:
+                return await self._fallback.list_compound_findings(
+                    run_id=run_id, severity=severity
+                )
+            return []
+        try:
+            parts = ["SELECT * FROM issues WHERE executor_type = 'SYNTHESIS'"]
+            params: dict = {}
+            if run_id:
+                parts.append("AND run_id = :run_id")
+                params["run_id"] = run_id
+            if severity:
+                parts.append("AND severity = :severity")
+                params["severity"] = severity.upper()
+            parts.append(
+                "ORDER BY CASE severity "
+                "WHEN 'CRITICAL' THEN 0 WHEN 'MAJOR' THEN 1 "
+                "WHEN 'MINOR' THEN 2 ELSE 3 END, created_at ASC"
+            )
+            rows = await self._exec(" ".join(parts), params)
+            return [self._row_to_issue(r) for r in rows]
+        except Exception as exc:
+            log.warning(f"list_compound_findings failed: {exc}")
+            if self._fallback:
+                return await self._fallback.list_compound_findings(
+                    run_id=run_id, severity=severity
+                )
+            return []
 
     # ── CONVERGENCE ────────────────────────────────────────────────────────────
 
