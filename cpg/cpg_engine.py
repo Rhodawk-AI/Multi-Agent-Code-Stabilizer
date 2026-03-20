@@ -520,6 +520,147 @@ class CPGEngine:
             max_results=max_results,
         )
 
+    async def compute_coupling_smell(
+        self,
+        function_names:          list[str],
+        coupling_module_threshold: int = 5,
+    ) -> dict:
+        """Compute architectural coupling smell for the given function names.
+
+        Gap 3 — Proactive Architectural Smell Detection
+        ------------------------------------------------
+        Wraps ``JoernClient.compute_coupling_score`` with the engine's
+        availability guard so callers never need to check ``is_available``.
+
+        A function whose callers span >= ``coupling_module_threshold`` distinct
+        directory-level modules is structurally over-coupled: no ownership
+        boundary exists between the callers, and patching the function in
+        isolation is unlikely to prevent the same bug class from recurring.
+
+        The fixer calls this BEFORE generating a patch (before even computing
+        blast radius) so that structurally-broken designs with a small call
+        surface — blast_radius_score well below the gate threshold but
+        coupling score at maximum — are escalated to a refactor proposal
+        rather than receiving another locally-correct but globally-blind patch.
+
+        Returns
+        -------
+        dict with keys:
+            distinct_caller_modules (int)
+            coupling_score          (float 0.0–1.0, or -1.0 when unavailable)
+            dominant_caller_module  (str)
+            total_callers           (int)
+            function_name_used      (str)
+            is_smell                (bool)  — True when distinct_caller_modules
+                                             >= coupling_module_threshold
+            coupling_module_threshold (int)
+
+        Returns all zeros / is_smell=False when Joern is unavailable so that
+        the fixer degrades gracefully without losing the primary blast-radius
+        gate.
+        """
+        if not self.is_available or not self._client:
+            return {
+                "distinct_caller_modules":  0,
+                "coupling_score":           -1.0,
+                "dominant_caller_module":   "",
+                "total_callers":            0,
+                "function_name_used":       "",
+                "is_smell":                 False,
+                "coupling_module_threshold": coupling_module_threshold,
+            }
+        try:
+            result = await self._client.compute_coupling_score(
+                function_names=function_names,
+            )
+            result["is_smell"] = (
+                result.get("distinct_caller_modules", 0) >= coupling_module_threshold
+            )
+            result["coupling_module_threshold"] = coupling_module_threshold
+            if result["is_smell"]:
+                log.warning(
+                    f"CPGEngine.compute_coupling_smell: COUPLING SMELL DETECTED "
+                    f"functions={function_names[:3]} "
+                    f"distinct_modules={result['distinct_caller_modules']} "
+                    f">= threshold={coupling_module_threshold} "
+                    f"score={result['coupling_score']:.4f}"
+                )
+            return result
+        except Exception as exc:
+            log.debug(f"CPGEngine.compute_coupling_smell: {exc}")
+            return {
+                "distinct_caller_modules":  0,
+                "coupling_score":           -1.0,
+                "dominant_caller_module":   "",
+                "total_callers":            0,
+                "function_name_used":       "",
+                "is_smell":                 False,
+                "coupling_module_threshold": coupling_module_threshold,
+            }
+
+    async def compute_structural_risk(
+        self,
+        function_names:            list[str],
+        file_paths:                list[str] | None = None,
+        depth:                     int = 3,
+        coupling_module_threshold: int = 5,
+    ) -> dict:
+        """Convenience method: blast radius + coupling smell in one call.
+
+        Gap 3 — Combined Structural Risk Assessment
+        --------------------------------------------
+        The fixer calls this once and decides whether to proceed with a patch
+        or escalate to a refactor proposal based on the combined signal:
+
+          - blast_radius.requires_human_review  → classic blast-radius gate
+          - coupling.is_smell                   → proactive coupling smell gate
+
+        Returns a dict combining both results under keys ``blast`` and
+        ``coupling``, plus a top-level ``requires_refactor`` bool and
+        ``refactor_reason`` string so the fixer can route with a single
+        conditional.
+        """
+        blast   = await self.compute_blast_radius(
+            function_names=function_names,
+            file_paths=file_paths,
+            depth=depth,
+        )
+        coupling = await self.compute_coupling_smell(
+            function_names=function_names,
+            coupling_module_threshold=coupling_module_threshold,
+        )
+
+        reasons: list[str] = []
+        if blast.requires_human_review:
+            reasons.append(
+                f"blast_radius={blast.affected_function_count} functions "
+                f"across {blast.affected_file_count} files "
+                f"(score={blast.blast_radius_score:.4f})"
+            )
+        if coupling["is_smell"]:
+            reasons.append(
+                f"coupling_smell: {coupling['distinct_caller_modules']} distinct "
+                f"caller modules >= threshold={coupling['coupling_module_threshold']} "
+                f"(score={coupling['coupling_score']:.4f}, "
+                f"dominant={coupling['dominant_caller_module']!r})"
+            )
+
+        requires_refactor = blast.requires_human_review or coupling["is_smell"]
+        refactor_reason   = " | ".join(reasons) if reasons else ""
+
+        log.info(
+            f"CPGEngine.compute_structural_risk: requires_refactor={requires_refactor} "
+            f"blast_review={blast.requires_human_review} "
+            f"coupling_smell={coupling['is_smell']} "
+            + (f"reason={refactor_reason}" if refactor_reason else "")
+        )
+        return {
+            "blast":             blast,
+            "coupling":          coupling,
+            "requires_refactor": requires_refactor,
+            "refactor_reason":   refactor_reason,
+        }
+
     async def scan_for_vulnerability_patterns(self, vuln_type: str = "all") -> list[dict]:
         if not self.is_available or not self._client:
             return []

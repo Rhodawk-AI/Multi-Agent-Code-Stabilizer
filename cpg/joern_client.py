@@ -738,6 +738,127 @@ class JoernClient:
                     }
         return list(all_affected.values())
 
+    async def compute_coupling_score(
+        self,
+        function_names: list[str],
+        max_callers:    int = 200,
+    ) -> dict:
+        """Compute an architectural coupling score for the given functions.
+
+        Gap 3 — Proactive Architectural Smell Detection
+        ------------------------------------------------
+        A function whose callers span many distinct, unrelated modules is an
+        architectural coupling smell: it means no ownership boundary exists
+        between those callers, and any change to the function is structurally
+        unsafe regardless of how small the blast radius is in raw function
+        counts.
+
+        Two metrics are returned:
+
+          distinct_caller_modules:
+              Number of unique *directory* prefixes (one level above the file)
+              in the caller set.  A function called from ``auth/``, ``billing/``,
+              ``reporting/``, ``admin/``, and ``notifications/`` has
+              distinct_caller_modules = 5.  If this exceeds the caller's
+              configured ``coupling_module_threshold`` (default 5) the function
+              is structurally over-coupled and a patch is the wrong tool.
+
+          coupling_score:
+              Normalised score in [0.0, 1.0] computed as:
+                min(distinct_caller_modules / 10.0, 1.0)
+              so 10+ distinct modules = maximum coupling score of 1.0.
+
+          dominant_caller_module:
+              The module directory that contributes the most callers (useful
+              for refactor proposal text).
+
+          total_callers:
+              Raw count of callers across all functions in function_names.
+
+          function_name_used:
+              The first function name that returned non-empty results (for
+              debugging).
+
+        Returns a dict with keys:
+            distinct_caller_modules (int)
+            coupling_score          (float, 0.0–1.0)
+            dominant_caller_module  (str)
+            total_callers           (int)
+            function_name_used      (str)
+
+        Returns all zeros with coupling_score=-1.0 when Joern is unavailable.
+        """
+        if not self.is_ready or not function_names:
+            return {
+                "distinct_caller_modules": 0,
+                "coupling_score":          -1.0,
+                "dominant_caller_module":  "",
+                "total_callers":           0,
+                "function_name_used":      "",
+            }
+
+        # Aggregate callers across all supplied function names; take the first
+        # function that returns results for the dominant-module label.
+        all_caller_files: list[str] = []
+        function_name_used = ""
+
+        for fn in function_names[:10]:   # cap to avoid huge Joern round-trips
+            try:
+                q = (
+                    f'cpg.method.name("{_esc(fn)}")'
+                    f'.repeat(_.caller)(_.times(1))'
+                    '.map(m => Map('
+                    '  "callerFile" -> m.filename'
+                    f')).take({max_callers}).l'
+                )
+                raw = await self._query(q)
+                files = [
+                    r.get("callerFile", "")
+                    for r in raw
+                    if isinstance(r, dict) and r.get("callerFile", "")
+                ]
+                if files:
+                    all_caller_files.extend(files)
+                    if not function_name_used:
+                        function_name_used = fn
+            except Exception as exc:
+                log.debug(f"JoernClient.compute_coupling_score({fn}): {exc}")
+
+        if not all_caller_files:
+            return {
+                "distinct_caller_modules": 0,
+                "coupling_score":          0.0,
+                "dominant_caller_module":  "",
+                "total_callers":           0,
+                "function_name_used":      function_name_used,
+            }
+
+        # "Module" = parent directory of the caller file.
+        # e.g. "services/auth/validator.py" → "services/auth"
+        #      "validator.py"               → "."  (root-level file)
+        from pathlib import Path as _P
+        module_counts: dict[str, int] = {}
+        for fp in all_caller_files:
+            parent = str(_P(fp).parent) if "/" in fp or "\\" in fp else "."
+            module_counts[parent] = module_counts.get(parent, 0) + 1
+
+        distinct_modules   = len(module_counts)
+        dominant_module    = max(module_counts, key=module_counts.__getitem__) if module_counts else ""
+        coupling_score     = round(min(distinct_modules / 10.0, 1.0), 4)
+
+        log.info(
+            f"JoernClient.compute_coupling_score: functions={function_names[:3]} "
+            f"distinct_modules={distinct_modules} score={coupling_score:.4f} "
+            f"dominant={dominant_module!r} total_callers={len(all_caller_files)}"
+        )
+        return {
+            "distinct_caller_modules": distinct_modules,
+            "coupling_score":          coupling_score,
+            "dominant_caller_module":  dominant_module,
+            "total_callers":           len(all_caller_files),
+            "function_name_used":      function_name_used,
+        }
+
     async def _query(self, joern_ql: str) -> list[Any]:
         if not self._session:
             raise JoernQueryError("No active session")
