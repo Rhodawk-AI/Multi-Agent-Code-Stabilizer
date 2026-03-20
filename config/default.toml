@@ -124,3 +124,62 @@ high_centrality_multiplier  = 1.20
 # ─── Plugin paths ─────────────────────────────────────────────────────────────
 [plugins]
 paths = []
+
+# ─── Code Property Graph — Gap 1 (Joern integration) ────────────────────────
+#
+# Joern builds a full Code Property Graph (CPG) combining:
+#   • AST  — abstract syntax tree
+#   • CFG  — control flow graph
+#   • PDG  — program dependence graph (data + control flow)
+#
+# The CPG enables three graph types used for causal context selection:
+#   1. Call graph       → which functions CALL the buggy function (depth 1–3)
+#   2. Data flow graph  → which variables and values FLOW INTO the crash site
+#   3. Type flow graph  → which callers VIOLATE the type contract (no null guard)
+#
+# Together these replace vector similarity for context selection in FixerAgent:
+# instead of "code that looks similar", the agent receives "code that CAUSED
+# the bug", including cross-file, cross-service causal chains that embeddings
+# cannot detect.
+#
+# Quick start:
+#   export JOERN_REPO_PATH=/path/to/repo-being-audited
+#   docker-compose up joern
+#   # CPG is built automatically on first run (5–30 min for 10M lines)
+#
+# All settings here map 1-to-1 to StabilizerConfig fields (config/loader.py).
+# They can all be overridden via environment variables (JOERN_URL, etc.).
+[cpg]
+
+# Master switch.  Set false to skip Joern entirely and fall back to the
+# hybrid BM25+dense retrieval path (same quality as before Gap 1).
+enabled                = true
+
+# Joern HTTP server address.  Matches the docker-compose service port.
+# Override with: JOERN_URL=http://joern-host:8080
+joern_url              = "http://localhost:8080"
+
+# Absolute host path of the repository to audit.  The docker-compose.yml
+# mounts this at /repo inside the Joern container (read-only).
+# Override with: JOERN_REPO_PATH=/absolute/path/to/repo
+# Leave blank to default to StabilizerConfig.repo_root.
+joern_repo_path        = ""
+
+# Joern project name.  Re-using the same name across runs avoids a full
+# CPG rebuild — Joern loads the persisted workspace from joern_workspace volume.
+joern_project_name     = "rhodawk"
+
+# Functions in the CPG impact set above this count trigger human review
+# instead of autonomous commit.  Mirrors PlannerAgent.BLAST_RADIUS_HUMAN_THRESHOLD.
+# Increase for large active codebases where many callers are expected.
+blast_radius_threshold = 50
+
+# Maximum number of causal functions included in a single context slice.
+# Higher values give the LLM more context at the cost of more tokens.
+# At 10M lines the relevant slice is typically 20–80 functions.
+max_slice_nodes        = 50
+
+# Maximum number of files from which source lines are loaded per slice.
+# Caps I/O at context-selection time.  Increase for highly modular codebases
+# where a bug spans many small files.
+max_files_in_slice     = 30
