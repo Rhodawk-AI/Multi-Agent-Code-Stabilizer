@@ -116,8 +116,18 @@ CREATE TABLE IF NOT EXISTS file_chunks (
     raw_observations    TEXT DEFAULT '[]',
     token_count         INTEGER DEFAULT 0,
     read_at             TEXT NOT NULL,
+    -- Gap 4 additions: content stored so get_all_observations/get_stale_observations
+    -- can return auditable dicts without re-reading every file from disk.
+    content             TEXT DEFAULT '',
+    function_name       TEXT DEFAULT '',
+    language            TEXT DEFAULT 'unknown',
+    run_id              TEXT DEFAULT '',
     UNIQUE(file_path, chunk_index)
 );
+
+CREATE INDEX IF NOT EXISTS idx_chunks_file      ON file_chunks(file_path);
+CREATE INDEX IF NOT EXISTS idx_chunks_fn        ON file_chunks(function_name);
+CREATE INDEX IF NOT EXISTS idx_chunks_run       ON file_chunks(run_id);
 
 CREATE TABLE IF NOT EXISTS issues (
     id                      TEXT PRIMARY KEY,
@@ -360,6 +370,15 @@ _MIGRATIONS = [
     # Bug 2 fix: persist blast-radius gate state so get_fix() round-trips correctly.
     "ALTER TABLE fix_attempts ADD COLUMN blast_radius_exceeded INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE fix_attempts ADD COLUMN refactor_proposal_id  TEXT    NOT NULL DEFAULT ''",
+
+    # Gap 4 fix: add content, function_name, language, run_id to file_chunks so
+    # get_all_observations / get_stale_observations can serve auditable dicts
+    # without re-reading every source file from disk on every audit cycle.
+    # All four are additive and safe to apply to existing databases.
+    "ALTER TABLE file_chunks ADD COLUMN content       TEXT    DEFAULT ''",
+    "ALTER TABLE file_chunks ADD COLUMN function_name TEXT    DEFAULT ''",
+    "ALTER TABLE file_chunks ADD COLUMN language      TEXT    DEFAULT 'unknown'",
+    "ALTER TABLE file_chunks ADD COLUMN run_id        TEXT    DEFAULT ''",
 ]
 
 
@@ -635,57 +654,188 @@ class SQLiteBrainStorage(BrainStorage):
             """, (summary, _now(), _now(), path))
             await db.commit()
 
-    async def append_chunk(self, chunk: FileChunkRecord) -> None:
+    # ── Chunk persistence (implements BrainStorage abstract contract) ─────────
+    #
+    # The old names append_chunk / get_chunks did not match the ABC and used
+    # the non-existent chunk.chunk_id attribute.  Both are replaced here by
+    # the correct upsert_chunk / list_chunks pair that use chunk.id and also
+    # persist the new content / function_name / language / run_id columns.
+
+    async def upsert_chunk(self, chunk: FileChunkRecord) -> None:
+        """Idempotent upsert on (file_path, chunk_index)."""
         async with self._write() as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO file_chunks
+            await db.execute(
+                """
+                INSERT INTO file_chunks
                     (chunk_id, file_path, chunk_index, total_chunks,
                      line_start, line_end, symbols_defined, symbols_referenced,
-                     dependencies, summary, raw_observations, token_count, read_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                chunk.chunk_id, chunk.file_path,
-                chunk.chunk_index, chunk.total_chunks,
-                chunk.line_start, chunk.line_end,
-                json.dumps(chunk.symbols_defined),
-                json.dumps(chunk.symbols_referenced),
-                json.dumps(chunk.dependencies),
-                chunk.summary,
-                json.dumps(chunk.raw_observations),
-                chunk.token_count,
-                chunk.read_at.isoformat(),
-            ))
-            await db.execute(
-                "UPDATE files SET chunks_read=chunks_read+1, updated_at=? WHERE path=?",
-                (_now(), chunk.file_path),
+                     dependencies, summary, raw_observations, token_count,
+                     read_at, content, function_name, language, run_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(file_path, chunk_index) DO UPDATE SET
+                    chunk_id        = excluded.chunk_id,
+                    total_chunks    = excluded.total_chunks,
+                    line_end        = excluded.line_end,
+                    symbols_defined = excluded.symbols_defined,
+                    symbols_referenced = excluded.symbols_referenced,
+                    dependencies    = excluded.dependencies,
+                    summary         = excluded.summary,
+                    raw_observations = excluded.raw_observations,
+                    token_count     = excluded.token_count,
+                    read_at         = excluded.read_at,
+                    content         = excluded.content,
+                    function_name   = excluded.function_name,
+                    language        = excluded.language,
+                    run_id          = excluded.run_id
+                """,
+                (
+                    chunk.id,
+                    chunk.file_path,
+                    chunk.chunk_index,
+                    chunk.total_chunks,
+                    chunk.line_start,
+                    chunk.line_end,
+                    json.dumps(chunk.symbols_defined),
+                    json.dumps(chunk.symbols_referenced),
+                    json.dumps(chunk.dependencies),
+                    chunk.summary,
+                    json.dumps(chunk.raw_observations),
+                    getattr(chunk, "token_count", 0),
+                    chunk.created_at.isoformat(),
+                    chunk.content,
+                    chunk.function_name,
+                    chunk.language,
+                    chunk.run_id,
+                ),
             )
             await db.commit()
 
-    async def get_chunks(self, file_path: str) -> list[FileChunkRecord]:
+    async def list_chunks(
+        self, file_path: str, run_id: str = ""
+    ) -> list[FileChunkRecord]:
+        """Return all chunks for a file, ordered by chunk_index."""
         async with self._conn() as db:
-            async with db.execute(
-                "SELECT * FROM file_chunks WHERE file_path=? ORDER BY chunk_index",
-                (file_path,),
-            ) as cur:
+            if run_id:
+                sql    = ("SELECT * FROM file_chunks "
+                          "WHERE file_path=? AND run_id=? ORDER BY chunk_index")
+                params: tuple = (file_path, run_id)
+            else:
+                sql    = ("SELECT * FROM file_chunks "
+                          "WHERE file_path=? ORDER BY chunk_index")
+                params = (file_path,)
+            async with db.execute(sql, params) as cur:
                 rows = await cur.fetchall()
-                return [
-                    FileChunkRecord(
-                        chunk_id=r["chunk_id"],
-                        file_path=r["file_path"],
-                        chunk_index=r["chunk_index"],
-                        total_chunks=r["total_chunks"],
-                        line_start=r["line_start"],
-                        line_end=r["line_end"],
-                        symbols_defined=json.loads(r["symbols_defined"]),
-                        symbols_referenced=json.loads(r["symbols_referenced"]),
-                        dependencies=json.loads(r["dependencies"]),
-                        summary=r["summary"],
-                        raw_observations=json.loads(r["raw_observations"]),
-                        token_count=r["token_count"],
-                        read_at=_require_dt(r["read_at"]),
+                return [self._row_to_chunk(r) for r in rows]
+
+    def _row_to_chunk(self, r: "aiosqlite.Row") -> FileChunkRecord:
+        """Convert a file_chunks row to a FileChunkRecord."""
+        return FileChunkRecord(
+            id=r["chunk_id"],
+            file_path=r["file_path"],
+            chunk_index=r["chunk_index"],
+            total_chunks=r["total_chunks"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+            symbols_defined=json.loads(r["symbols_defined"] or "[]"),
+            symbols_referenced=json.loads(r["symbols_referenced"] or "[]"),
+            dependencies=json.loads(r["dependencies"] or "[]"),
+            summary=r["summary"] or "",
+            raw_observations=json.loads(r["raw_observations"] or "[]"),
+            content=r["content"] or "",
+            function_name=r["function_name"] or "",
+            language=r["language"] or "unknown",
+            run_id=r["run_id"] or "",
+        )
+
+    def _row_to_obs_dict(self, r: "aiosqlite.Row") -> dict:
+        """Convert a file_chunks row to the observation dict shape the auditor expects."""
+        return {
+            "file_path":     r["file_path"],
+            "language":      r["language"] or "unknown",
+            "content":       r["content"] or "",
+            "line_start":    r["line_start"],
+            "line_end":      r["line_end"],
+            "function_name": r["function_name"] or "",
+            "dependencies":  json.loads(r["dependencies"] or "[]"),
+            "run_id":        r["run_id"] or "",
+        }
+
+    async def get_all_observations(self) -> list[dict]:
+        """
+        Return every stored chunk as an observation dict for the auditor.
+
+        Implements the BrainStorage abstract method.  Each dict contains the
+        keys the auditor's _audit_chunk() expects:
+            file_path, language, content, line_start, line_end,
+            function_name, dependencies
+        """
+        async with self._conn() as db:
+            try:
+                async with db.execute(
+                    "SELECT * FROM file_chunks ORDER BY file_path, chunk_index"
+                ) as cur:
+                    rows = await cur.fetchall()
+                return [self._row_to_obs_dict(r) for r in rows if r["content"]]
+            except Exception as exc:
+                log.warning("get_all_observations failed: %s", exc)
+                return []
+
+    async def get_stale_observations(self, run_id: str = "") -> list[dict]:
+        """
+        Return only the chunk observation dicts whose function_name appears in
+        the function_staleness table.
+
+        Gap 4 fix: the auditor calls this instead of get_all_observations()
+        during incremental (commit-triggered) audit cycles so that only the
+        CPG-computed impact set is re-audited rather than the whole codebase.
+
+        When run_id is supplied the staleness lookup is scoped to that run.
+        When the staleness table is empty this returns an empty list and the
+        caller must fall back to get_all_observations().
+        """
+        async with self._conn() as db:
+            try:
+                if run_id:
+                    stale_sql = (
+                        "SELECT DISTINCT function_name FROM function_staleness "
+                        "WHERE run_id = ?"
                     )
-                    for r in rows
-                ]
+                    stale_params: tuple = (run_id,)
+                else:
+                    stale_sql    = "SELECT DISTINCT function_name FROM function_staleness"
+                    stale_params = ()
+
+                async with db.execute(stale_sql, stale_params) as cur:
+                    stale_names = {row["function_name"] for row in await cur.fetchall()
+                                   if row["function_name"]}
+
+                if not stale_names:
+                    return []
+
+                # SQLite IN clause: bind one ? per stale function name.
+                placeholders = ",".join("?" * len(stale_names))
+                chunk_sql = (
+                    f"SELECT * FROM file_chunks "
+                    f"WHERE function_name IN ({placeholders}) "
+                    f"ORDER BY file_path, chunk_index"
+                )
+                async with db.execute(chunk_sql, tuple(stale_names)) as cur:
+                    rows = await cur.fetchall()
+
+                return [self._row_to_obs_dict(r) for r in rows if r["content"]]
+            except Exception as exc:
+                log.warning("get_stale_observations failed: %s", exc)
+                return []
+
+    # ── Legacy aliases kept for callers that pre-date the ABC rename ─────────
+
+    async def append_chunk(self, chunk: FileChunkRecord) -> None:
+        """Deprecated alias for upsert_chunk.  Use upsert_chunk instead."""
+        await self.upsert_chunk(chunk)
+
+    async def get_chunks(self, file_path: str) -> list[FileChunkRecord]:
+        """Deprecated alias for list_chunks.  Use list_chunks instead."""
+        return await self.list_chunks(file_path)
 
                                                                                
     async def upsert_issue(self, issue: Issue) -> None:

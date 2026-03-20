@@ -77,6 +77,23 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_all_observations(self) -> list[dict[str, Any]]: ...
 
+    @abstractmethod
+    async def get_stale_observations(self, run_id: str = "") -> list[dict[str, Any]]:
+        """
+        Return the minimal observation dicts needed to re-audit only the
+        functions marked stale by CommitAuditScheduler.
+
+        The returned dicts have the same shape as get_all_observations()
+        ({file_path, language, content, line_start, line_end, function_name,
+        dependencies}) but are scoped to chunks whose function_name appears in
+        the function_staleness table for the given run_id.
+
+        When run_id is empty, all stale marks across all runs are included.
+        When the function_staleness table is empty, returns an empty list —
+        callers must fall back to get_all_observations() in that case.
+        """
+        ...
+
                                                                                  
     @abstractmethod
     async def upsert_issue(self, issue: Issue) -> None: ...

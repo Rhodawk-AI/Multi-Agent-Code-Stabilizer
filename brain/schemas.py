@@ -423,6 +423,11 @@ class FileChunkRecord(BaseModel):
     line_end: int = 0
     language: str = 'unknown'
     strategy: ChunkStrategy = ChunkStrategy.FULL
+    # The actual source text for this chunk.  Populated by chunk_file() and
+    # persisted to the file_chunks table so get_all_observations() and
+    # get_stale_observations() can return auditable dicts without re-reading
+    # every file from disk on every audit cycle.
+    content: str = ''
     summary: str = ''
     symbols_defined: list[str] = Field(default_factory=list)
     symbols_referenced: list[str] = Field(default_factory=list)
