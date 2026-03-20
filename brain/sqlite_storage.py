@@ -157,23 +157,25 @@ CREATE TABLE IF NOT EXISTS issue_fingerprints (
 );
 
 CREATE TABLE IF NOT EXISTS fix_attempts (
-    id                  TEXT PRIMARY KEY,
-    run_id              TEXT DEFAULT '',
-    issue_ids           TEXT NOT NULL DEFAULT '[]',
-    fixed_files         TEXT NOT NULL DEFAULT '[]',
-    reviewer_verdict    TEXT,
-    reviewer_reason     TEXT DEFAULT '',
-    reviewer_confidence REAL DEFAULT 0.0,
-    planner_approved    INTEGER,
-    planner_reason      TEXT DEFAULT '',
-    gate_passed         INTEGER,
-    gate_reason         TEXT DEFAULT '',
-    test_run_id         TEXT,
-    formal_proofs       TEXT DEFAULT '[]',
-    commit_sha          TEXT,
-    pr_url              TEXT,
-    created_at          TEXT NOT NULL,
-    committed_at        TEXT
+    id                    TEXT PRIMARY KEY,
+    run_id                TEXT DEFAULT '',
+    issue_ids             TEXT NOT NULL DEFAULT '[]',
+    fixed_files           TEXT NOT NULL DEFAULT '[]',
+    reviewer_verdict      TEXT,
+    reviewer_reason       TEXT DEFAULT '',
+    reviewer_confidence   REAL DEFAULT 0.0,
+    planner_approved      INTEGER,
+    planner_reason        TEXT DEFAULT '',
+    gate_passed           INTEGER,
+    gate_reason           TEXT DEFAULT '',
+    test_run_id           TEXT,
+    formal_proofs         TEXT DEFAULT '[]',
+    commit_sha            TEXT,
+    pr_url                TEXT,
+    created_at            TEXT NOT NULL,
+    committed_at          TEXT,
+    blast_radius_exceeded INTEGER NOT NULL DEFAULT 0,
+    refactor_proposal_id  TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_fix_run ON fix_attempts(run_id);
@@ -307,6 +309,10 @@ _MIGRATIONS = [
                      
     "ALTER TABLE planner_records ADD COLUMN formal_proof_available INTEGER DEFAULT 0",
     "ALTER TABLE planner_records ADD COLUMN formal_proof_id TEXT DEFAULT ''",
+
+    # Bug 2 fix: persist blast-radius gate state so get_fix() round-trips correctly.
+    "ALTER TABLE fix_attempts ADD COLUMN blast_radius_exceeded INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE fix_attempts ADD COLUMN refactor_proposal_id  TEXT    NOT NULL DEFAULT ''",
 ]
 
 
@@ -801,8 +807,9 @@ class SQLiteBrainStorage(BrainStorage):
                      reviewer_reason, reviewer_confidence, planner_approved,
                      planner_reason, gate_passed, gate_reason,
                      test_run_id, formal_proofs,
-                     commit_sha, pr_url, created_at, committed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     commit_sha, pr_url, created_at, committed_at,
+                     blast_radius_exceeded, refactor_proposal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     reviewer_verdict=excluded.reviewer_verdict,
                     reviewer_reason=excluded.reviewer_reason,
@@ -815,7 +822,9 @@ class SQLiteBrainStorage(BrainStorage):
                     formal_proofs=excluded.formal_proofs,
                     commit_sha=excluded.commit_sha,
                     pr_url=excluded.pr_url,
-                    committed_at=excluded.committed_at
+                    committed_at=excluded.committed_at,
+                    blast_radius_exceeded=excluded.blast_radius_exceeded,
+                    refactor_proposal_id=excluded.refactor_proposal_id
             """, (
                 fix.id, fix.run_id,
                 json.dumps(fix.issue_ids),
@@ -833,6 +842,8 @@ class SQLiteBrainStorage(BrainStorage):
                 fix.pr_url,
                 fix.created_at.isoformat(),
                 fix.committed_at.isoformat() if fix.committed_at else None,
+                int(fix.blast_radius_exceeded),
+                fix.refactor_proposal_id,
             ))
             await db.commit()
 
@@ -876,6 +887,15 @@ class SQLiteBrainStorage(BrainStorage):
         gp_raw      = row["gate_passed"]
         gate_passed: bool | None = None if gp_raw is None else bool(gp_raw)
 
+        # blast_radius_exceeded and refactor_proposal_id were added in the
+        # Bug 2 schema migration.  Use `in keys` guards so the method still
+        # works against pre-migration databases (e.g. test fixtures created
+        # before the ALTER TABLE is applied to an existing SQLite file).
+        blast_radius_exceeded = bool(row["blast_radius_exceeded"]) \
+            if "blast_radius_exceeded" in keys else False
+        refactor_proposal_id = (row["refactor_proposal_id"] or "") \
+            if "refactor_proposal_id" in keys else ""
+
         return FixAttempt(
             id=row["id"],
             run_id=row["run_id"] or "",
@@ -894,6 +914,8 @@ class SQLiteBrainStorage(BrainStorage):
             pr_url=row["pr_url"],
             created_at=_require_dt(row["created_at"]),
             committed_at=_parse_dt(row["committed_at"]),
+            blast_radius_exceeded=blast_radius_exceeded,
+            refactor_proposal_id=refactor_proposal_id,
         )
 
                                                                                 
@@ -1435,6 +1457,10 @@ class SQLiteBrainStorage(BrainStorage):
             recommendation=row["recommendation"] or "",
             escalation_id=row["escalation_id"] or "",
             requires_human_review=bool(row["requires_human_review"]),
+            # Bug 5 fix: restore persisted timestamp instead of defaulting to
+            # now().  Without this, every API response showed the query time
+            # rather than when the proposal was actually created.
+            created_at=_require_dt(row["created_at"]),
         )
     async def upsert_baseline(self, baseline) -> None:
         await self._ensure_baselines_table()

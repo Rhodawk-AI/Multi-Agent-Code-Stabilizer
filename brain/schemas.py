@@ -734,4 +734,12 @@ class ConvergenceRecord(BaseModel):
     score: float = 0.0
     converged: bool = False
     halt_reason: str = ''
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible alias
+# ---------------------------------------------------------------------------
+# Tests and external callers import `Escalation` rather than `EscalationRecord`.
+# The alias keeps those imports working without duplicating the class.
+Escalation = EscalationRecord
     recorded_at: datetime = Field(default_factory=_utcnow)
