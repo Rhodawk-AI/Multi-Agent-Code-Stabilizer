@@ -522,6 +522,11 @@ class FixAttempt(BaseModel):
     pr_url: str = ''
     blast_radius_exceeded: bool = False
     refactor_proposal_id: str = ''
+    # Gap 5: free-form metadata from the BoBN adversarial ensemble
+    # Stores JSON-serialised BoBN scoring fields (candidate_id, composite_score,
+    # test_score, n_candidates, attack_confidence) so the audit trail and API
+    # can surface provenance for every adversarially-selected patch.
+    extra_notes: str = ''
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
