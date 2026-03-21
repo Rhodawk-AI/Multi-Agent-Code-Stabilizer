@@ -122,6 +122,18 @@ def _flatten_toml(raw: dict) -> dict:
         "max_compound_findings": "synthesis_max_compound",
     })
 
+    # Gap 5: [gap5] section — adversarial BoBN ensemble
+    _map(out, raw.get("gap5", {}), {
+        "enabled":                  "gap5_enabled",
+        "vllm_secondary_base_url":  "gap5_vllm_secondary_base_url",
+        "vllm_secondary_model":     "gap5_vllm_secondary_model",
+        "vllm_critic_base_url":     "gap5_vllm_critic_base_url",
+        "vllm_critic_model":        "gap5_vllm_critic_model",
+        "bobn_n_candidates":        "gap5_bobn_n_candidates",
+        "bobn_fixer_a_count":       "gap5_bobn_fixer_a_count",
+        "bobn_fixer_b_count":       "gap5_bobn_fixer_b_count",
+    })
+
     _map(out, raw.get("github", {}), {
         "base_branch":   "base_branch",
         "branch_prefix": "branch_prefix",
@@ -169,6 +181,15 @@ _ENV_MAP: dict[str, tuple[str, str]] = {
     "RHODAWK_SYNTHESIS_ENABLED":  ("synthesis_enabled",           "bool"),
     "RHODAWK_COMPOUND_ENABLED":   ("synthesis_compound_enabled",  "bool"),
     "RHODAWK_SYNTHESIS_MAX":      ("synthesis_max_compound",      "int"),
+    # Gap 5: adversarial BoBN ensemble
+    "RHODAWK_GAP5_ENABLED":       ("gap5_enabled",                "bool"),
+    "VLLM_SECONDARY_BASE_URL":    ("gap5_vllm_secondary_base_url","str"),
+    "VLLM_SECONDARY_MODEL":       ("gap5_vllm_secondary_model",   "str"),
+    "VLLM_CRITIC_BASE_URL":       ("gap5_vllm_critic_base_url",   "str"),
+    "VLLM_CRITIC_MODEL":          ("gap5_vllm_critic_model",      "str"),
+    "RHODAWK_BOBN_CANDIDATES":    ("gap5_bobn_n_candidates",      "int"),
+    "RHODAWK_BOBN_FIXER_A":       ("gap5_bobn_fixer_a_count",     "int"),
+    "RHODAWK_BOBN_FIXER_B":       ("gap5_bobn_fixer_b_count",     "int"),
 }
 
 
