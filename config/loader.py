@@ -139,6 +139,17 @@ def _flatten_toml(raw: dict) -> dict:
         "bobn_fixer_b_count":       "gap5_bobn_fixer_b_count",
     })
 
+    # Gap 6: [gap6] section — federated anonymized pattern store
+    _map(out, raw.get("gap6", {}), {
+        "federation_enabled":  "gap6_federation_enabled",
+        "contribute_patterns": "gap6_contribute_patterns",
+        "receive_patterns":    "gap6_receive_patterns",
+        "registry_url":        "gap6_registry_url",
+        "extra_peer_urls":     "gap6_extra_peer_urls",
+        "instance_id":         "gap6_instance_id",
+        "min_complexity":      "gap6_min_complexity",
+    })
+
     _map(out, raw.get("github", {}), {
         "base_branch":   "base_branch",
         "branch_prefix": "branch_prefix",
@@ -199,6 +210,14 @@ _ENV_MAP: dict[str, tuple[str, str]] = {
     "RHODAWK_BOBN_CANDIDATES":    ("gap5_bobn_n_candidates",      "int"),
     "RHODAWK_BOBN_FIXER_A":       ("gap5_bobn_fixer_a_count",     "int"),
     "RHODAWK_BOBN_FIXER_B":       ("gap5_bobn_fixer_b_count",     "int"),
+    # Gap 6: federated anonymized pattern store
+    "RHODAWK_GAP6_ENABLED":       ("gap6_federation_enabled",     "bool"),
+    "RHODAWK_FED_CONTRIBUTE":     ("gap6_contribute_patterns",    "bool"),
+    "RHODAWK_FED_RECEIVE":        ("gap6_receive_patterns",       "bool"),
+    "RHODAWK_FED_REGISTRY_URL":   ("gap6_registry_url",           "str"),
+    "RHODAWK_FED_PEERS":          ("gap6_extra_peer_urls",        "str"),
+    "RHODAWK_FED_INSTANCE_ID":    ("gap6_instance_id",            "str"),
+    "RHODAWK_FED_MIN_COMPLEXITY": ("gap6_min_complexity",         "float"),
 }
 
 

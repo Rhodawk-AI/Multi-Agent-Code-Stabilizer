@@ -145,3 +145,33 @@ bobn_fixer_b_count       = 2
 critic_weight_test       = 0.6
 critic_weight_robustness = 0.3
 critic_weight_minimality = 0.1
+
+# Gap 6: Federated anonymized fix-pattern store.
+# Patterns are structurally normalized (all identifiers stripped) before
+# leaving this deployment — no source code or proprietary information is
+# transmitted.  Participation is fully opt-in via the flags below.
+#
+# federation_enabled    — master switch.  Off by default; set to true to
+#                         activate the full push/pull federation pipeline.
+# contribute_patterns   — push locally learned patterns to the federation.
+# receive_patterns      — pull patterns from the federation to augment
+#                         local FixMemory retrieval.
+# registry_url          — URL of the hub registry (or primary peer).
+#                         Leave blank for peer-to-peer / local-only mode.
+# extra_peer_urls       — additional peer URLs (comma-separated) for
+#                         hub-and-spoke or mesh topologies.
+# instance_id           — stable opaque ID for this deployment.  Auto-
+#                         generated on first run if left blank.
+# min_complexity        — only push patterns with structural complexity >=
+#                         this threshold (0.0-1.0).  Filters trivial patterns
+#                         that add noise to the registry.
+# data_dir_override     — override the local cache directory.  Defaults to
+#                         <repo_root>/.stabilizer/federation/.
+[gap6]
+federation_enabled   = false
+contribute_patterns  = true
+receive_patterns     = true
+registry_url         = ""
+extra_peer_urls      = ""
+instance_id          = ""
+min_complexity       = 0.15
