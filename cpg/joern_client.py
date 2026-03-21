@@ -14,6 +14,44 @@ _PROJECTS_ENDPOINT   = "/api/v1/projects"
 _DEFAULT_QUERY_TIMEOUT = 120
 _IMPORT_TIMEOUT      = 600
 
+# ── AST-text fallback safety guards ───────────────────────────────────────────
+# The AST-text fallback in get_importing_files() searches the entire CPG for
+# files whose AST contains the symbol name as raw text.  For short or
+# extremely common names this produces massive false-positive sets that flood
+# the blast-radius estimate and make every fix look globally unsafe.
+#
+# Two guards prevent this:
+#
+#   _MIN_FALLBACK_SYMBOL_LEN  — symbols shorter than this are skipped entirely
+#     for the AST fallback.  Single-letter names and 2–3 char abbreviations
+#     (e.g. ``fn``, ``id``, ``db``, ``is``) appear in almost every file and
+#     provide zero signal about import relationships.
+#
+#   _FALLBACK_SKIP_SYMBOLS    — explicit blocklist of names that are both short
+#     and extremely common across codebases.  Even when ≥4 chars, these names
+#     appear in too many unrelated files for the AST match to be meaningful.
+#
+#   _MAX_AST_FALLBACK_RESULTS — cap on results returned by the AST fallback per
+#     symbol.  A result set larger than this almost certainly contains false
+#     positives; we truncate and tag the relationship as "ast_text_reference_capped"
+#     so callers know the results are less reliable.
+_MIN_FALLBACK_SYMBOL_LEN: int = 4
+_MAX_AST_FALLBACK_RESULTS: int = 50
+_FALLBACK_SKIP_SYMBOLS: frozenset[str] = frozenset({
+    # Python builtins and near-universals
+    "run", "get", "set", "list", "dict", "type", "call", "data", "name",
+    "init", "main", "next", "iter", "stop", "open", "read", "load",
+    "save", "send", "recv", "make", "new",  "copy", "move", "free",
+    "size", "keys", "vals", "args", "self", "true", "false", "none",
+    "base", "node", "item", "line", "file", "path", "root", "core",
+    # Common C/C++ identifiers
+    "alloc", "error", "value", "state", "count", "start", "close",
+    "write", "check", "reset", "clear", "flush", "parse", "print",
+    # JavaScript
+    "then", "done", "emit", "bind", "apply", "create", "update",
+    "delete", "insert", "remove", "append", "render",
+})
+
 
 class JoernQueryError(RuntimeError):
     pass
@@ -766,44 +804,80 @@ class JoernClient:
             except Exception as exc:
                 log.debug(f"JoernClient.get_importing_files (dependency pass) for {sym}: {exc}")
 
-            # --- Fallback: file-level endsWith match --------------------------
+            # --- Fallback: file-level AST text match -------------------------
             # When cpg.imports / cpg.dependency return nothing (e.g. a language
             # Joern indexes without an explicit IMPORT layer), fall back to a
-            # broader AST-level code search on the symbol name.  This may produce
-            # false positives for very short names, so it is applied only when
-            # both structured passes returned zero results for this symbol.
+            # broader AST-level code search on the symbol name.
+            #
+            # SAFETY GUARDS — applied before the Joern query to prevent
+            # false-positive floods:
+            #
+            #   1. Length guard: symbols shorter than _MIN_FALLBACK_SYMBOL_LEN
+            #      characters appear in almost every file (e.g. ``id``, ``db``,
+            #      ``fn``) and provide no useful import-relationship signal.
+            #
+            #   2. Common-name blocklist: names in _FALLBACK_SKIP_SYMBOLS are
+            #      too common across all codebases to be meaningful even when
+            #      they exceed the minimum length (e.g. ``run``, ``load``).
+            #
+            #   3. Result cap: more than _MAX_AST_FALLBACK_RESULTS hits almost
+            #      always means the regex matched on something other than the
+            #      actual symbol.  We truncate and tag with a ``_capped`` suffix
+            #      so callers can downweight these results.
             if not any(r["imported_symbol"] == sym for r in results.values()):
-                try:
-                    q_fallback = (
-                        f'cpg.file.where(_.ast.code(".*{_esc(sym)}.*"))' "\n"
-                        ".map(f => Map("
-                        '  "importerFile"   -> f.name,'
-                        f' "importedSymbol" -> "{_esc(sym)}",'
-                        '  "relationship"   -> "ast_text_reference"'
-                        ")).l"
+                # Guard 1 & 2: skip ambiguous symbols entirely
+                if len(sym) < _MIN_FALLBACK_SYMBOL_LEN or sym.lower() in _FALLBACK_SKIP_SYMBOLS:
+                    log.debug(
+                        f"JoernClient.get_importing_files: AST fallback skipped for "
+                        f"{sym!r} (too short or in common-name blocklist)"
                     )
-                    raw = await self._query(q_fallback)
-                    for r in raw:
-                        fp = r.get("importerFile", "")
-                        # Skip the file that DEFINES the symbol — it is not an
-                        # importer of itself.
-                        if fp and fp != "<unknown>":
-                            skip = False
-                            if file_paths:
-                                for src_fp in file_paths:
-                                    if fp.endswith(src_fp) or src_fp.endswith(fp):
-                                        skip = True
-                                        break
-                            if not skip:
-                                key = f"{fp}::{sym}::ast"
-                                if key not in results:
-                                    results[key] = {
-                                        "importer_file":   fp,
-                                        "imported_symbol": sym,
-                                        "relationship":    "ast_text_reference",
-                                    }
-                except Exception as exc:
-                    log.debug(f"JoernClient.get_importing_files (AST fallback) for {sym}: {exc}")
+                else:
+                    try:
+                        q_fallback = (
+                            f'cpg.file.where(_.ast.code(".*{_esc(sym)}.*"))' "\n"
+                            f".take({_MAX_AST_FALLBACK_RESULTS + 1})" "\n"
+                            ".map(f => Map("
+                            '  "importerFile"   -> f.name,'
+                            f' "importedSymbol" -> "{_esc(sym)}",'
+                            '  "relationship"   -> "ast_text_reference"'
+                            ")).l"
+                        )
+                        raw = await self._query(q_fallback)
+
+                        # Guard 3: cap and tag oversized result sets
+                        capped   = len(raw) > _MAX_AST_FALLBACK_RESULTS
+                        raw      = raw[:_MAX_AST_FALLBACK_RESULTS]
+                        rel_tag  = "ast_text_reference_capped" if capped else "ast_text_reference"
+                        if capped:
+                            log.debug(
+                                f"JoernClient.get_importing_files: AST fallback for "
+                                f"{sym!r} exceeded {_MAX_AST_FALLBACK_RESULTS} results — "
+                                f"truncated and tagged '{rel_tag}'"
+                            )
+
+                        for r in raw:
+                            fp = r.get("importerFile", "")
+                            # Skip the file that DEFINES the symbol — it is not an
+                            # importer of itself.
+                            if fp and fp != "<unknown>":
+                                skip = False
+                                if file_paths:
+                                    for src_fp in file_paths:
+                                        if fp.endswith(src_fp) or src_fp.endswith(fp):
+                                            skip = True
+                                            break
+                                if not skip:
+                                    key = f"{fp}::{sym}::ast"
+                                    if key not in results:
+                                        results[key] = {
+                                            "importer_file":   fp,
+                                            "imported_symbol": sym,
+                                            # Use rel_tag so callers know whether
+                                            # the result set was truncated.
+                                            "relationship":    rel_tag,
+                                        }
+                    except Exception as exc:
+                        log.debug(f"JoernClient.get_importing_files (AST fallback) for {sym}: {exc}")
 
         return list(results.values())
 
