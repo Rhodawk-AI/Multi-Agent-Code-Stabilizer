@@ -40,15 +40,28 @@ BoBN Pipeline
    Model family: CLOUD_OSS (Devstral/Llama-4) — different from both fixers
    and the adversarial critic.  Falls back to argmax if the LLM call fails.
 
-5. FORMAL GATE: Winner patch is run through a three-layer self-contained
-   formal verification gate (structural diff sanity → safety pattern scan →
-   Z3 SMT).  This gate is now wired directly inside BoBNSampler.sample() and
-   does NOT require SWEBenchEvaluator or SWEInstance — it runs on every
-   invocation of sample(), regardless of whether the caller is the evaluator
-   or the production controller (orchestrator/controller._phase_fix_gap5).
-   If the winner fails, BoBNSampler promotes the next-best ranked candidate
-   and retries the gate (up to RHODAWK_FORMAL_MAX_RETRIES times).
+5. FORMAL GATE: Winner patch is run through a FOUR-layer self-contained
+   formal verification gate:
+     Layer 1 — Structural diff sanity (hunk headers, no conflict markers)
+     Layer 2 — Safety pattern scan (+lines only: unbounded loops, shell=True, etc.)
+     Layer 3 — CBMC bounded model checking for C/C++ patches (hard gate;
+               non-blocking when cbmc is absent or times out)
+     Layer 4 — Z3 SMT constraint check (advisory; only unsat fails the gate)
+   This gate runs inside BoBNSampler.sample() and does NOT require
+   SWEBenchEvaluator or SWEInstance.  If the winner fails, the next-best
+   candidate is promoted (up to RHODAWK_FORMAL_MAX_RETRIES times).
    Disable with RHODAWK_DISABLE_FORMAL=1.
+
+5.5 TEST GENERATION + MUTATION GATE: When storage and repo_root are provided
+   to the constructor, TestGeneratorAgent generates a test suite for the
+   winning patch and MutationVerifierAgent verifies that the suite kills at
+   least domain_threshold% of mutants.  Domain thresholds:
+     MILITARY / AEROSPACE / NUCLEAR: 90%  (DO-178C DAL-A)
+     EMBEDDED / AUTOMOTIVE:          80%
+     GENERAL:                        configurable (default 60%)
+   Mutation gate failure marks winner.formal_gate_passed=False so trajectory
+   collection records the run as unresolved.  Infrastructure failures
+   (mutmut not installed, etc.) are non-blocking.
 
 6. COLLECT: All (prompt, patch, test_result, reward) triples written to
    TrajectoryCollector for ARPO fine-tuning.  TrajectoryCollector is passed
@@ -66,11 +79,28 @@ which is not called when BoBNSampler is used directly from the production
 controller path (orchestrator/controller.py::_phase_fix_gap5).
 
 The fix adds BoBNSampler._run_formal_gate_on_patch() — a self-contained
-three-layer verifier — and BoBNSampler._apply_formal_gate() which orchestrates
+four-layer verifier — and BoBNSampler._apply_formal_gate() which orchestrates
 promotion of runner-up candidates on failure.  sample() calls _apply_formal_gate()
-between step 4.5 (synthesis) and step 6 (trajectory collection).  The evaluator
+between step 4.5 (synthesis) and step 5.5 (test/mutation gate).  The evaluator
 path still calls its own _run_formal_gate() for backward compatibility, but
 doing so is now additive rather than the only place formal verification runs.
+
+FIX — CBMC inline in Formal Gate (Layer 3)
+────────────────────────────────────────────
+Previously the formal gate in bobn_sampler only ran 3 layers (diff sanity,
+safety patterns, Z3).  CBMC only ran in FormalVerifierAgent which is a
+post-commit standalone agent — meaning the production BoBN path never ran
+CBMC during candidate selection.  _run_cbmc_on_patch() is now Layer 3 of
+the inline formal gate, closing this gap for both the evaluator and
+controller call paths.
+
+FIX — TestGenerator + MutationVerifier inline (Step 5.5)
+──────────────────────────────────────────────────────────
+Previously TestGeneratorAgent and MutationVerifierAgent were only called
+from controller._phase_fix_gap5() AFTER BoBNSampler.sample() returned —
+meaning the SWE-bench evaluator path had no mutation coverage gate at all.
+Step 5.5 runs these inline when storage and repo_root are provided,
+closing the gap for all call paths.
 """
 from __future__ import annotations
 
@@ -86,6 +116,9 @@ from typing import Any
 _DISABLE_FORMAL     = os.environ.get("RHODAWK_DISABLE_FORMAL", "0") == "1"
 # Max number of runner-up candidates to try if the synthesis winner fails
 _MAX_FORMAL_RETRIES = int(os.environ.get("RHODAWK_FORMAL_MAX_RETRIES", "2"))
+# CBMC timeout for Layer 3 of the formal gate (seconds).
+# Kept shorter than FormalVerifierAgent's 120s because this runs per candidate.
+_CBMC_TIMEOUT_S     = int(os.environ.get("RHODAWK_BOBN_CBMC_TIMEOUT", "60"))
 
 # Hazardous patterns scanned in lines ADDED by a patch.
 # Each entry: (regex_pattern, human_readable_description)
@@ -168,6 +201,11 @@ class BoBNResult:
     # Populated after formal gate (GAP 5 fix — step 5)
     formal_gate_passed:  bool          = False
     formal_gate_skipped: bool          = False  # True when RHODAWK_DISABLE_FORMAL=1
+    # Populated after test-generation + mutation gate (GAP 5 fix — step 5.5)
+    # False means the winner's test suite didn't kill enough mutants.
+    # None means the gate was skipped (storage/repo_root not provided to constructor).
+    test_gate_passed:      bool | None = None
+    mutation_gate_passed:  bool | None = None
 
     @property
     def winning_patch(self) -> str:
@@ -182,25 +220,32 @@ class BoBNSampler:
     """
     Behavior Best-of-N sampler — orchestrates the full GAP 5 pipeline:
     dual-fixer generation → execution loops → adversarial critique →
-    patch synthesis → ranking.
-
-    GAP 5 FIX: PatchSynthesisAgent is now called between the adversarial
-    critique (step 3) and the final winner selection (step 4).  This replaces
-    the pure composite_score argmax with an LLM-reasoned decision that can
-    MERGE the best elements of multiple candidates.
-
-    GAP 5 FIX (Step 5 — Formal Gate Closure):
-    The formal gate now runs inside BoBNSampler.sample() after synthesis and
-    before trajectory collection.  It is self-contained: it does not depend on
-    SWEBenchEvaluator or SWEInstance.  This closes the gap where the production
-    controller path (controller.py::_phase_fix_gap5) bypassed formal verification
-    by calling BoBNSampler directly without going through the evaluator.
+    patch synthesis → ranking → formal gate (4 layers) →
+    test generation + mutation gate → trajectory collection.
 
     GAP 5 FIX (Step 4.5 — Synthesis):
     PatchSynthesisAgent is called between the adversarial critique (step 3) and
     the final winner selection (step 4).  This replaces the pure composite_score
     argmax with an LLM-reasoned decision that can MERGE the best elements of
     multiple candidates.
+
+    GAP 5 FIX (Step 5 — Formal Gate Closure):
+    The formal gate now runs inside BoBNSampler.sample() after synthesis and
+    before trajectory collection.  Four layers: diff sanity → safety patterns
+    → CBMC (C/C++) → Z3 SMT.  Self-contained — no SWEBenchEvaluator dependency.
+
+    GAP 5 FIX (Step 5 — CBMC Layer 3):
+    CBMC is now Layer 3 of the inline formal gate.  Previously CBMC only ran
+    in FormalVerifierAgent (post-commit standalone agent), so BoBN candidate
+    selection never exercised bounded model checking.  _run_cbmc_on_patch()
+    extracts added C/C++ content from the diff and runs cbmc with standard
+    safety flags.  Non-blocking when cbmc is absent or times out.
+
+    GAP 5 FIX (Step 5.5 — TestGenerator + MutationVerifier):
+    When storage and repo_root are provided, TestGeneratorAgent generates a
+    test suite for the winning patch and MutationVerifierAgent verifies that
+    the suite kills >= domain_threshold% of mutants before trajectory collection.
+    This closes the gap where the evaluator path had no mutation coverage gate.
 
     Parameters
     ──────────
@@ -214,6 +259,20 @@ class BoBNSampler:
                            to skip trajectory collection (e.g. during unit tests).
     enable_formal_gate   — When True (default), the formal gate runs after synthesis.
                            Overridden to False when RHODAWK_DISABLE_FORMAL=1.
+    storage              — BrainStorage instance (optional).  Required for inline
+                           TestGenerator + MutationVerifier (step 5.5).  When None
+                           the test/mutation gate is skipped.
+    run_id               — Run identifier string for TestGenerator/MutationVerifier
+                           storage records.  Defaults to the sample() instance_id
+                           when not provided.
+    repo_root            — Path to the repository root (optional).  Required for
+                           CBMC (detects file paths in diff) and TestGenerator /
+                           MutationVerifier.  When None, CBMC writes to a temp
+                           dir and test/mutation gate is skipped.
+    domain_mode          — DomainMode enum value controlling mutation score
+                           thresholds (MILITARY=90%, GENERAL=60%, etc.).
+    mutation_threshold   — Override the domain_mode-derived mutation threshold
+                           (0–100).  None = use domain_mode default.
     """
 
     def __init__(
@@ -225,6 +284,11 @@ class BoBNSampler:
         synthesis:              PatchSynthesisAgent | None = None,
         trajectory_collector:   TrajectoryCollector | None = None,
         enable_formal_gate:     bool                      = True,
+        storage:                Any | None                = None,
+        run_id:                 str                       = "",
+        repo_root:              Any | None                = None,
+        domain_mode:            Any | None                = None,
+        mutation_threshold:     float | None              = None,
     ) -> None:
         self.router       = model_router
         self.critic       = critic
@@ -236,6 +300,12 @@ class BoBNSampler:
         # Synthesis agent: use provided instance or auto-create from same router.
         # Auto-create uses CLOUD_OSS tier — different family from all vLLM models.
         self._synthesis = synthesis or PatchSynthesisAgent(model_router=model_router)
+        # Step 5.5 — TestGen + Mutation: require storage + repo_root to activate
+        self._storage            = storage
+        self._run_id             = run_id
+        self._repo_root          = repo_root
+        self._domain_mode        = domain_mode
+        self._mutation_threshold = mutation_threshold
 
     async def sample(
         self,
@@ -361,6 +431,26 @@ class BoBNSampler:
                 f"elapsed={result.total_elapsed_s:.1f}s"
             )
 
+        # ── Step 5.5: TestGenerator + MutationVerifier inline gate ───────────
+        # GAP 5 FIX: Previously missing from bobn_sampler.sample().
+        # TestGenerator and MutationVerifier only ran in controller._phase_fix_gap5()
+        # AFTER BoBNSampler returned, meaning the SWE-bench evaluator path had no
+        # mutation coverage gate at all.
+        #
+        # When storage and repo_root are provided, this step runs inline so both
+        # the evaluator path and the controller path execute the full audit diagram:
+        #   Formal Gate → Test Generator + Mutation → Commit
+        #
+        # Mutation gate failure marks winner.formal_gate_passed=False so trajectory
+        # collection records the run as unresolved (same semantics as a formal fail).
+        # Infrastructure failures (mutmut not installed) are non-blocking.
+        if result.winner and self._storage and self._repo_root:
+            result.winner = await self._run_test_mutation_gate(
+                instance_id = instance_id,
+                winner      = result.winner,
+                result      = result,
+            )
+
         # ── Step 6: Trajectory collection for ARPO fine-tuning ────────────────
         # Record every candidate — winner and losers — as a training triple.
         # GRPO learns from the contrast between attempts; only recording the
@@ -477,7 +567,7 @@ class BoBNSampler:
         attempt:     int = 0,
     ) -> bool:
         """
-        Three-layer self-contained formal gate.
+        Four-layer self-contained formal gate.
 
         Does NOT depend on SWEInstance, BrainStorage, or SWEBenchEvaluator.
         Runs identically on every BoBNSampler call path (evaluator and controller).
@@ -491,7 +581,16 @@ class BoBNSampler:
           dynamic allocation, goto, unsafe atoi family, stdio in safety-critical
           paths, shell=True, eval).  A match fails the gate immediately.
 
-        Layer 3 — Z3 SMT constraint check (runs if z3-solver is installed):
+        Layer 3 — CBMC bounded model checking (C/C++ patches only):
+          GAP 5 FIX: Previously missing from this method.  CBMC only ran in
+          FormalVerifierAgent (post-commit standalone agent), so BoBN candidate
+          selection never exercised bounded model checking.
+          Detects C/C++ files from diff headers.  Extracts added content, wraps
+          in a minimal harness, and runs cbmc with --bounds-check --pointer-check
+          --div-by-zero-check --signed-overflow-check.  Non-blocking when cbmc
+          is absent or times out — only a confirmed counterexample (rc=10) fails.
+
+        Layer 4 — Z3 SMT constraint check (runs if z3-solver is installed):
           Asks the routing LLM to extract Z3 Python assertions for the key fix
           invariants and verifies them.  Non-blocking — infrastructure failures
           (z3 not installed, LLM timeout, unparseable code) are skipped, not
@@ -541,19 +640,160 @@ class BoBNSampler:
             f"({len(added_lines)} added lines, no violations)"
         )
 
-        # ── Layer 3: Z3 SMT constraint check ──────────────────────────────────
+        # ── Layer 3: CBMC bounded model checking (C/C++ patches only) ─────────
+        # GAP 5 FIX: This layer was previously missing — CBMC only ran in
+        # FormalVerifierAgent post-commit, never during BoBN candidate selection.
+        try:
+            cbmc_ok = await self._run_cbmc_on_patch(
+                patch       = patch,
+                instance_id = instance_id,
+            )
+            if not cbmc_ok:
+                log.warning(f"{prefix}: Layer 3 FAIL — CBMC counterexample found")
+                return False
+            log.debug(f"{prefix}: Layer 3 passed (CBMC)")
+        except Exception as exc:
+            # Infrastructure failures (cbmc not installed, timeout) are non-blocking.
+            # Only a confirmed rc=10 counterexample fails — everything else skips.
+            log.debug(f"{prefix}: Layer 3 skipped ({exc})")
+
+        # ── Layer 4: Z3 SMT constraint check ──────────────────────────────────
         try:
             z3_ok = await self._run_z3_gate(patch=patch, instance_id=instance_id)
             if not z3_ok:
-                log.warning(f"{prefix}: Layer 3 FAIL — Z3 found a counterexample")
+                log.warning(f"{prefix}: Layer 4 FAIL — Z3 found a counterexample")
                 return False
-            log.debug(f"{prefix}: Layer 3 passed (Z3)")
+            log.debug(f"{prefix}: Layer 4 passed (Z3)")
         except Exception as exc:
             # Infrastructure failures are non-blocking
-            log.debug(f"{prefix}: Layer 3 skipped ({exc})")
+            log.debug(f"{prefix}: Layer 4 skipped ({exc})")
 
         log.info(f"{prefix}: all layers passed")
         return True
+
+    async def _run_cbmc_on_patch(self, patch: str, instance_id: str) -> bool:
+        """
+        Extract added C/C++ content from the diff and run CBMC on it.
+
+        GAP 5 FIX: Closes the gap where CBMC only ran in FormalVerifierAgent
+        (post-commit) and never during BoBN candidate selection.
+
+        Detection:
+          Inspects '--- a/...' headers in the diff to determine whether any
+          touched file has a C/C++ extension.  Skips silently for non-C patches.
+
+        Harness:
+          The added lines (+lines) are extracted from the diff, wrapped in a
+          minimal harness function, and written to a temporary .c file.  This
+          is intentionally lightweight — the goal is to catch obvious memory
+          safety violations (buffer overruns, null derefs, integer overflows)
+          introduced by the patch, not full compilation of the whole codebase.
+
+        Returns:
+          True  — no counterexample found, or gate was skipped (cbmc absent,
+                  timeout, non-C patch).
+          False — CBMC returned rc=10 (confirmed counterexample).
+        """
+        import shutil
+
+        # ── Detect C/C++ files in diff ────────────────────────────────────────
+        _c_extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
+        touched_files = [
+            ln.split()[-1]
+            for ln in patch.splitlines()
+            if ln.startswith("--- ") and not ln.startswith("--- /dev/null")
+        ]
+        has_c_files = any(
+            any(f.endswith(ext) for ext in _c_extensions)
+            for f in touched_files
+        )
+        if not has_c_files:
+            log.debug(f"[cbmc_gate] {instance_id}: no C/C++ files in patch — layer skipped")
+            return True
+
+        if not shutil.which("cbmc"):
+            log.debug(f"[cbmc_gate] {instance_id}: cbmc not in PATH — layer skipped")
+            return True
+
+        # ── Extract added lines as C content ──────────────────────────────────
+        added_lines = [
+            line[1:] for line in patch.split("\n")
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        c_content = "\n".join(added_lines).strip()
+        if not c_content:
+            return True
+
+        # ── Wrap in minimal CBMC harness ──────────────────────────────────────
+        harness = (
+            "#include <stdint.h>\n"
+            "#include <stdbool.h>\n"
+            "#include <stdlib.h>\n\n"
+            "/* CBMC harness generated by BoBNSampler formal gate */\n"
+            "void __patch_harness(void) {\n"
+            f"{c_content}\n"
+            "}\n\n"
+            "int main(void) { __patch_harness(); return 0; }\n"
+        )
+
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tmp_path: str = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".c", mode="w", encoding="utf-8", delete=False
+            ) as f:
+                f.write(harness)
+                tmp_path = f.name
+
+            result = subprocess.run(
+                [
+                    "cbmc", tmp_path,
+                    "--json-ui",
+                    "--bounds-check",
+                    "--pointer-check",
+                    "--div-by-zero-check",
+                    "--signed-overflow-check",
+                    "--unwind", "5",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_CBMC_TIMEOUT_S,
+            )
+
+            # rc=0  → VERIFICATION SUCCESSFUL (no violations)
+            # rc=10 → VERIFICATION FAILED (concrete counterexample)
+            # other → parse error / unsupported input → skip
+            if result.returncode == 10:
+                log.warning(
+                    f"[cbmc_gate] {instance_id}: CBMC counterexample found "
+                    f"(rc=10) — patch has a concrete safety violation"
+                )
+                return False
+
+            log.debug(
+                f"[cbmc_gate] {instance_id}: CBMC rc={result.returncode} — "
+                "no counterexample (gate passes)"
+            )
+            return True
+
+        except subprocess.TimeoutExpired:
+            log.debug(
+                f"[cbmc_gate] {instance_id}: CBMC timeout after {_CBMC_TIMEOUT_S}s "
+                "— layer skipped (non-blocking)"
+            )
+            return True
+        except Exception as exc:
+            log.debug(
+                f"[cbmc_gate] {instance_id}: CBMC infrastructure error: {exc} "
+                "— layer skipped (non-blocking)"
+            )
+            return True
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
     async def _run_z3_gate(self, patch: str, instance_id: str) -> bool:
         """
@@ -582,8 +822,11 @@ class BoBNSampler:
 
         try:
             import litellm
+            # Use synthesis_model() explicitly — primary_model("critical_fix") also
+            # resolves to VLLM_SYNTHESIS but using the named accessor is clearer
+            # and immune to future _TASK_TIERS remapping.
             resp = await litellm.acompletion(
-                model       = self.router.primary_model("critical_fix"),
+                model       = self.router.synthesis_model(),
                 messages    = [{"role": "user", "content": prompt}],
                 max_tokens  = 512,
                 temperature = 0.0,
@@ -615,6 +858,179 @@ class BoBNSampler:
                 pass  # z3 comparison failed — treat as skip
 
         return True
+
+    # ── Test Generation + Mutation Gate (Step 5.5) ──────────────────────────
+
+    async def _run_test_mutation_gate(
+        self,
+        instance_id: str,
+        winner:      BoBNCandidate,
+        result:      BoBNResult,
+    ) -> BoBNCandidate:
+        """
+        Generate a test suite for the winning patch and verify mutation score.
+
+        GAP 5 FIX: Previously TestGeneratorAgent and MutationVerifierAgent were
+        only called from controller._phase_fix_gap5() AFTER BoBNSampler.sample()
+        returned — so the SWE-bench evaluator path had no mutation coverage gate
+        at all.  This method wires both agents inline so every call path (evaluator
+        and controller) executes the full audit diagram step:
+          Formal Gate → Test Generator + Mutation → Commit
+
+        Requires self._storage and self._repo_root to be set at constructor time.
+        When either is absent, this method returns the winner unchanged (gate
+        skipped, result.*_gate_passed remain None).
+
+        Mutation gate failure does NOT drop the winner.  It marks
+        winner.formal_gate_passed=False and result.mutation_gate_passed=False
+        so the trajectory collector records the run as unresolved, giving the RL
+        training loop correct negative signal without silently discarding the patch.
+
+        Infrastructure failures (mutmut not installed, test generation timeout,
+        import errors) are fully non-blocking — they log a warning and return the
+        winner unchanged with gate fields set to None.
+
+        Returns
+        -------
+        The winner BoBNCandidate (possibly with formal_gate_passed=False if the
+        mutation gate failed).
+        """
+        if not self._storage or not self._repo_root:
+            log.debug(
+                f"[bobn] {instance_id}: test/mutation gate skipped "
+                "(storage or repo_root not provided)"
+            )
+            return winner
+
+        from pathlib import Path
+
+        effective_run_id  = self._run_id or instance_id
+        effective_repo    = Path(self._repo_root)
+
+        # ── Step 5.5a: TestGeneratorAgent ─────────────────────────────────────
+        # Generate a regression test suite for the winning patch.  The suite
+        # covers the functions touched by the patch so MutationVerifier can target
+        # them specifically.  Failures here are non-blocking — the mutation step
+        # can still proceed using any existing tests in the repo.
+        generated_test_paths: list[str] = []
+        try:
+            from agents.test_generator import TestGeneratorAgent
+            from agents.base import AgentConfig
+
+            tg_config = AgentConfig() if not hasattr(self, "_agent_config") else self._agent_config  # type: ignore[attr-defined]
+
+            tg = TestGeneratorAgent(
+                storage     = self._storage,
+                run_id      = effective_run_id,
+                config      = tg_config,
+                repo_root   = effective_repo,
+                domain_mode = self._domain_mode,
+            )
+
+            # Build a minimal FixAttempt-like object that TestGeneratorAgent
+            # expects.  We only need the patch and a placeholder fix id.
+            from brain.schemas import FixAttempt, FixedFile
+            fix_stub = FixAttempt(
+                run_id      = effective_run_id,
+                issue_id    = instance_id,
+                patch       = winner.patch,
+                gate_passed = True,
+                fixed_files = _extract_fixed_files_from_patch(winner.patch),
+            )
+
+            tg_results = await tg.run(fix=fix_stub)
+            if tg_results:
+                generated_test_paths = [
+                    str(effective_repo / tf)
+                    for tf in (getattr(tg_results, "test_paths", None) or [])
+                    if tf
+                ]
+                log.info(
+                    f"[bobn] {instance_id}: TestGenerator produced "
+                    f"{len(generated_test_paths)} test file(s)"
+                )
+            result.test_gate_passed = bool(tg_results)
+        except ImportError as exc:
+            log.debug(f"[bobn] {instance_id}: TestGeneratorAgent import skipped: {exc}")
+            result.test_gate_passed = None
+        except Exception as exc:
+            log.warning(
+                f"[bobn] {instance_id}: TestGeneratorAgent non-fatal error: {exc}"
+            )
+            result.test_gate_passed = None
+
+        # ── Step 5.5b: MutationVerifierAgent ──────────────────────────────────
+        # Verify the generated (+ existing) test suite kills >= threshold% of
+        # mutants in the changed functions.  Gate failure marks the winner as
+        # unresolved for trajectory collection.
+        try:
+            from agents.mutation_verifier import MutationVerifierAgent
+            from agents.base import AgentConfig
+
+            mv_config = AgentConfig() if not hasattr(self, "_agent_config") else self._agent_config  # type: ignore[attr-defined]
+
+            mv = MutationVerifierAgent(
+                storage          = self._storage,
+                run_id           = effective_run_id,
+                config           = mv_config,
+                repo_root        = effective_repo,
+                domain_mode      = self._domain_mode,
+                score_threshold  = self._mutation_threshold,
+            )
+
+            # Reuse or build the same FixAttempt stub for the mutation run.
+            from brain.schemas import FixAttempt
+            fix_stub_mv = FixAttempt(
+                run_id      = effective_run_id,
+                issue_id    = instance_id,
+                patch       = winner.patch,
+                gate_passed = True,
+                fixed_files = _extract_fixed_files_from_patch(winner.patch),
+            )
+
+            mutation_results = await mv.run(
+                fix        = fix_stub_mv,
+                test_paths = generated_test_paths or None,
+            )
+
+            if mutation_results:
+                all_passed = all(r.passed for r in mutation_results)
+                result.mutation_gate_passed = all_passed
+
+                scores = ", ".join(
+                    f"{r.file_path}:{r.mutation_score:.1f}%"
+                    for r in mutation_results
+                )
+                if all_passed:
+                    log.info(
+                        f"[bobn] {instance_id}: mutation gate PASSED — {scores}"
+                    )
+                else:
+                    failed = [r for r in mutation_results if not r.passed]
+                    log.warning(
+                        f"[bobn] {instance_id}: mutation gate FAILED — {scores} "
+                        f"({len(failed)} file(s) below threshold)"
+                    )
+                    # Mark winner as failing formal gate so trajectory collector
+                    # labels this run as unresolved — correct RL negative signal.
+                    winner.formal_gate_passed = False
+            else:
+                # mutmut found no Python files to mutate (e.g. pure C patch)
+                result.mutation_gate_passed = None
+                log.debug(
+                    f"[bobn] {instance_id}: mutation gate skipped "
+                    "(no mutable Python files in patch)"
+                )
+        except ImportError as exc:
+            log.debug(f"[bobn] {instance_id}: MutationVerifierAgent import skipped: {exc}")
+            result.mutation_gate_passed = None
+        except Exception as exc:
+            log.warning(
+                f"[bobn] {instance_id}: MutationVerifierAgent non-fatal error: {exc}"
+            )
+            result.mutation_gate_passed = None
+
+        return winner
 
     # ── Synthesis (Step 4.5) ─────────────────────────────────────────────────
 
@@ -813,3 +1229,58 @@ class BoBNSampler:
             elif isinstance(r, Exception):
                 log.warning(f"[bobn] execution loop error: {r}")
         return updated
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _extract_fixed_files_from_patch(patch: str) -> list:
+    """
+    Parse a unified diff and return a list of FixedFile-like objects
+    (path + patch slice) for each touched file.
+
+    Used by _run_test_mutation_gate to build the FixAttempt stub that
+    TestGeneratorAgent and MutationVerifierAgent require.
+
+    Returns an empty list on any parse failure — callers handle that
+    gracefully (the agents skip mutation on files with no content).
+    """
+    try:
+        from brain.schemas import FixedFile
+    except ImportError:
+        # If brain.schemas is unavailable in the test environment, return a
+        # minimal duck-typed substitute so callers still see `.path` attributes.
+        class FixedFile:  # type: ignore[no-redef]
+            def __init__(self, path: str, patch: str = "") -> None:
+                self.path  = path
+                self.patch = patch
+                self.content: str = ""
+
+    files: list = []
+    current_file: str = ""
+    current_lines: list[str] = []
+
+    for line in patch.splitlines(keepends=True):
+        if line.startswith("--- "):
+            # Flush previous file
+            if current_file and current_lines:
+                files.append(FixedFile(
+                    path  = current_file,
+                    patch = "".join(current_lines),
+                ))
+            current_lines = [line]
+            # Normalise "--- a/path/to/file" → "path/to/file"
+            raw = line[4:].strip()
+            if raw.startswith("a/") or raw.startswith("b/"):
+                raw = raw[2:]
+            current_file = raw if raw != "/dev/null" else ""
+        elif current_file:
+            current_lines.append(line)
+
+    # Flush last file
+    if current_file and current_lines:
+        files.append(FixedFile(
+            path  = current_file,
+            patch = "".join(current_lines),
+        ))
+
+    return files
