@@ -139,9 +139,15 @@ class SynthesisAgent(BaseAgent):
     _DEDUP_BATCH_SIZE: int = 60
 
     # Minimum number of issues from ≥2 different domains required before
-    # attempting compound finding detection.  Below this threshold the
-    # cross-domain analysis adds noise, not signal.
-    _COMPOUND_MIN_CROSS_DOMAIN_ISSUES: int = 3
+    # attempting compound finding detection.
+    #
+    # BUG FIX: was 3, which silently skipped the canonical two-issue compound
+    # case — one SECURITY finding + one ARCHITECTURE finding — that the gap
+    # spec explicitly demonstrates (auth_bypass + async_handler race =
+    # privilege escalation).  Exactly 2 issues from 2 distinct domains is the
+    # minimum meaningful cross-domain signal; anything lower is impossible
+    # (the ``len(domains_present) < 2`` guard above already enforces ≥2 domains).
+    _COMPOUND_MIN_CROSS_DOMAIN_ISSUES: int = 2
 
     def __init__(
         self,
