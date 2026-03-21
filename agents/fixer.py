@@ -30,6 +30,30 @@ _RECURRENCE_ESCALATION_THRESHOLD = 3
 # not fix the structural cause.
 _COUPLING_MODULE_THRESHOLD = 5
 
+# ── Bug-class normalisation for recurrence matching ──────────────────────────
+# The recurrence gate in _check_bug_recurrence() queries fix_memory using the
+# raw issue description as the lookup key.  Without normalisation, two instances
+# of the same structural bug class at different line numbers produce different
+# keys ("null dereference in process_payment at line 47" vs. "…at line 52") and
+# the recurrence counter never exceeds 1, silently preventing the gate from
+# ever firing.
+#
+# _normalize_bug_class() strips all location-specific noise from a description
+# so that the same structural defect maps to the same memory key regardless of
+# which line it was found on or which exact variable name appeared.
+import re as _re_mod
+
+_NORM_LINE_PATTERNS = [
+    # "at line 47", "at line N", "on line 52"
+    _re_mod.compile(r'\bat (line|col|column)\s+\d+\b', _re_mod.IGNORECASE),
+    # ":47", "L47", "L 47" — standalone location suffixes
+    _re_mod.compile(r'(?<!\w)(?:L\s*)?\d{1,6}(?!\w)'),
+    # file path prefixes: "services/auth/validator.py:" or "/abs/path:"
+    _re_mod.compile(r'(?:[a-zA-Z0-9_.\-/\\]+\.(?:py|c|cpp|h|hpp|js|ts|go|rs|java))\s*:?\s*'),
+    # "in function foo_bar" — function names are structural noise for the class key
+    _re_mod.compile(r'\bin (?:function|method|class)\s+\w+', _re_mod.IGNORECASE),
+]
+
 class FixedFileFullResponse(BaseModel):
     path: str
     content: str = Field(description='COMPLETE corrected file content')
@@ -72,6 +96,45 @@ class FixerAgent(BaseAgent):
         self.program_slicer = program_slicer
         self.escalation_manager = escalation_manager
         self.blast_radius_threshold = blast_radius_threshold
+
+    @staticmethod
+    def _normalize_bug_class(description: str) -> str:
+        """Return a location-stripped, lowercased bug-class key for fix_memory.
+
+        WHY THIS EXISTS
+        ---------------
+        fix_memory.retrieve() uses embedding similarity against stored
+        ``issue_type`` keys.  When we store the raw description as the key
+        ("null dereference in process_payment at line 47") and then query with
+        a slightly different description ("null dereference in process_payment
+        at line 52"), the embedding similarity is high but not 1.0 — and,
+        more importantly, when the query comes from a completely different call
+        site in the same function after a refactor, the line number changes and
+        even the function name may differ.
+
+        By stripping all location-specific tokens before storing AND before
+        querying, we ensure that the same structural defect class ("null
+        dereference in process_payment") always produces an identical or
+        near-identical key regardless of where it manifests in the file, what
+        variable name appeared, or which exact line number was reported.
+
+        Transformations applied (in order):
+          1. Strip file-path prefixes (``services/foo.py:``)
+          2. Strip "at/on line N" phrases
+          3. Strip bare numbers (line numbers, offsets)
+          4. Strip "in function/method/class <name>" phrases
+          5. Lowercase and collapse whitespace
+
+        The result is a short structural description like
+        "null dereference process_payment" that is stable across re-audits.
+        """
+        text = description[:200]           # cap to avoid giant embeddings
+        for pat in _NORM_LINE_PATTERNS:
+            text = pat.sub(" ", text)
+        # Collapse runs of whitespace and strip
+        text = _re_mod.sub(r'\s+', ' ', text).strip().lower()
+        # Keep only the first 80 chars — this is a memory key, not a full desc
+        return text[:80]
 
     async def run(self, **kwargs: Any) -> list[FixAttempt]:
         issues = await self.storage.list_issues(run_id=self.run_id, status=IssueStatus.APPROVED.value)
@@ -344,7 +407,17 @@ class FixerAgent(BaseAgent):
         # ── Signal 1: recurrence check ────────────────────────────────────────
         if self.fix_memory:
             try:
-                query = ' '.join(i.description[:100] for i in issues[:3])
+                # CORRECTNESS FIX: normalise the description before using it
+                # as the fix_memory query key.  Without normalisation, the same
+                # structural bug at different line numbers produces a different
+                # embedding key each time ("null dereference … at line 47" ≠
+                # "null dereference … at line 52"), so the recurrence counter
+                # never exceeds 1 and this gate silently never fires.
+                # _normalize_bug_class() strips line numbers, file-path prefixes,
+                # and other location-specific noise so every instance of the same
+                # structural class maps to the same (or near-identical) key.
+                raw_query = ' '.join(i.description[:100] for i in issues[:3])
+                query = self._normalize_bug_class(raw_query)
                 # Retrieve a generous set so we can count without trimming.
                 entries = self.fix_memory.retrieve(
                     query, n=20, max_age_days=window_days
@@ -599,11 +672,11 @@ class FixerAgent(BaseAgent):
         if not self.fix_memory:
             return ''
         try:
-            query = ' '.join((i.description[:100] for i in issues[:3]))
-            # Gap 3 Defect 3 fix: pass max_age_days=180 so reverts from years
-            # ago are excluded.  The retrieve() signature accepts max_age_days;
-            # callers that omitted it got the default but without the explicit
-            # call the intent was invisible and could change accidentally.
+            raw_query = ' '.join((i.description[:100] for i in issues[:3]))
+            # Normalise for the same reason as _check_bug_recurrence — ensures
+            # the few-shot examples retrieved match the structural class of the
+            # current issue, not just the exact description text at one line number.
+            query = self._normalize_bug_class(raw_query)
             entries = self.fix_memory.retrieve(query, n=3, max_age_days=180)
             return self.fix_memory.format_as_few_shot(entries)
         except Exception as exc:
@@ -614,7 +687,10 @@ class FixerAgent(BaseAgent):
         if not self.fix_memory:
             return
         try:
-            issue_type = issues[0].description[:80] if issues else 'unknown'
+            # Normalise the issue_type key so the recurrence gate finds this
+            # entry when the same bug manifests at a different line next time.
+            raw_type  = issues[0].description[:80] if issues else 'unknown'
+            issue_type = self._normalize_bug_class(raw_type)
             file_context = ', '.join((ff.path for ff in fixed_files[:3]))
             fix_approach = '; '.join((ff.diff_summary[:60] for ff in fixed_files[:3] if ff.diff_summary))
             self.fix_memory.store_success(issue_type=issue_type, file_context=file_context, fix_approach=fix_approach, test_result='gate_passed=True', run_id=self.run_id)
@@ -633,7 +709,8 @@ class FixerAgent(BaseAgent):
         if not self.fix_memory:
             return
         try:
-            issue_type = issues[0].description[:80] if issues else 'unknown'
+            raw_type   = issues[0].description[:80] if issues else 'unknown'
+            issue_type = self._normalize_bug_class(raw_type)
             file_context = ', '.join(file_paths[:3])
             # Extract a readable approach summary from the last generated result.
             if isinstance(last_result, PatchResponse) and last_result.patched_files:
