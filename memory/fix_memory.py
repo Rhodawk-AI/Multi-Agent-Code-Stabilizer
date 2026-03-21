@@ -57,6 +57,7 @@ Public API
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -100,17 +101,24 @@ class FixMemory:
 
     def __init__(
         self,
-        repo_url:   str  = "",
-        qdrant_url: str  = "http://localhost:6333",
-        data_dir:   Path | str | None = None,
+        repo_url:          str              = "",
+        qdrant_url:        str              = "http://localhost:6333",
+        data_dir:          Path | str | None = None,
+        federated_store:   Any              = None,   # FederatedPatternStore | None
+        language:          str              = "python",
     ) -> None:
-        self.repo_url   = repo_url
-        self.qdrant_url = qdrant_url
-        self.data_dir   = Path(data_dir) if data_dir else None
-        self._user_id   = self._make_user_id(repo_url)
-        self._client: Any     = None  # mem0.Memory or qdrant_client
-        self._backend:  str   = "none"
+        self.repo_url          = repo_url
+        self.qdrant_url        = qdrant_url
+        self.data_dir          = Path(data_dir) if data_dir else None
+        self._user_id          = self._make_user_id(repo_url)
+        self._client: Any      = None  # mem0.Memory or qdrant_client
+        self._backend:  str    = "none"
         self._json_path: Path | None = None
+        # GAP 6: federated pattern store (optional)
+        self._federated_store: Any = federated_store
+        self._language:        str = language
+        # Lazy-loaded normalizer (only when federation is active)
+        self._normalizer: Any  = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -202,6 +210,13 @@ class FixMemory:
         except Exception as exc:
             log.warning(f"FixMemory.store_success: {exc}")
 
+        # GAP 6: push anonymized structural pattern to federation (fire-and-forget)
+        if self._federated_store is not None:
+            self._schedule_federation_push(
+                fix_approach=fix_approach,
+                issue_type=issue_type,
+            )
+
     def store_failure(
         self,
         issue_type:   str,
@@ -289,10 +304,164 @@ class FixMemory:
             # as a plain int config field where 0 conventionally means "off".
             if max_age_days is not None and max_age_days > 0:
                 entries = self._filter_by_age(entries, max_age_days)
+
+            # GAP 6: augment local results with federated patterns
+            fed_entries = self._retrieve_federated(issue_description, n)
+            if fed_entries:
+                # Merge without duplicating structurally identical approaches
+                local_approaches = {e.fix_approach.lower() for e in entries}
+                for fe in fed_entries:
+                    if fe.fix_approach.lower() not in local_approaches:
+                        entries.append(fe)
+                        local_approaches.add(fe.fix_approach.lower())
+
             return entries[:n]
         except Exception as exc:
             log.debug(f"FixMemory.retrieve: {exc}")
         return []
+
+    # ── GAP 6: Federation helpers ─────────────────────────────────────────────
+
+    def _get_normalizer(self) -> Any:
+        """Lazy-load PatternNormalizer only when federation is active."""
+        if self._normalizer is None:
+            try:
+                from memory.pattern_normalizer import PatternNormalizer
+                self._normalizer = PatternNormalizer()
+            except Exception as exc:
+                log.debug(f"FixMemory: PatternNormalizer unavailable ({exc})")
+        return self._normalizer
+
+    def _schedule_federation_push(
+        self,
+        fix_approach: str,
+        issue_type:   str,
+    ) -> None:
+        """
+        Fire-and-forget coroutine to push a normalized pattern to the
+        federation.  Never blocks the caller.
+
+        Called from store_success() after local persistence succeeds.
+        Failures are caught and logged — they must never raise to the caller.
+        """
+        normalizer = self._get_normalizer()
+        if normalizer is None:
+            return
+
+        async def _push() -> None:
+            try:
+                result = normalizer.normalize(
+                    fix_approach=fix_approach,
+                    issue_type=issue_type,
+                    language=self._language,
+                )
+                if not result.normalization_ok:
+                    log.debug(
+                        f"FixMemory.federation_push: normalization failed "
+                        f"({result.error}) — skipping push"
+                    )
+                    return
+                await self._federated_store.push_pattern(
+                    fingerprint      = result.fingerprint,
+                    normalized_text  = result.normalized_text,
+                    issue_type       = issue_type,
+                    language         = result.language,
+                    complexity_score = result.complexity_score,
+                )
+                log.debug(
+                    f"FixMemory.federation_push: pushed fingerprint="
+                    f"{result.fingerprint[:16]}... issue={issue_type}"
+                )
+            except Exception as exc:
+                log.debug(f"FixMemory.federation_push: {exc}")
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_push())
+            else:
+                loop.run_until_complete(_push())
+        except RuntimeError:
+            # No event loop available (e.g. in sync test context) — skip
+            log.debug("FixMemory.federation_push: no event loop — skipping")
+
+    def _retrieve_federated(
+        self,
+        issue_description: str,
+        n:                 int,
+    ) -> list[FixMemoryEntry]:
+        """
+        Synchronous wrapper around the async federated pull.
+
+        Returns empty list if:
+        • No federated store is configured
+        • Federation is disabled (receive=False)
+        • Event loop is unavailable (defensive)
+        """
+        if self._federated_store is None:
+            return []
+        if not getattr(self._federated_store, "receive", False):
+            return []
+
+        async def _pull() -> list:
+            try:
+                # Extract a compact issue_type label from description
+                # (first word / CWE / category keyword)
+                issue_type_hint = issue_description.split()[0].lower()[:32] \
+                    if issue_description else ""
+                patterns = await self._federated_store.pull_patterns(
+                    issue_type  = issue_type_hint,
+                    query_text  = issue_description[:300],
+                    n           = n,
+                )
+                return patterns
+            except Exception as exc:
+                log.debug(f"FixMemory._retrieve_federated: {exc}")
+                return []
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Can't run nested event loops — schedule and immediately cancel
+                # the coroutine; return empty (federation augmentation is best-effort)
+                log.debug(
+                    "FixMemory._retrieve_federated: called from async context "
+                    "— federation augmentation deferred (best-effort)"
+                )
+                return []
+            patterns = loop.run_until_complete(_pull())
+        except RuntimeError:
+            return []
+
+        # Convert FederatedPattern → FixMemoryEntry (structural translation)
+        entries: list[FixMemoryEntry] = []
+        for p in patterns:
+            entries.append(FixMemoryEntry(
+                id           = p.fingerprint[:16],
+                issue_type   = p.issue_type,
+                file_context = f"[federated/{p.language}] {p.source_instance[:8]}",
+                fix_approach = (
+                    f"[FEDERATED] {p.normalized_text[:400]}"
+                    if p.normalized_text else ""
+                ),
+                test_result  = (
+                    f"federated success_rate="
+                    f"{p.success_count}/{max(p.use_count, 1)} "
+                    f"complexity={p.complexity_score:.2f}"
+                ),
+                run_id       = "",
+                created_at   = p.contributed_at,
+                score        = float(p.federation_score),
+            ))
+        return entries
+
+    def set_federated_store(self, store: Any) -> None:
+        """
+        Wire a FederatedPatternStore into this FixMemory instance.
+        Called by StabilizerController during _init_gap6().
+        """
+        self._federated_store = store
+        log.info("FixMemory: FederatedPatternStore wired")
 
     def format_as_few_shot(self, entries: list[FixMemoryEntry]) -> str:
         """
@@ -540,16 +709,23 @@ _instance: FixMemory | None = None
 
 
 def get_fix_memory(
-    repo_url:  str  = "",
-    qdrant_url: str = "http://localhost:6333",
-    data_dir:  Path | str | None = None,
+    repo_url:        str              = "",
+    qdrant_url:      str              = "http://localhost:6333",
+    data_dir:        Path | str | None = None,
+    federated_store: Any              = None,
+    language:        str              = "python",
 ) -> FixMemory:
     global _instance
     if _instance is None:
         _instance = FixMemory(
-            repo_url=repo_url,
-            qdrant_url=qdrant_url,
-            data_dir=data_dir,
+            repo_url        = repo_url,
+            qdrant_url      = qdrant_url,
+            data_dir        = data_dir,
+            federated_store = federated_store,
+            language        = language,
         )
         _instance.initialise()
+    elif federated_store is not None and _instance._federated_store is None:
+        # Allow late-wiring of the federation store after singleton creation
+        _instance.set_federated_store(federated_store)
     return _instance
