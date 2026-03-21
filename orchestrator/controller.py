@@ -1263,11 +1263,25 @@ class StabilizerController:
             from agents.patch_synthesis_agent import PatchSynthesisAgent
             self._patch_synthesis = PatchSynthesisAgent(model_router=router)
 
+            # GAP 5 FIX: Pass storage, run_id, repo_root, and domain_mode so
+            # BoBNSampler.sample() can run TestGeneratorAgent + MutationVerifierAgent
+            # inline at step 5.5.  Previously these were None, which silently skipped
+            # the test/mutation gate inside sample() — leaving the SWE-bench evaluator
+            # path with no mutation coverage gate at all.  The controller's own
+            # post-BoBN test/mutation blocks (GAP 5 FIX C/D below) remain as a
+            # production safeguard; both paths running them is additive because the
+            # inline gate operates on a BoBNCandidate stub while the controller path
+            # operates on the persisted FixAttempt record.
             self._bobn_sampler = BoBNSampler(
                 model_router         = router,
                 critic               = self._adversarial_critic,
                 synthesis            = self._patch_synthesis,
                 trajectory_collector = self._trajectory_collector,
+                storage              = self.storage,
+                run_id               = self.run.id if self.run else "",
+                repo_root            = self.config.repo_root,
+                domain_mode          = self.config.domain_mode,
+                mutation_threshold   = getattr(self.config, "mutation_score_threshold", None),
             )
 
             # GAP 5 FIX: Trajectory collector for ARPO RL training corpus.
