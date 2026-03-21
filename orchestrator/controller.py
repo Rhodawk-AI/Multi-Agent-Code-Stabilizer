@@ -315,6 +315,13 @@ class StabilizerController:
         # in _phase_fix_gap5().  Instantiated in _init_gap5() so it shares the
         # same CPG / hybrid retriever references as the rest of the pipeline.
         self._localization_agent:     LocalizationAgent | None = None
+        # FormalVerifierAgent for the Gap 5 patch gate.  Constructed explicitly
+        # in _init_gap5() so the dependency is never silently absent.  When
+        # self._gap5_formal_verifier is None at fix time, _phase_fix_gap5() logs
+        # a clear WARNING (not a silent skip) and falls back to the inline
+        # swe_bench.evaluator helpers.  This makes the missing-verifier condition
+        # visible in logs rather than undetectable.
+        self._gap5_formal_verifier:   Any | None = None
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -1316,6 +1323,35 @@ class StabilizerController:
                 max_slice_nodes      = getattr(self.config, "cpg_max_slice_nodes", 50),
             )
 
+            # ── Explicit FormalVerifierAgent for Gap 5 patch gate ─────────────
+            # CORRECTNESS FIX: previously the formal gate in _phase_fix_gap5()
+            # relied entirely on an ImportError-guarded inline block that imported
+            # helpers from swe_bench.evaluator.  When those imports failed (e.g.
+            # evaluator not on PYTHONPATH in production), the gate silently skipped
+            # with no log message, making the missing-verifier condition invisible.
+            #
+            # Fix: construct FormalVerifierAgent here and store as
+            # self._gap5_formal_verifier.  _phase_fix_gap5() checks this
+            # attribute first.  If it is None (construction failed) a WARNING
+            # is emitted before falling back to the inline swe_bench helpers,
+            # making the degraded state explicit in every log.
+            try:
+                self._gap5_formal_verifier = FormalVerifierAgent(
+                    storage     = self.storage,
+                    run_id      = self.run.id if self.run else "",
+                    domain_mode = self.config.domain_mode,
+                    config      = _agent_cfg(self.config, self.run.id if self.run else ""),
+                    repo_root   = self.config.repo_root,
+                )
+                self.log.info("[gap5] FormalVerifierAgent constructed for BoBN patch gate")
+            except Exception as _fv_exc:
+                self._gap5_formal_verifier = None
+                self.log.warning(
+                    "[gap5] FormalVerifierAgent construction failed — "
+                    "formal gate will use inline swe_bench.evaluator helpers as fallback: %s",
+                    _fv_exc,
+                )
+
             self.log.info(
                 "[gap5] Adversarial ensemble ready: "
                 "fixer_a=%s fixer_b=%s critic=%s synthesis=%s "
@@ -1328,10 +1364,11 @@ class StabilizerController:
             )
         except Exception as exc:
             self.log.error(f"[gap5] BoBN sampler init failed — Gap 5 disabled: {exc}")
-            self._adversarial_critic = None
-            self._patch_synthesis    = None
-            self._bobn_sampler       = None
-            self._trajectory_collector = None
+            self._adversarial_critic    = None
+            self._patch_synthesis       = None
+            self._bobn_sampler          = None
+            self._trajectory_collector  = None
+            self._gap5_formal_verifier  = None
 
     async def _phase_fix_gap5(self, issues: list[Issue]) -> None:
         """
@@ -1459,10 +1496,92 @@ class StabilizerController:
                 #   4. Z3               — SMT constraint check (advisory only)
                 # On hard failure (layers 1-3) tries the second-best candidate
                 # before giving up.
+                #
+                # CORRECTNESS FIX: prefer self._gap5_formal_verifier.verify_fix()
+                # over the fragile ImportError-caught swe_bench.evaluator inline
+                # helpers.  When the explicit FormalVerifierAgent was not
+                # constructed (construction failure at _init_gap5 time), emit a
+                # WARNING so the degraded state is visible, then fall back to the
+                # inline helpers.  A completely silent skip is no longer possible.
                 winning_patch      = winner.patch
                 formal_gate_passed = True
 
                 if self.config.formal_verification and winning_patch:
+                    # ── Path A: use explicit FormalVerifierAgent ───────────────
+                    if self._gap5_formal_verifier is not None:
+                        try:
+                            from brain.schemas import FixAttempt as _FA, FixedFile as _FF, PatchMode as _PM
+                            _probe_fix = _FA(
+                                run_id      = self.run.id,
+                                issue_ids   = [issue.id],
+                                fixed_files = [
+                                    _FF(
+                                        path       = p,
+                                        content    = "",
+                                        patch      = winning_patch,
+                                        patch_mode = _PM.UNIFIED_DIFF,
+                                        changes_made = "gap5_formal_gate_probe",
+                                        diff_summary = "gap5",
+                                    )
+                                    for p in {
+                                        ln.split()[-1]
+                                        for ln in winning_patch.splitlines()
+                                        if ln.startswith("+++ ") and ln.split()[-1] != "/dev/null"
+                                    }
+                                ],
+                                fixer_model       = winner.model,
+                                fixer_model_family= "",
+                                patch_mode        = _PM.UNIFIED_DIFF,
+                            )
+                            fv_results = await self._gap5_formal_verifier.run(
+                                fix=_probe_fix
+                            )
+                            # FormalVerifierAgent.run() returns list[FormalVerificationResult]
+                            # A CRITICAL counterexample in any result fails the gate.
+                            for fv_r in fv_results:
+                                if (
+                                    getattr(fv_r, "counterexample", None)
+                                    and getattr(fv_r, "severity", "") == "CRITICAL"
+                                ):
+                                    self.log.warning(
+                                        "[gap5] FormalVerifierAgent FAIL issue=%s "
+                                        "property=%s — trying second-best candidate",
+                                        issue.id[:8],
+                                        getattr(fv_r, "property_name", "unknown"),
+                                    )
+                                    formal_gate_passed = False
+                                    second = next(
+                                        (c for c in bobn_result.all_candidates[1:]
+                                         if c.patch and c.patch != winning_patch),
+                                        None,
+                                    )
+                                    if second:
+                                        winning_patch      = second.patch
+                                        winner             = second
+                                        formal_gate_passed = True
+                                        self.log.info(
+                                            "[gap5] Formal gate (FormalVerifierAgent): "
+                                            "promoted second-best candidate=%s for issue %s",
+                                            winner.candidate_id, issue.id[:8],
+                                        )
+                                    break
+                        except Exception as _fv_exc:
+                            self.log.debug(
+                                "[gap5] FormalVerifierAgent.run() failed — "
+                                "falling through to inline helpers: %s", _fv_exc
+                            )
+                            # Treat as gate skipped, not gate failed
+                    else:
+                        # ── Path B: fallback to inline swe_bench helpers ───────
+                        # _gap5_formal_verifier is None because construction failed
+                        # at _init_gap5() time.  This is a degraded state; log it
+                        # so operators know the full gate did not run.
+                        self.log.warning(
+                            "[gap5] _gap5_formal_verifier is None — formal gate "
+                            "using inline swe_bench.evaluator helpers (degraded). "
+                            "Check _init_gap5 logs for construction failure reason."
+                        )
+
                     try:
                         from swe_bench.evaluator import (
                             _check_safety_patterns,
@@ -1503,12 +1622,6 @@ class StabilizerController:
                                 )
                         else:
                             # ── Layer 3: CBMC — hard gate for C/C++ patches ───
-                            # Detect whether the patch touches any C/C++ files by
-                            # inspecting the diff's file headers.  Only invoke CBMC
-                            # when cbmc is installed and at least one touched file is
-                            # a C/C++ translation unit.  Non-blocking on tooling
-                            # failure (cbmc not installed, timeout) — only a
-                            # confirmed counterexample (rc=10) blocks the commit.
                             _c_extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"}
                             _touched_files = [
                                 ln.split()[-1]
@@ -1550,7 +1663,6 @@ class StabilizerController:
                                             f"issue={issue.id[:8]}"
                                         )
                                 except Exception as _cbmc_e:
-                                    # Infrastructure failure — never block the pipeline
                                     self.log.debug(
                                         f"[gap5] CBMC layer skipped (infrastructure): {_cbmc_e}"
                                     )

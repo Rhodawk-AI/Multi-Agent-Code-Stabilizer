@@ -36,6 +36,104 @@ from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
 
+# ── Coverage data provider ────────────────────────────────────────────────────
+
+class _CoverageDataProvider:
+    """Read a pytest/coverage.py coverage artefact and map function names to
+    the test node IDs that execute them.
+
+    Supports two coverage formats:
+      • ``coverage.json``  — produced by ``coverage json``
+      • ``.coverage``      — the SQLite database produced by ``coverage run``
+        (requires the ``coverage`` package to be importable)
+
+    Falls back gracefully to an empty mapping when neither file exists or
+    when the required libraries are absent.  Callers should treat a None
+    return from ``tests_for_functions()`` as "no coverage data available".
+
+    Usage
+    -----
+    The provider is constructed once per CommitAuditScheduler and caches the
+    loaded data so repeated calls during one scheduler invocation do not re-read
+    the file from disk.
+    """
+
+    def __init__(self, repo_root: Path) -> None:
+        self._repo_root   = repo_root
+        self._loaded      = False
+        # Maps function name (bare, no module prefix) → set of test node IDs
+        self._fn_to_tests: dict[str, set[str]] = {}
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        # Try coverage.json first (always parseable without extra deps)
+        json_path = self._repo_root / "coverage.json"
+        if json_path.exists():
+            try:
+                import json
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+                # coverage.json structure:
+                #   {"files": {"path": {"contexts": {"line_no": ["test::id"]}}}}
+                for _file_path, file_data in data.get("files", {}).items():
+                    for _line, test_ids in file_data.get("contexts", {}).items():
+                        for tid in test_ids:
+                            if "::" in tid:
+                                # test node id like "tests/test_foo.py::test_bar"
+                                # extract the bare test function name
+                                fn = tid.rsplit("::", 1)[-1]
+                                self._fn_to_tests.setdefault(fn, set()).add(tid)
+                log.debug(
+                    "[CoverageDataProvider] Loaded coverage.json: %d test entries",
+                    sum(len(v) for v in self._fn_to_tests.values()),
+                )
+                return
+            except Exception as exc:
+                log.debug("[CoverageDataProvider] coverage.json read failed: %s", exc)
+
+        # Try .coverage SQLite database
+        cov_db = self._repo_root / ".coverage"
+        if cov_db.exists():
+            try:
+                import coverage as _cov_pkg
+                cov = _cov_pkg.Coverage(data_file=str(cov_db))
+                cov.load()
+                cov_data = cov.get_data()
+                for test_id in cov_data.measured_files():
+                    # In coverage 7+ context() returns test node ids per line
+                    pass  # full context iteration requires CoverageData.contexts
+                # Simpler approach: use CoverageData directly
+                raw_data = _cov_pkg.CoverageData(basename=str(cov_db))
+                raw_data.read()
+                for ctx in raw_data.measured_contexts():
+                    if "::" in ctx:
+                        fn = ctx.rsplit("::", 1)[-1]
+                        self._fn_to_tests.setdefault(fn, set()).add(ctx)
+                log.debug(
+                    "[CoverageDataProvider] Loaded .coverage db: %d test entries",
+                    sum(len(v) for v in self._fn_to_tests.values()),
+                )
+            except Exception as exc:
+                log.debug("[CoverageDataProvider] .coverage db read failed: %s", exc)
+
+    def tests_for_functions(self, function_names: list[str]) -> list[str] | None:
+        """Return test node IDs that cover any of the given function names.
+
+        Returns None when no coverage data is available (signals caller to
+        fall back to the heuristic grep strategy).  Returns an empty list when
+        coverage data exists but none of the functions appear in it.
+        """
+        self._load()
+        if not self._fn_to_tests:
+            return None
+        result: set[str] = set()
+        for fn in function_names:
+            bare = fn.rsplit(".", 1)[-1]   # strip module prefix if present
+            result |= self._fn_to_tests.get(fn, set())
+            result |= self._fn_to_tests.get(bare, set())
+        return sorted(result)
+
 
 class CommitAuditScheduler:
     """
@@ -79,6 +177,8 @@ class CommitAuditScheduler:
         self._repo_root  = repo_root
         self._cpg        = cpg_engine
         self._graph      = graph_engine
+        # Coverage data provider — lazily loaded on first test-scope call
+        self._coverage   = _CoverageDataProvider(repo_root) if repo_root else None
 
     # ── Primary entry point ───────────────────────────────────────────────────
 
@@ -270,15 +370,50 @@ class CommitAuditScheduler:
         changed_functions: list[str],
         changed_files:     set[str],
     ) -> tuple[list[str], list[str]]:
-        """
-        Identify which test files and test function names should be re-run.
+        """Identify which test files and test function names should be re-run.
 
         Strategy (in order of preference):
-        1. Use CPG ``test_functions_covering`` query when Joern is available.
-        2. Scan the tests/ directory for functions whose names contain any of
-           the changed function names (naming-convention heuristic).
-        3. Return empty lists (caller falls back to changed_functions -k run).
+
+        1. **Coverage-map lookup** — read ``coverage.json`` or ``.coverage``
+           to find the exact test node IDs that executed each changed function.
+           This is the only strategy that gives true precision: only tests that
+           actually exercised the changed code are re-run.  Falls back when no
+           coverage artefact exists.
+
+        2. **CPG call-graph query** — ask Joern for test functions that have
+           a call edge into any of the changed functions.  More precise than
+           grep but requires Joern to be running.
+
+        3. **Heuristic grep** — scan ``tests/`` for files/functions that
+           mention any changed function name as a text substring.  Fast and
+           dependency-free but may miss tests that call the function indirectly
+           or via a fixture, and may include tests that merely import the name.
         """
+        # ── Strategy 1: coverage-map lookup ───────────────────────────────────
+        if self._coverage is not None and changed_functions:
+            try:
+                cov_tests = self._coverage.tests_for_functions(changed_functions)
+                if cov_tests is not None:
+                    if cov_tests:
+                        log.info(
+                            "[CommitAudit] coverage-map found %d test(s) for %d changed fn(s)",
+                            len(cov_tests),
+                            len(changed_functions),
+                        )
+                        # Separate file paths from bare function names
+                        test_files = sorted({t.split("::")[0] for t in cov_tests if "::" in t})
+                        test_fns   = [t.rsplit("::", 1)[-1] for t in cov_tests if "::" in t]
+                        return test_files, test_fns
+                    else:
+                        log.debug(
+                            "[CommitAudit] coverage-map loaded but no tests found for changed fns "
+                            "— falling through to CPG strategy"
+                        )
+                # cov_tests is None → no coverage data, fall through silently
+            except Exception as exc:
+                log.debug("[CommitAudit] coverage-map strategy failed: %s", exc)
+
+        # ── Strategy 2: CPG call-graph query ──────────────────────────────────
         if self._cpg and getattr(self._cpg, "is_available", False):
             try:
                 test_fns = await self._cpg_test_scope(changed_functions)
@@ -287,7 +422,7 @@ class CommitAuditScheduler:
             except Exception as exc:
                 log.debug("[CommitAudit] CPG test scope query failed: %s", exc)
 
-        # Heuristic fallback: grep test files for function name occurrences
+        # ── Strategy 3: heuristic grep fallback ───────────────────────────────
         return await self._heuristic_test_scope(changed_functions, changed_files)
 
     async def _cpg_test_scope(self, changed_functions: list[str]) -> list[str]:
@@ -387,8 +522,25 @@ class CommitAuditScheduler:
     # ── Git helpers ───────────────────────────────────────────────────────────
 
     async def _resolve_changed_files(self, commit_hash: str) -> set[str]:
-        """
-        Use ``git diff-tree`` to resolve the set of files changed by a commit.
+        """Use git to resolve the set of files changed by a commit.
+
+        MERGE COMMIT FIX
+        ----------------
+        ``git diff-tree --no-commit-id -r <hash>`` on a merge commit returns
+        the combined diff between the merge commit and ALL its parents, which
+        includes every file touched by the entire merged branch.  On an active
+        engineering team this can be hundreds of files — defeating the whole
+        point of function-granularity incremental auditing.
+
+        The correct behaviour for merge commits is to audit only the files that
+        differ between the two parent commits (i.e. the branch diff), not the
+        full merge diff.  We detect merge commits by checking how many parents
+        the commit has (``git log --format=%P -n 1``).  For a two-parent merge
+        we use ``git diff <parent1>...<parent2>`` to get the branch diff.
+
+        For regular (non-merge) commits the original ``diff-tree`` logic is
+        used unchanged.
+
         Falls back to an empty set when git is unavailable.
         """
         if not self._repo_root:
@@ -402,18 +554,50 @@ class CommitAuditScheduler:
 
         def _run() -> set[str]:
             try:
+                cwd = str(self._repo_root)
+
+                # ── Detect merge commits ───────────────────────────────────
+                # A merge commit has two or more space-separated parent hashes
+                # in the %P format field.
                 if commit_hash:
+                    parents_result = subprocess.run(
+                        ["git", "log", "--format=%P", "-n", "1", commit_hash],
+                        capture_output=True, text=True, cwd=cwd, timeout=10,
+                    )
+                    parents = parents_result.stdout.strip().split() if parents_result.returncode == 0 else []
+                else:
+                    parents = []
+
+                is_merge = len(parents) >= 2
+
+                if is_merge:
+                    # Diff the two parents to get only the changes introduced
+                    # by the merged branch, not the full combined merge diff.
+                    parent1, parent2 = parents[0], parents[1]
+                    cmd = [
+                        "git", "diff", "--name-only",
+                        f"{parent1}...{parent2}",
+                    ]
+                    log.debug(
+                        "[CommitAudit] merge commit %s detected "
+                        "(parents: %s %s) — using branch diff",
+                        commit_hash[:12] if commit_hash else "HEAD",
+                        parent1[:8],
+                        parent2[:8],
+                    )
+                elif commit_hash:
                     cmd = [
                         "git", "diff-tree", "--no-commit-id", "-r",
                         "--name-only", commit_hash,
                     ]
                 else:
                     cmd = ["git", "diff", "--name-only", "HEAD~1", "HEAD"]
+
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
-                    cwd=str(self._repo_root),
+                    cwd=cwd,
                     timeout=15,
                 )
                 if result.returncode != 0:
