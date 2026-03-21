@@ -1258,9 +1258,10 @@ class StabilizerController:
             self._patch_synthesis = PatchSynthesisAgent(model_router=router)
 
             self._bobn_sampler = BoBNSampler(
-                model_router = router,
-                critic       = self._adversarial_critic,
-                synthesis    = self._patch_synthesis,
+                model_router         = router,
+                critic               = self._adversarial_critic,
+                synthesis            = self._patch_synthesis,
+                trajectory_collector = self._trajectory_collector,
             )
 
             # GAP 5 FIX: Trajectory collector for ARPO RL training corpus.
@@ -1356,13 +1357,34 @@ class StabilizerController:
             self._bobn_sampler.issue   = issue_text
             self._bobn_sampler.loc_ctx = localization_context
 
+            # Extract test identifiers from the issue.  fail_tests drives the
+            # FAIL_TO_PASS scoring signal inside ExecutionFeedbackLoop — without
+            # real test IDs the loop skips Docker execution entirely and every
+            # candidate ends up with test_score=0.0, collapsing the composite
+            # formula from 0.6×test + 0.3×robust + 0.1×minimal to only the
+            # robustness and minimality terms (40% of signal).
+            # base_commit tells Docker which repo snapshot to use.
+            _fail_tests  = list(getattr(issue, "fail_tests",  None) or [])
+            _pass_tests  = list(getattr(issue, "pass_tests",  None) or []) or None
+            _base_commit = str(getattr(issue, "base_commit",  None) or "")
+
+            if not _fail_tests:
+                # Issue was created without test IDs (e.g. from static analysis
+                # rather than a regression).  Log at debug so operators can
+                # populate fail_tests when a reproducible test case is known.
+                self.log.debug(
+                    f"[gap5] issue {issue.id[:8]} has no fail_tests — "
+                    "execution loop will score on patch quality only "
+                    "(composite reduces to robustness + minimality terms)"
+                )
+
             try:
                 bobn_result = await self._bobn_sampler.sample(
                     instance_id  = issue.id,
                     repo         = self.config.repo_url,
-                    base_commit  = "",            # not in Issue schema; gap bench only
-                    fail_tests   = [],            # execution loop skips docker without tests
-                    pass_tests   = None,
+                    base_commit  = _base_commit,
+                    fail_tests   = _fail_tests,
+                    pass_tests   = _pass_tests,
                     repo_root    = self.config.repo_root,
                 )
 
@@ -1447,33 +1469,6 @@ class StabilizerController:
 
                     except ImportError as _ie:
                         self.log.debug(f"[gap5] Formal gate helpers unavailable: {_ie}")
-
-                # ── GAP 5 FIX B: Trajectory collection ───────────────────────
-                # Previously MISSING from the controller path.  The evaluator
-                # path collected trajectories; production fix runs must too so
-                # the ARPO RL corpus grows from real-world data, not just benchmarks.
-                _tc = getattr(self, "_trajectory_collector", None)
-                if _tc is not None and bobn_result.all_candidates:
-                    try:
-                        _tc.collect_from_bobn_result(
-                            instance_id = issue.id,
-                            bobn_result = bobn_result,
-                            resolved    = formal_gate_passed,
-                            issue_text  = issue_text,
-                            loc_context = localization_context,
-                        )
-                        _corpus = _tc.corpus_size()
-                        self.log.debug(
-                            f"[gap5] Trajectory saved for issue {issue.id[:8]}. "
-                            f"Corpus={_corpus}"
-                        )
-                        if _tc.is_ready_for_training():
-                            self.log.info(
-                                f"[gap5] RL corpus ready ({_corpus} trajectories) — "
-                                "run: python scripts/arpo_trainer.py"
-                            )
-                    except Exception as _te:
-                        self.log.debug(f"[gap5] Trajectory collection non-fatal: {_te}")
 
                 # ── Write the winning patch as a FixAttempt ───────────────────
                 fixer = FixerAgent(
