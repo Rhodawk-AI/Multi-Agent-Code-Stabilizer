@@ -892,9 +892,12 @@ class TestGap5ControllerConfig:
             **overrides,
         )
 
-    def test_gap5_disabled_by_default(self):
+    def test_gap5_enabled_by_default(self):
+        # Gap 5 is ON by default in StabilizerConfig (gap5_enabled=True).
+        # The default.toml sets enabled=false for operators who want it off;
+        # direct Python construction gets the production default which is True.
         cfg = self._make_config()
-        assert cfg.gap5_enabled is False
+        assert cfg.gap5_enabled is True
 
     def test_gap5_can_be_enabled(self):
         cfg = self._make_config(gap5_enabled=True)
@@ -914,16 +917,22 @@ class TestGap5ControllerConfig:
         assert cfg.gap5_vllm_critic_base_url == ""
 
     def test_bobn_counts_sum_to_n_candidates(self):
+        # Python defaults: 6 + 4 = 10. default.toml: 3 + 2 = 5.
+        # Either way the sum must equal gap5_bobn_n_candidates.
         cfg = self._make_config()
         assert cfg.gap5_bobn_fixer_a_count + cfg.gap5_bobn_fixer_b_count == cfg.gap5_bobn_n_candidates
 
     def test_bobn_fixer_a_count_default(self):
+        # Python class default is 6 (N=10 BoBN: 6 Fixer-A + 4 Fixer-B).
+        # default.toml uses 3 for ops who run without full GPU budget.
         cfg = self._make_config()
-        assert cfg.gap5_bobn_fixer_a_count == 3
+        assert cfg.gap5_bobn_fixer_a_count == 6
 
     def test_bobn_fixer_b_count_default(self):
+        # Python class default is 4 (N=10 BoBN: 6 Fixer-A + 4 Fixer-B).
+        # default.toml uses 2 for ops who run without full GPU budget.
         cfg = self._make_config()
-        assert cfg.gap5_bobn_fixer_b_count == 2
+        assert cfg.gap5_bobn_fixer_b_count == 4
 
     def test_secondary_url_points_to_different_port(self):
         cfg = self._make_config()
