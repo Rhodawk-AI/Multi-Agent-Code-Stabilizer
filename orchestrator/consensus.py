@@ -351,3 +351,50 @@ class ConsensusEngine:
             high_centrality=self._is_high_centrality(issue.file_path),
             escalation_required=True,
         )
+
+
+# ── GAP 5: BoBN Candidate Ranking ─────────────────────────────────────────────
+
+def rank_candidates(candidates: list[dict]) -> list[dict]:
+    """
+    Rank BoBN patch candidates by composite score.
+
+    This is a module-level utility (not a method on ConsensusEngine) because
+    BoBN candidate ranking is orthogonal to the issue-consensus workflow — it
+    operates on patch candidates, not on audit findings.
+
+    The composite score formula matches the GAP 5 architecture specification:
+        composite = 0.6 × test_score
+                  + 0.3 × (1 − attack_confidence)
+                  + 0.1 × minimality_score
+
+    Each candidate dict must contain:
+        id              — candidate identifier
+        patch           — unified diff string
+        test_score      — FAIL_TO_PASS pass rate [0.0, 1.0]
+        attack_confidence — adversarial critic's confidence it can break the patch
+        minimality_score  — patch minimality [0.0, 1.0]
+
+    Returns candidates sorted descending by composite_score.
+    """
+    for c in candidates:
+        test_score    = float(c.get("test_score",         0.0))
+        attack_conf   = float(c.get("attack_confidence",  0.5))
+        minimality    = float(c.get("minimality_score",   0.5))
+        c["composite_score"] = (
+            0.6 * test_score
+            + 0.3 * (1.0 - attack_conf)
+            + 0.1 * minimality
+        )
+
+    ranked = sorted(candidates, key=lambda c: c["composite_score"], reverse=True)
+    for i, c in enumerate(ranked):
+        c["rank"] = i + 1
+        log.debug(
+            f"[consensus] BoBN rank={i+1} id={c.get('id','?')} "
+            f"composite={c['composite_score']:.3f} "
+            f"test={c.get('test_score',0):.2f} "
+            f"robustness={1-c.get('attack_confidence',0.5):.2f} "
+            f"minimal={c.get('minimality_score',0.5):.2f}"
+        )
+    return ranked
