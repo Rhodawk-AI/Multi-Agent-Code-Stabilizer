@@ -110,22 +110,99 @@ class TestGap51ModelRouter:
                 router.assert_family_independence()
 
     def test_assert_family_independence_passes_on_different_families(self):
+        """All four roles from distinct families must pass without raising."""
         from models.router import get_router
         router = get_router()
 
+        # Four calls in assertion order: primary, secondary, critic, synthesis.
+        # Previously this test used families = ["qwen", "deepseek", "llama"] with
+        # `call_count[0] % 3`, which made the 4th call (synthesis) return "qwen" —
+        # matching primary.  That hit a *soft* warning, not the hard RuntimeError,
+        # so the test passed while never exercising the four-family requirement.
+        # Fixed: use a 4-element list, one distinct family per role.
+        families = ["alibaba", "deepseek", "meta", "mistral"]
         call_count = [0]
-        families   = ["qwen", "deepseek", "llama"]
 
         def mock_extractor(model):
-            idx = call_count[0] % 3
+            idx = call_count[0]
             call_count[0] += 1
             return families[idx]
 
         with patch(
             "verification.independence_enforcer.extract_model_family",
-            side_effect=mock_extractor
+            side_effect=mock_extractor,
         ):
-            router.assert_family_independence()  # Should not raise
+            router.assert_family_independence()  # Must not raise
+
+    def test_assert_family_independence_raises_on_synthesis_critic_collision(self):
+        """When synthesis and critic share a family, assert_family_independence raises.
+
+        This is the specific bug that was fixed: synthesis was never checked
+        against the critic, allowing two correlated Meta-family models in the
+        pipeline (synthesis=llama-4-scout, critic=llama-3.3-70b) without any
+        startup error.
+        """
+        from models.router import get_router
+        router = get_router()
+
+        # primary=alibaba, secondary=deepseek, critic=meta, synthesis=meta (collision)
+        families = ["alibaba", "deepseek", "meta", "meta"]
+        call_count = [0]
+
+        def mock_extractor(model):
+            idx = call_count[0]
+            call_count[0] += 1
+            return families[idx]
+
+        with patch(
+            "verification.independence_enforcer.extract_model_family",
+            side_effect=mock_extractor,
+        ):
+            with pytest.raises(RuntimeError, match="GAP 5 independence violation"):
+                router.assert_family_independence()
+
+    def test_assert_family_independence_raises_on_critic_secondary_collision(self):
+        """Critic sharing a family with secondary fixer must also raise."""
+        from models.router import get_router
+        router = get_router()
+
+        # primary=alibaba, secondary=deepseek, critic=deepseek (collision), synthesis=mistral
+        families = ["alibaba", "deepseek", "deepseek", "mistral"]
+        call_count = [0]
+
+        def mock_extractor(model):
+            idx = call_count[0]
+            call_count[0] += 1
+            return families[idx]
+
+        with patch(
+            "verification.independence_enforcer.extract_model_family",
+            side_effect=mock_extractor,
+        ):
+            with pytest.raises(RuntimeError, match="GAP 5 independence violation"):
+                router.assert_family_independence()
+
+    def test_synthesis_tier_exists(self):
+        from models.router import ModelTier
+        assert ModelTier.VLLM_SYNTHESIS in ModelTier.__members__.values()
+
+    def test_synthesis_model_is_devstral(self):
+        """synthesis_model() must return a Mistral-family model identifier."""
+        from models.router import get_router
+        router = get_router()
+        model  = router.synthesis_model()
+        assert model  # Must return something non-empty
+        assert "devstral" in model.lower() or "mistral" in model.lower()
+
+    def test_task_routing_synthesis_tasks(self):
+        """synthesis/patch_synthesis/critical_fix tasks must route to VLLM_SYNTHESIS tier."""
+        from models.router import _TASK_TIERS, ModelTier
+        for task in ["synthesis", "patch_synthesis", "critical_fix"]:
+            assert _TASK_TIERS[task] == ModelTier.VLLM_SYNTHESIS, (
+                f"Task '{task}' routes to {_TASK_TIERS.get(task)} — expected VLLM_SYNTHESIS. "
+                "This regression allows synthesis to silently use the same model family "
+                "as the adversarial critic."
+            )
 
     def test_stats_includes_gap5_fields(self):
         from models.router import get_router
@@ -1220,12 +1297,47 @@ class TestGap5ConfigLoader:
             "VLLM_SECONDARY_MODEL",
             "VLLM_CRITIC_BASE_URL",
             "VLLM_CRITIC_MODEL",
+            # Synthesis vLLM fields — these were missing before the fix.
+            # An operator who sets VLLM_SYNTHESIS_BASE_URL in their environment
+            # would silently get the Python default ("") via StabilizerConfig
+            # because _apply_env() had no entry for this key.
+            "VLLM_SYNTHESIS_BASE_URL",
+            "VLLM_SYNTHESIS_MODEL",
             "RHODAWK_BOBN_CANDIDATES",
             "RHODAWK_BOBN_FIXER_A",
             "RHODAWK_BOBN_FIXER_B",
         }
         missing = required - set(_ENV_MAP.keys())
         assert not missing, f"Missing env mappings: {missing}"
+
+    def test_flatten_toml_gap5_synthesis_fields(self):
+        """vllm_synthesis_base_url and vllm_synthesis_model must be mapped by _flatten_toml.
+
+        Previously these keys were absent from the [gap5] mapping dict, so an
+        operator who set them in default.toml would get the Python class default
+        instead of their configured value.
+        """
+        from config.loader import _flatten_toml
+        raw = {
+            "gap5": {
+                "vllm_synthesis_base_url": "http://gpu3:8003/v1",
+                "vllm_synthesis_model":    "mistralai/Devstral-Small-2505",
+            }
+        }
+        out = _flatten_toml(raw)
+        assert out["gap5_vllm_synthesis_base_url"] == "http://gpu3:8003/v1"
+        assert out["gap5_vllm_synthesis_model"]    == "mistralai/Devstral-Small-2505"
+
+    def test_flatten_toml_gap5_synthesis_blank_url_is_valid(self):
+        """Blank vllm_synthesis_base_url is valid — routes through OpenRouter."""
+        from config.loader import _flatten_toml
+        raw = {"gap5": {"vllm_synthesis_base_url": "", "vllm_synthesis_model": "mistralai/Devstral-Small-2505"}}
+        out = _flatten_toml(raw)
+        # Blank string should still be stored (not filtered out) so it can
+        # override a non-blank default set elsewhere.
+        # _map() uses `if val is not None` — empty string passes through.
+        assert "gap5_vllm_synthesis_model" in out
+        assert out["gap5_vllm_synthesis_model"] == "mistralai/Devstral-Small-2505"
 
     def test_env_override_gap5_enabled(self, monkeypatch):
         import os
@@ -1255,6 +1367,30 @@ class TestGap5ConfigLoader:
         data: dict = {}
         _apply_env(data)
         assert data.get("gap5_vllm_secondary_base_url") == "http://gpu2:8001/v1"
+
+    def test_env_override_synthesis_url(self, monkeypatch):
+        """VLLM_SYNTHESIS_BASE_URL must propagate to gap5_vllm_synthesis_base_url.
+
+        Previously missing from _ENV_MAP — operator-set env var was silently ignored.
+        """
+        from config.loader import _apply_env
+        monkeypatch.setenv("VLLM_SYNTHESIS_BASE_URL", "http://gpu3:8003/v1")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_vllm_synthesis_base_url") == "http://gpu3:8003/v1"
+
+    def test_env_override_synthesis_model(self, monkeypatch):
+        """VLLM_SYNTHESIS_MODEL must propagate to gap5_vllm_synthesis_model.
+
+        Previously missing from _ENV_MAP — operator-set env var was silently ignored,
+        leaving the synthesis model stuck at the Python class default regardless of
+        what the operator set in their environment.
+        """
+        from config.loader import _apply_env
+        monkeypatch.setenv("VLLM_SYNTHESIS_MODEL", "mistralai/Mistral-Medium-3")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_vllm_synthesis_model") == "mistralai/Mistral-Medium-3"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
