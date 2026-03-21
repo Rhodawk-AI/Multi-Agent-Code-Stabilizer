@@ -20,6 +20,12 @@ GET    /api/federation/patterns
       n           (int, 1–50) — max results (default 10)
       lang        (optional) — filter by language
 
+POST   /api/federation/patterns/{fingerprint}/usage
+    Record that a pattern was applied by a peer deployment.
+    Body: {"success": true|false}
+    Increments use_count always; success_count when success=true.
+    This is the feedback loop that drives quality-based ranking over time.
+
 GET    /api/federation/status
     Registry health, pattern count, peer count, stats.
 
@@ -65,10 +71,6 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/federation", tags=["federation"])
 
 # ── In-process pattern store ───────────────────────────────────────────────────
-# The registry keeps received patterns in memory + Qdrant cache.
-# On startup the controller wires in the FederatedPatternStore singleton.
-# If it is not wired (federation disabled), all endpoints return 503.
-
 _fed_store: Any = None   # FederatedPatternStore | None
 
 
@@ -97,12 +99,8 @@ _FED_TOKEN = os.environ.get("RHODAWK_FED_TOKEN", "")
 
 
 def _check_fed_auth(request: Request) -> None:
-    """
-    Optional bearer-token guard for federation endpoints.
-    Only enforced when RHODAWK_FED_TOKEN is set.
-    """
     if not _FED_TOKEN:
-        return   # open federation (default for private networks)
+        return
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -130,11 +128,19 @@ class PeerRegistration(BaseModel):
     name: str = Field(default="", max_length=128)
 
 
+class UsageFeedback(BaseModel):
+    """
+    Body schema for POST /api/federation/patterns/{fingerprint}/usage.
+
+    success=True  → fix that used this pattern passed all tests.
+    success=False → fix was applied but failed validation / tests.
+    Both increment use_count.  Only True increments success_count.
+    """
+    success: bool = Field(...)
+
+
 _FP_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Heuristic: normalized text should NOT contain patterns that look like
-# real identifiers (camelCase, snake_case longer than 2 chars that is not
-# a known keyword).  Used as a second line of defense after the normalizer.
 _SUSPECT_IDENTIFIER_RE = re.compile(
     r"\b(?!func_|var_|arg_|cls_|mod_|id_|<)[A-Za-z][a-zA-Z0-9]{4,}\b"
 )
@@ -142,16 +148,12 @@ _SUSPECT_IDENTIFIER_RE = re.compile(
 
 def _validate_pattern(body: PatternSubmission) -> None:
     """Raise HTTPException if the pattern fails basic integrity checks."""
-    # 1. Fingerprint must be valid SHA-256 hex
     if not _FP_RE.match(body.fingerprint):
         raise HTTPException(
             status_code=422,
             detail="fingerprint must be a 64-char lowercase hex SHA-256",
         )
-
-    # 2. Spot-check for leaked identifiers (defence in depth)
     suspects = _SUSPECT_IDENTIFIER_RE.findall(body.normalized_text)
-    # Allow up to 5 matches — the regex catches some type names like "Optional"
     if len(suspects) > 10:
         raise HTTPException(
             status_code=422,
@@ -160,12 +162,18 @@ def _validate_pattern(body: PatternSubmission) -> None:
                 f"({len(suspects)} suspect tokens). Re-run PatternNormalizer."
             ),
         )
-
-    # 3. complexity_score sanity
     if not (0.0 <= body.complexity_score <= 1.0):
         raise HTTPException(
             status_code=422,
             detail="complexity_score must be in [0.0, 1.0]",
+        )
+
+
+def _validate_fingerprint_param(fingerprint: str) -> None:
+    if not _FP_RE.match(fingerprint):
+        raise HTTPException(
+            status_code=422,
+            detail="fingerprint path parameter must be a 64-char lowercase hex SHA-256",
         )
 
 
@@ -180,12 +188,36 @@ async def receive_pattern(
     """
     Receive a normalized fix pattern from a peer deployment.
 
-    Returns 201 on success, 409 if the fingerprint is already known.
+    Returns 201 on success.
+    Returns 409 (Conflict) if the fingerprint is already known — the caller
+    should treat 409 as a successful no-op (idempotent submission).
+
+    FIXES APPLIED:
+    • Defect 1 — now raises HTTPException(409) instead of returning a plain
+      200 dict, matching what _push_to_peer expects and what the docstring
+      has always promised.
+    • Defect 2 — dedup check queries with issue_type="" (no filter) so the
+      same fingerprint cannot bypass deduplication by arriving with a
+      different issue_type label than it was originally stored under.
     """
     _check_fed_auth(request)
     _validate_pattern(body)
 
     from memory.federated_store import FederatedPattern
+
+    # FIX (Defect 2): use empty issue_type so the dedup scan is global —
+    # no issue_type-based bypass is possible.
+    existing = await store._retrieve_from_cache("", n=10_000)
+    for ex in existing:
+        if ex.fingerprint == body.fingerprint:
+            # FIX (Defect 1): proper 409 Conflict, not a silent 200.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status":      "already_known",
+                    "fingerprint": body.fingerprint,
+                },
+            )
 
     pattern = FederatedPattern(
         fingerprint      = body.fingerprint,
@@ -196,13 +228,6 @@ async def receive_pattern(
         source_instance  = body.sender_hash,
         contributed_at   = body.contributed_at,
     )
-
-    # Check for existing fingerprint (idempotency)
-    existing = await store._retrieve_from_cache(body.issue_type, n=1000)
-    for ex in existing:
-        if ex.fingerprint == body.fingerprint:
-            return {"status": "already_known", "fingerprint": body.fingerprint}
-
     await store._cache_pattern(pattern)
     log.info(
         f"Federation: received pattern fingerprint={body.fingerprint[:16]}... "
@@ -210,6 +235,48 @@ async def receive_pattern(
         f"complexity={body.complexity_score:.3f}"
     )
     return {"status": "accepted", "fingerprint": body.fingerprint}
+
+
+@router.post("/patterns/{fingerprint}/usage", status_code=200)
+async def record_pattern_usage(
+    fingerprint: str,
+    body:        UsageFeedback,
+    request:     Request,
+    store        = Depends(_get_fed_store),
+):
+    """
+    Record that a federated pattern was applied by a peer deployment.
+
+    FIX (Defect 3): This endpoint is the missing feedback loop.
+    use_count and success_count existed as fields on FederatedPattern and
+    were defined in the dataclass, read from storage, and displayed in
+    formatted output — but nothing ever incremented them.  Without this
+    endpoint, quality-based ranking was permanently frozen at 0/0 for
+    every pattern in the federation.
+
+    The fixer calls this endpoint after gate evaluation completes so the
+    registry learns which structural patterns have a real-world success
+    rate and can promote them above untested patterns.
+    """
+    _check_fed_auth(request)
+    _validate_fingerprint_param(fingerprint)
+
+    updated = await store.record_usage(fingerprint=fingerprint, success=body.success)
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pattern {fingerprint[:16]}... not found in local cache.",
+        )
+
+    log.info(
+        f"Federation: usage recorded fingerprint={fingerprint[:16]}... "
+        f"success={body.success}"
+    )
+    return {
+        "status":      "recorded",
+        "fingerprint": fingerprint,
+        "success":     body.success,
+    }
 
 
 @router.get("/patterns")
@@ -224,20 +291,23 @@ async def serve_patterns(
     """
     Serve normalized patterns to a requesting peer.
 
-    Results are filtered by issue_type and/or language if provided,
-    then ranked by complexity × similarity descending.
+    Results are ranked by quality: (success_count / use_count) × 0.6 +
+    complexity_score × 0.4.  Now that use_count and success_count are
+    properly maintained via /usage, this ranking is meaningful.
     """
     _check_fed_auth(request)
 
     patterns = await store._retrieve_from_cache(issue_type, n * 3)
 
-    # Apply language filter
     if lang:
         patterns = [p for p in patterns if not p.language or p.language == lang]
 
-    # Sort and truncate
+    # Quality-aware sort: success_rate weighted 60%, complexity 40%
     patterns.sort(
-        key=lambda p: p.complexity_score * max(p.federation_score, 0.01),
+        key=lambda p: (
+            (p.success_count / max(p.use_count, 1)) * 0.6
+            + p.complexity_score * 0.4
+        ),
         reverse=True,
     )
     patterns = patterns[:n]
