@@ -120,16 +120,25 @@ synthesis_model       = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
 max_compound_findings = 20
 
 # Gap 5: adversarial BoBN ensemble.
-# Three vLLM servers on separate ports:
-#   port 8000  Qwen2.5-Coder-32B     (Fixer A, primary)
-#   port 8001  DeepSeek-Coder-V2     (Fixer B, different family)
-#   port 8002  Llama-3.3-70B         (Critic, different family from both fixers)
+# Four vLLM servers on separate ports:
+#   port 8000  Qwen2.5-Coder-32B     (Fixer A, Alibaba family)
+#   port 8001  DeepSeek-Coder-V2     (Fixer B, DeepSeek family)
+#   port 8002  Llama-3.3-70B         (Critic,  Meta family)
+#   port 8003  Devstral-Small-2505   (Synthesis, Mistral family)
+# All four must be from different model families — enforced at startup by
+# assert_family_independence(). Leave a *_base_url blank to route that
+# role through OpenRouter instead of a local vLLM server.
 [gap5]
 enabled                  = false
 vllm_secondary_base_url  = "http://localhost:8001/v1"
 vllm_secondary_model     = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
 vllm_critic_base_url     = "http://localhost:8002/v1"
 vllm_critic_model        = "openai/meta-llama/Llama-3.3-70B-Instruct"
+# Synthesis vLLM endpoint (Mistral family — fourth independent family).
+# Leave vllm_synthesis_base_url blank to route through OpenRouter Devstral.
+# Set to a local vLLM server to eliminate the OpenRouter dependency and cost.
+vllm_synthesis_base_url  = ""
+vllm_synthesis_model     = "mistralai/Devstral-Small-2505"
 bobn_n_candidates        = 5
 bobn_fixer_a_count       = 3
 bobn_fixer_b_count       = 2
