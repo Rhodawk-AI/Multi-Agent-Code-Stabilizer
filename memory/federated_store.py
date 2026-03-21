@@ -379,6 +379,99 @@ class FederatedPatternStore:
         self._stats.active_peers = sum(1 for p in self._peers if p.active)
         return self._stats
 
+    async def record_usage(self, fingerprint: str, success: bool) -> bool:
+        """
+        Increment use_count (always) and success_count (when success=True)
+        for the pattern identified by fingerprint.
+
+        FIX (Defect 3): This method is the missing feedback loop for GAP 6.
+        use_count and success_count were defined on FederatedPattern,
+        propagated through pull/push, and displayed in formatted output —
+        but nothing ever wrote back to them.  Without this method being
+        called, quality-based ranking in serve_patterns was permanently
+        frozen at 0/0 for every pattern.
+
+        Returns True if the pattern was found and updated, False if the
+        fingerprint does not exist in the local cache (caller should 404).
+        """
+        if self._backend == "qdrant" and self._qdrant_client:
+            return await self._record_usage_qdrant(fingerprint, success)
+        elif self._backend == "json" and self._json_path:
+            return self._record_usage_json(fingerprint, success)
+        return False
+
+    async def _record_usage_qdrant(self, fingerprint: str, success: bool) -> bool:
+        """Update use_count / success_count for a pattern stored in Qdrant."""
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue  # type: ignore
+
+            # Locate the point by fingerprint payload field
+            uid = abs(hash(fingerprint)) % (10 ** 9)
+            results = self._qdrant_client.retrieve(
+                collection_name=_FED_COLLECTION,
+                ids=[uid],
+                with_payload=True,
+            )
+            if not results:
+                return False
+
+            point   = results[0]
+            payload = dict(point.payload or {})
+
+            # Guard: verify fingerprint matches (hash collision defence)
+            if payload.get("fingerprint") != fingerprint:
+                return False
+
+            payload["use_count"]     = int(payload.get("use_count", 0)) + 1
+            if success:
+                payload["success_count"] = int(payload.get("success_count", 0)) + 1
+
+            from qdrant_client.models import PointStruct  # type: ignore
+            vec = self._embed(payload.get("normalized_text", fingerprint))
+            self._qdrant_client.upsert(
+                collection_name=_FED_COLLECTION,
+                points=[PointStruct(id=uid, vector=vec, payload=payload)],
+            )
+            self._stats.patterns_applied += 1
+            log.debug(
+                f"FederatedStore.record_usage (qdrant): fingerprint="
+                f"{fingerprint[:16]}... use={payload['use_count']} "
+                f"success={payload.get('success_count', 0)}"
+            )
+            return True
+        except Exception as exc:
+            log.debug(f"FederatedStore._record_usage_qdrant: {exc}")
+            return False
+
+    def _record_usage_json(self, fingerprint: str, success: bool) -> bool:
+        """Update use_count / success_count for a pattern stored in the JSON fallback."""
+        if not self._json_path or not self._json_path.exists():
+            return False
+        try:
+            records = self._json_load_patterns()
+            found   = False
+            for record in records:
+                if record.get("fingerprint") == fingerprint:
+                    record["use_count"]     = int(record.get("use_count", 0)) + 1
+                    if success:
+                        record["success_count"] = int(record.get("success_count", 0)) + 1
+                    found = True
+                    break
+            if not found:
+                return False
+            self._json_path.write_text(
+                json.dumps(records, indent=2), encoding="utf-8"
+            )
+            self._stats.patterns_applied += 1
+            log.debug(
+                f"FederatedStore.record_usage (json): fingerprint="
+                f"{fingerprint[:16]}... updated"
+            )
+            return True
+        except Exception as exc:
+            log.debug(f"FederatedStore._record_usage_json: {exc}")
+            return False
+
     # ── Internal: peer HTTP ───────────────────────────────────────────────────
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -416,6 +509,71 @@ class FederatedPatternStore:
                     raise
                 await asyncio.sleep(0.5)
         return False
+
+    async def push_usage_feedback(
+        self,
+        fingerprint: str,
+        success:     bool,
+    ) -> None:
+        """
+        Report usage feedback for a federated pattern back to the peer
+        registries that originally served it.
+
+        FIX (Defect 3 - network layer): Closes the feedback loop at the
+        network level.  When this deployment applies a pattern received from
+        a remote registry and the test result is known, this method POSTs
+        back to every peer so their use_count / success_count are updated —
+        not just our local cache.
+
+        Fire-and-forget: failures are logged but never propagated.
+        """
+        if not self.contribute:
+            return
+
+        targets: list[str] = []
+        if self.registry_url:
+            targets.append(self.registry_url)
+        targets.extend(self.extra_peer_urls)
+        for peer in self._peers:
+            if peer.active and peer.url and peer.url not in targets:
+                targets.append(peer.url)
+
+        if not targets:
+            return
+
+        payload = {"success": success}
+        tasks = [
+            self._post_usage_to_peer(url, fingerprint, payload)
+            for url in targets
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for url, r in zip(targets, results):
+            if isinstance(r, Exception):
+                log.debug(
+                    f"FederatedStore.push_usage_feedback: peer {url} — {r}"
+                )
+
+    async def _post_usage_to_peer(
+        self, base_url: str, fingerprint: str, payload: dict
+    ) -> None:
+        """POST usage feedback to a single peer registry endpoint."""
+        url = f"{base_url}/api/federation/patterns/{fingerprint}/usage"
+        try:
+            session = await self._get_session()
+            async with session.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=_PUSH_TIMEOUT_S),
+            ) as resp:
+                if resp.status not in (200, 404):
+                    body = await resp.text()
+                    log.debug(
+                        f"FederatedStore._post_usage_to_peer: {url} "
+                        f"status={resp.status} body={body[:200]}"
+                    )
+        except Exception as exc:
+            log.debug(f"FederatedStore._post_usage_to_peer {url}: {exc}")
 
     async def _pull_from_peers(
         self, issue_type: str, query_text: str, n: int

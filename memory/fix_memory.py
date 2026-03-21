@@ -455,6 +455,61 @@ class FixMemory:
             ))
         return entries
 
+    def record_federated_usage(
+        self,
+        fingerprint: str,
+        success:     bool,
+    ) -> None:
+        """
+        Record that a federated pattern (identified by fingerprint) was applied
+        and report the outcome (success or failure) back to the federation.
+
+        FIX (Defect 3 — FixMemory layer): This is the caller-side half of the
+        feedback loop.  The fixer calls this method after gate evaluation
+        completes for any fix that drew on a [FEDERATED] pattern from
+        _retrieve_federated().  It:
+
+          1. Updates use_count / success_count in the local cache via
+             _federated_store.record_usage().
+          2. Fires push_usage_feedback() to propagate the outcome back to
+             every peer registry that may have served the pattern, so the
+             entire network benefits from real-world signal.
+
+        Both operations are fire-and-forget — they must never block or raise
+        to the caller.
+        """
+        if self._federated_store is None:
+            return
+
+        async def _record() -> None:
+            try:
+                # 1. Update local cache
+                await self._federated_store.record_usage(
+                    fingerprint=fingerprint,
+                    success=success,
+                )
+                # 2. Propagate to remote peers
+                if hasattr(self._federated_store, "push_usage_feedback"):
+                    await self._federated_store.push_usage_feedback(
+                        fingerprint=fingerprint,
+                        success=success,
+                    )
+                log.debug(
+                    f"FixMemory.record_federated_usage: fingerprint="
+                    f"{fingerprint[:16]}... success={success}"
+                )
+            except Exception as exc:
+                log.debug(f"FixMemory.record_federated_usage: {exc}")
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_record())
+            else:
+                loop.run_until_complete(_record())
+        except RuntimeError:
+            log.debug("FixMemory.record_federated_usage: no event loop — skipping")
+
     def set_federated_store(self, store: Any) -> None:
         """
         Wire a FederatedPatternStore into this FixMemory instance.
