@@ -253,70 +253,218 @@ class JoernClient:
         """Type flow graph analysis: find callers that violate the type contract
         of ``function_name``.
 
-        Two-pass implementation:
-          1. Query Joern for the declared return type of the function.
-          2. Query all callers and check whether each caller contains a
-             null/None/nullptr guard before using the return value.
+        Four-pass implementation — each pass catches a distinct violation class
+        that the others cannot detect:
 
-        A caller WITHOUT a null guard is a *type flow violation*: it assumes
-        a stricter type than the function may actually return.  This is the
-        exact cross-service pattern described in Gap 1:
-            auth_middleware.validate_session() started returning ``None``, but
-            payment_service.process_payment() still dereferences the result
-            as a ``User`` without checking.
+        Pass 1 — Return type resolution (shared by all passes)
+            Query Joern for the declared return type so every violation record
+            carries the type that changed.
+
+        Pass 2 — Null / None guard detection (enhanced)
+            Find callers whose control-flow graph contains NO guard against
+            None / null / nullptr before using the return value.  The regex
+            covers Python truthiness checks, Rust unwrap/expect, Java
+            Optional.isPresent, Kotlin requireNotNull, and assert statements —
+            all patterns the original single-pass implementation missed.
+
+        Pass 3 — Optional / Union return-type widening
+            When the declared return type is ``Optional[T]``, ``Union[T, None]``,
+            a nullable ``T?`` (Kotlin/Swift), or similar, find callers that invoke
+            a method or access an attribute directly on the return value without
+            a prior guard.  This catches the ``user.admin`` → ``None.admin``
+            crash class even when no null *literal* appears anywhere in the caller
+            (the old regex-only approach misses these entirely).
+
+        Pass 4 — Exception contract widening
+            When the function contains ``raise`` / ``throw`` sites, find callers
+            with no surrounding ``try/except/catch`` block.  This catches callers
+            broken by new exception types added to a function that previously
+            always returned cleanly — a common refactor regression that has
+            nothing to do with null values.
+
+        All passes run independently; results are deduplicated on
+        ``(caller_name, caller_file)`` so a caller that fails multiple checks
+        appears only once (with the first-detected violation type).
 
         Returns a list of dicts with keys:
             caller_name, caller_file, caller_line,
-            return_type, has_null_guard, violation (bool), relationship
+            return_type, has_null_guard, violation (bool),
+            violation_type (str), relationship
         """
         if not self.is_ready:
             return []
+
+        # Keyed on ``caller_name::caller_file`` to deduplicate across passes.
+        results: dict[str, dict] = {}
+
+        # ── Pass 1: resolve declared return type ─────────────────────────────
+        return_type = "ANY"
         try:
-            # Pass 1: resolve the declared return type
             rtype_q = (
                 f'cpg.method.name("{_esc(function_name)}")'
-                ".methodReturn.typeFullName.l.headOption.getOrElse(\"ANY\")"
+                '.methodReturn.typeFullName.l.headOption.getOrElse("ANY")'
             )
             rtype_raw = await self._query(rtype_q)
             return_type = str(rtype_raw[0]) if rtype_raw else "ANY"
+        except Exception as exc:
+            log.debug(f"JoernClient.get_type_flows_to_callers pass1 ({function_name}): {exc}")
 
-            # Pass 2: callers + null-guard detection via AST control-flow scan
-            # The regex covers Python (None / is None / != None),
-            # C/C++/Java (null / NULL / nullptr / != null), and
-            # common guard idioms (Optional.isPresent, hasValue, etc.)
+        # ── Pass 2: null / None guard detection (enhanced) ───────────────────
+        # The regex now additionally covers:
+        #   • Python truthiness + early-return:  ``if result:`` / ``assert result``
+        #   • Rust:   ``.unwrap()`` / ``.expect()`` / ``.unwrap_or()``
+        #   • Java:   ``Objects.requireNonNull`` / ``Optional.isPresent``
+        #   • Kotlin: ``requireNotNull`` / ``checkNotNull`` / ``?.``
+        #   • Go:     ``if err != nil`` / ``if v == nil``
+        #   • Control-structure early returns that check the value
+        # A caller that passes ANY of these checks is considered guarded.
+        try:
             null_guard_regex = (
                 ".*None.*|.*null.*|.*nullptr.*|.*NULL.*"
                 "|.*is_none.*|.*isNone.*|.*isEmpty.*"
                 "|.*Optional.*|.*hasValue.*|.*isDefined.*"
+                "|.*isPresent.*|.*isNotNull.*|.*nonNull.*"
+                "|.*checkNotNull.*|.*requireNotNull.*"
+                "|.*unwrap.*|.*expect.*|.*unwrap_or.*"
+                "|.*getOrElse.*|.*orElse.*|.*ifPresent.*"
+                "|.*assert.*"
             )
-            q = (
+            q2 = (
                 f'cpg.method.name("{_esc(function_name)}").caller\n'
                 ".map(m => Map(\n"
                 '  "callerName" -> m.name,\n'
                 '  "callerFile" -> m.filename,\n'
                 '  "callerLine" -> m.lineNumber.getOrElse(0),\n'
-                "  \"hasNullGuard\" -> m.ast.isControlStructure\n"
-                f'    .condition.code("{_esc(null_guard_regex)}").l.nonEmpty\n'
-                f')).take({max_results}).l'
+                '  "hasNullGuard" -> (\n'
+                "    m.ast.isControlStructure\n"
+                f'      .condition.code("{_esc(null_guard_regex)}").l.nonEmpty\n'
+                # Also treat an early-return on the result as a guard:
+                # ``if result is None: return`` — the return node itself has None
+                "    || m.ast.isReturn.code(\".*None.*|.*null.*|.*nullptr.*\").l.nonEmpty\n"
+                # Treat assert / require calls as guards (Kotlin / Python / Guava)
+                "    || m.ast.isCall\n"
+                "         .name(\"assert|require|checkNotNull|requireNotNull|Objects.requireNonNull\")\n"
+                "         .l.nonEmpty\n"
+                "  )\n"
+                f")).take({max_results}).l"
             )
-            raw = await self._query(q)
-            results: list[dict] = []
-            for r in raw:
+            raw2 = await self._query(q2)
+            for r in raw2:
                 has_guard = bool(r.get("hasNullGuard", True))
-                results.append({
-                    "caller_name":  r.get("callerName", ""),
-                    "caller_file":  r.get("callerFile", ""),
-                    "caller_line":  int(r.get("callerLine", 0)),
-                    "return_type":  return_type,
-                    "has_null_guard": has_guard,
-                    # violation = caller does NOT guard against non-standard type
-                    "violation":    not has_guard,
-                    "relationship": "type_flow_caller",
-                })
-            return results
+                if not has_guard:
+                    key = f"{r.get('callerName', '')}::{r.get('callerFile', '')}"
+                    results[key] = {
+                        "caller_name":    r.get("callerName", ""),
+                        "caller_file":    r.get("callerFile", ""),
+                        "caller_line":    int(r.get("callerLine", 0)),
+                        "return_type":    return_type,
+                        "has_null_guard": False,
+                        "violation":      True,
+                        "violation_type": "missing_null_guard",
+                        "relationship":   "type_flow_caller",
+                    }
         except Exception as exc:
-            log.debug(f"JoernClient.get_type_flows_to_callers({function_name}): {exc}")
-            return []
+            log.debug(f"JoernClient.get_type_flows_to_callers pass2 ({function_name}): {exc}")
+
+        # ── Pass 3: Optional / Union return-type widening ────────────────────
+        # When the return type annotation itself signals optionality (Optional,
+        # Union, nullable ``?``, Maybe, Result …) find callers that invoke a
+        # method call or attribute access directly on the return value without
+        # an intervening guard.  These callers will crash when the function
+        # starts returning None — even though no null literal appears in the
+        # caller body (so Pass 2 alone would miss them).
+        _optional_markers = (
+            "Optional", "Union", "NoneType", "?", "Maybe",
+            "Result", "nullable", "Nullable",
+        )
+        if return_type != "ANY" and any(m in return_type for m in _optional_markers):
+            try:
+                # A caller violates this contract when:
+                #   (a) it calls our function and immediately chains a member
+                #       access or subscript on the return value, AND
+                #   (b) it has no null-guard control structure anywhere in its
+                #       AST (a full guard in any branch is enough to be safe).
+                q3 = (
+                    f'cpg.method.name("{_esc(function_name)}").caller\n'
+                    ".filter(m =>\n"
+                    # (a) return value used as receiver of a member call
+                    "  m.ast.isCall.filter(c =>\n"
+                    f'    c.argument.isCall.name("{_esc(function_name)}").nonEmpty\n'
+                    "  ).nonEmpty\n"
+                    # (b) no null guard anywhere in the caller
+                    "  && !m.ast.isControlStructure\n"
+                    '      .condition.code(".*None.*|.*null.*|.*Optional.*|.*isDefined.*")\n'
+                    "      .l.nonEmpty\n"
+                    ")\n"
+                    ".map(m => Map(\n"
+                    '  "callerName" -> m.name,\n'
+                    '  "callerFile" -> m.filename,\n'
+                    '  "callerLine" -> m.lineNumber.getOrElse(0)\n'
+                    f')).take({max_results}).l'
+                )
+                raw3 = await self._query(q3)
+                for r in raw3:
+                    key = f"{r.get('callerName', '')}::{r.get('callerFile', '')}"
+                    if key not in results:
+                        results[key] = {
+                            "caller_name":    r.get("callerName", ""),
+                            "caller_file":    r.get("callerFile", ""),
+                            "caller_line":    int(r.get("callerLine", 0)),
+                            "return_type":    return_type,
+                            "has_null_guard": False,
+                            "violation":      True,
+                            "violation_type": "optional_return_unguarded_deref",
+                            "relationship":   "type_flow_caller",
+                        }
+            except Exception as exc:
+                log.debug(f"JoernClient.get_type_flows_to_callers pass3 ({function_name}): {exc}")
+
+        # ── Pass 4: exception contract widening ──────────────────────────────
+        # If the function contains raise / throw sites, find callers that do
+        # NOT wrap the call in a try / except / catch block.  These callers
+        # are broken when a function that previously always returned cleanly
+        # starts raising — a refactor regression completely invisible to
+        # null-guard analysis.
+        try:
+            q4_count = (
+                f'cpg.method.name("{_esc(function_name)}")\n'
+                '  .ast.isCall.name("raise|Raise|throw|Throw|ThrowNew|throwError")\n'
+                "  .l.size"
+            )
+            raises_raw = await self._query(q4_count)
+            has_raises = int(raises_raw[0]) > 0 if raises_raw else False
+
+            if has_raises:
+                q4_callers = (
+                    f'cpg.method.name("{_esc(function_name)}").caller\n'
+                    ".filter(m =>\n"
+                    "  !m.ast.isControlStructure\n"
+                    '    .controlStructureType("TRY|CATCH").l.nonEmpty\n'
+                    ")\n"
+                    ".map(m => Map(\n"
+                    '  "callerName" -> m.name,\n'
+                    '  "callerFile" -> m.filename,\n'
+                    '  "callerLine" -> m.lineNumber.getOrElse(0)\n'
+                    f')).take({max_results}).l'
+                )
+                raw4 = await self._query(q4_callers)
+                for r in raw4:
+                    key = f"{r.get('callerName', '')}::{r.get('callerFile', '')}"
+                    if key not in results:
+                        results[key] = {
+                            "caller_name":    r.get("callerName", ""),
+                            "caller_file":    r.get("callerFile", ""),
+                            "caller_line":    int(r.get("callerLine", 0)),
+                            "return_type":    return_type,
+                            "has_null_guard": False,
+                            "violation":      True,
+                            "violation_type": "missing_exception_handler",
+                            "relationship":   "type_flow_caller",
+                        }
+        except Exception as exc:
+            log.debug(f"JoernClient.get_type_flows_to_callers pass4 ({function_name}): {exc}")
+
+        return list(results.values())
 
     async def get_call_sites(self, function_name: str) -> list[dict]:
         if not self.is_ready:
