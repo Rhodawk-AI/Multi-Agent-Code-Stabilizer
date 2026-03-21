@@ -1,16 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# MACS — Multi-Agent Code Stabilizer
-# Default Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-# All values can be overridden by environment variables.
-# See config/loader.py for the full override map.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Domain mode: general | finance | medical | military | embedded
-# Finance: PCI-DSS, no float on monetary values, atomic balance ops
-# Medical: IEC 62304, HIPAA, dosage safety
-# Military: MISRA-C, DO-178C, no dynamic alloc, no goto
-# Embedded: RTOS rules: no dynamic alloc, bounded loops, no stdio
 domain_mode = "general"
 
 # ─── Models ──────────────────────────────────────────────────────────────────
