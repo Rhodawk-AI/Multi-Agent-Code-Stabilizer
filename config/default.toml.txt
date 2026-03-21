@@ -1,0 +1,138 @@
+# MACS — Multi-Agent Code Stabilizer
+# All values can be overridden by environment variables (see config/loader.py).
+
+# domain_mode: general | finance | medical | military | embedded
+domain_mode = "general"
+
+[models]
+# Heavy models served via vLLM (openai/ = OpenAI-compatible local endpoint)
+primary               = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+audit_model           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+fix_model             = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+critical_fix_model    = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
+# Light models served via Ollama (triage/fallback only)
+triage_model          = "ollama/granite-code:3b"
+fallbacks             = ["ollama/qwen2.5-coder:7b", "ollama/deepseek-coder-v2"]
+cross_validate_critical = true
+
+[loop]
+max_cycles             = 50
+cost_ceiling_usd       = 50.0
+concurrency            = 4
+chunk_concurrency      = 4
+stall_threshold        = 2
+regression_threshold   = 0.10
+max_fix_attempts       = 3
+parallel_fixes         = true
+
+[chunking]
+threshold_full         = 200
+threshold_half         = 1_000
+threshold_ast          = 5_000
+threshold_skeleton     = 20_000
+
+[auditing]
+direct_audit_line_threshold = 5_000
+validate_findings           = true
+audit_batch_size            = 20
+
+[static_analysis]
+run_ruff          = true
+run_mypy          = true
+run_semgrep       = true
+run_bandit        = true
+fail_on_warning   = false
+timeout_s         = 60
+
+[graph]
+enabled                  = true
+backend                  = "networkx"   # networkx | neo4j
+min_centrality_threshold = 0.0
+neo4j_uri                = "bolt://localhost:7687"
+neo4j_user               = "neo4j"
+neo4j_password           = ""
+
+[formal_verification]
+enabled   = false
+solver    = "z3"
+timeout_s = 30
+domains   = ["finance", "medical", "military"]
+
+[test_runner]
+enabled   = true
+timeout_s = 300
+
+[brain]
+backend                = "sqlite"
+db_path                = ".stabilizer/brain.db"
+vector_store_enabled   = false
+vector_store_path      = ".stabilizer/vectors"
+vector_embedding_model = "all-MiniLM-L6-v2"
+
+[patrol]
+poll_interval_s          = 60
+task_timeout_min         = 15
+rejection_rate_threshold = 0.50
+cost_warn_pct            = 0.80
+
+[github]
+base_branch   = "main"
+branch_prefix = "stabilizer"
+auto_merge    = false
+
+[api]
+host   = "0.0.0.0"
+port   = 8000
+reload = false
+
+[consensus]
+critical_min_agents        = 2
+critical_confidence_floor  = 0.85
+critical_requires_security = true
+major_min_agents           = 2
+major_confidence_floor     = 0.70
+minor_min_agents           = 1
+minor_confidence_floor     = 0.50
+high_centrality_threshold  = 0.70
+high_centrality_multiplier = 1.20
+
+[plugins]
+paths = []
+
+# Gap 1: Joern Code Property Graph
+# docker-compose up joern, then set JOERN_REPO_PATH to your repo.
+[cpg]
+enabled                = true
+joern_url              = "http://localhost:8080"
+joern_repo_path        = ""
+joern_project_name     = "rhodawk"
+blast_radius_threshold = 50
+max_slice_nodes        = 50
+max_files_in_slice     = 30
+
+# Gap 2: synthesis_model must be a different family from primary.
+# e.g. primary is qwen (Alibaba) so use deepseek or llama here.
+[synthesis]
+enabled               = true
+dedup_enabled         = true
+compound_enabled      = true
+synthesis_model       = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
+max_compound_findings = 20
+
+# Gap 5: adversarial BoBN ensemble.
+# Three vLLM servers on separate ports:
+#   port 8000  Qwen2.5-Coder-32B     (Fixer A, primary)
+#   port 8001  DeepSeek-Coder-V2     (Fixer B, different family)
+#   port 8002  Llama-3.3-70B         (Critic, different family from both fixers)
+[gap5]
+enabled                  = false
+vllm_secondary_base_url  = "http://localhost:8001/v1"
+vllm_secondary_model     = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
+vllm_critic_base_url     = "http://localhost:8002/v1"
+vllm_critic_model        = "openai/meta-llama/Llama-3.3-70B-Instruct"
+bobn_n_candidates        = 5
+bobn_fixer_a_count       = 3
+bobn_fixer_b_count       = 2
+critic_weight_test       = 0.6
+critic_weight_robustness = 0.3
+critic_weight_minimality = 0.1
