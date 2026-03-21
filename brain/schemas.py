@@ -482,6 +482,16 @@ class Issue(BaseModel):
     closed_at: datetime | None = None
     last_updated: datetime = Field(default_factory=_utcnow)
     escalation_id: str = ''
+    # BoBN / SWE-bench integration fields.
+    # fail_tests: test IDs that must be fixed by the patch (FAIL_TO_PASS signal).
+    # pass_tests: test IDs that must remain green after the patch (PASS_TO_PASS signal).
+    # base_commit: the git commit SHA the issue was detected against; passed to
+    #              ExecutionFeedbackLoop so Docker containers start from the right
+    #              snapshot.  These were previously hardcoded to [] / None / "" in
+    #              _phase_fix_gap5, which zeroed every BoBN test_score.
+    fail_tests:   list[str]       = Field(default_factory=list)
+    pass_tests:   list[str]       = Field(default_factory=list)
+    base_commit:  str             = ''
 
 class FixedFile(BaseModel):
     path: str = ''
