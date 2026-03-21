@@ -1272,6 +1272,15 @@ class StabilizerController:
             # production safeguard; both paths running them is additive because the
             # inline gate operates on a BoBNCandidate stub while the controller path
             # operates on the persisted FixAttempt record.
+            # GAP 5 FIX: Trajectory collector for ARPO RL training corpus.
+            # Must be instantiated BEFORE BoBNSampler so the live reference is
+            # passed in — not the None placeholder from __init__.
+            # Previously this block appeared AFTER BoBNSampler construction,
+            # so self._trajectory_collector was always None inside the sampler
+            # and no training data was ever collected.
+            from swe_bench.trajectory_collector import TrajectoryCollector
+            self._trajectory_collector = TrajectoryCollector()
+
             self._bobn_sampler = BoBNSampler(
                 model_router         = router,
                 critic               = self._adversarial_critic,
@@ -1283,12 +1292,6 @@ class StabilizerController:
                 domain_mode          = self.config.domain_mode,
                 mutation_threshold   = getattr(self.config, "mutation_score_threshold", None),
             )
-
-            # GAP 5 FIX: Trajectory collector for ARPO RL training corpus.
-            # Production fix runs should accumulate training data just like
-            # the SWE-bench evaluator path does.
-            from swe_bench.trajectory_collector import TrajectoryCollector
-            self._trajectory_collector = TrajectoryCollector()
 
             self.log.info(
                 "[gap5] Adversarial ensemble ready: "
@@ -1773,16 +1776,16 @@ class StabilizerController:
                 "— fix recorded in brain but not committed to VCS"
             )
 
-        async def _phase_fix(self, issues: list[Issue]) -> None:
-            assert self.run and self.storage
+    async def _phase_fix(self, issues: list[Issue]) -> None:
+        assert self.run and self.storage
 
-            # Enforce reviewer independence BEFORE creating the fixer
-            if self._independence_enforcer:
-                self._independence_enforcer.verify_or_raise(
-                    context=f"run={self.run.id[:8]}"
-                )
+        # Enforce reviewer independence BEFORE creating the fixer
+        if self._independence_enforcer:
+            self._independence_enforcer.verify_or_raise(
+                context=f"run={self.run.id[:8]}"
+            )
 
-            fixer = FixerAgent(
+        fixer = FixerAgent(
             storage=self.storage,
             run_id=self.run.id,
             config=_agent_cfg(self.config, self.run.id),
