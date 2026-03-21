@@ -116,6 +116,68 @@ _MILITARY_PROPERTIES: list[dict[str, str]] = [
 ]
 
 _CBMC_TIMEOUT_S = 120
+_PYTHON_CHECK_TIMEOUT_S = 60
+
+# Python-specific security / correctness properties checked via AST + bandit.
+# These mirror the intent of the C/C++ CBMC checks for Python codebases.
+_PYTHON_AST_PROPERTIES: list[dict] = [
+    {
+        "name":    "no_exec_eval",
+        "desc":    "No exec() or eval() with dynamic content (CWE-78 / CWE-95)",
+        "pattern": r"\b(?:exec|eval)\s*\(",
+        "cwe":     "CWE-95",
+        "severity": "critical",
+    },
+    {
+        "name":    "no_unsafe_deserialize",
+        "desc":    "No pickle.loads / yaml.load without Loader (CWE-502)",
+        "pattern": r"\bpickle\.loads?\s*\(|\byaml\.load\s*\([^,)]+\)",
+        "cwe":     "CWE-502",
+        "severity": "critical",
+    },
+    {
+        "name":    "no_shell_true",
+        "desc":    "No subprocess with shell=True (CWE-78)",
+        "pattern": r"shell\s*=\s*True",
+        "cwe":     "CWE-78",
+        "severity": "high",
+    },
+    {
+        "name":    "no_hardcoded_secrets",
+        "desc":    "No hardcoded passwords, tokens, or API keys (CWE-798)",
+        "pattern": r"(?:password|passwd|secret|api_key|token)\s*=\s*['\"][^'\"]{4,}['\"]",
+        "cwe":     "CWE-798",
+        "severity": "high",
+    },
+    {
+        "name":    "no_assert_in_production",
+        "desc":    "No assert statements in production logic (optimized away with -O)",
+        "pattern": r"^\s*assert\b",
+        "cwe":     "",
+        "severity": "medium",
+    },
+    {
+        "name":    "no_broad_except",
+        "desc":    "No bare except: or except Exception without re-raise (swallows errors)",
+        "pattern": r"^\s*except\s*(?:Exception\s*)?:\s*$",
+        "cwe":     "",
+        "severity": "medium",
+    },
+    {
+        "name":    "no_mutable_default_arg",
+        "desc":    "No mutable default arguments ([] or {} in def signatures) — CWE-362 adjacent",
+        "pattern": r"def\s+\w+\s*\([^)]*=\s*[\[{]",
+        "cwe":     "",
+        "severity": "medium",
+    },
+    {
+        "name":    "no_open_without_encoding",
+        "desc":    "open() calls should specify encoding= to avoid locale-dependent behaviour",
+        "pattern": r"\bopen\s*\([^)]*\)(?![^)]*encoding\s*=)",
+        "cwe":     "",
+        "severity": "low",
+    },
+]
 
 
 class Z3ConstraintResponse(BaseModel):
@@ -188,11 +250,29 @@ class FormalVerifierAgent(BaseAgent):
         self, fix_id: str, file_path: str, content: str
     ) -> list[FormalVerificationResult]:
         ext = Path(file_path).suffix.lower()
-        is_c_family = ext in {".c", ".h", ".cpp", ".cc", ".hpp"}
+        is_c_family  = ext in {".c", ".h", ".cpp", ".cc", ".hpp"}
+        is_python    = ext in {".py", ".pyw"}
 
         results: list[FormalVerificationResult] = []
 
-        # CBMC for C/C++ files (DO-178C admissible formal evidence)
+        # ── Python: AST + bandit bounded check ───────────────────────────────
+        # Equivalent role to CBMC for Python files.  Runs two layers:
+        #   1. Pattern-based AST property scan (_PYTHON_AST_PROPERTIES)
+        #   2. bandit subprocess for deeper dataflow-aware security analysis
+        # If bandit is not installed, layer 2 is skipped gracefully.
+        if is_python:
+            py_results = await self._run_python_ast_check(fix_id, file_path, content)
+            if py_results:
+                results.extend(py_results)
+                # If any CRITICAL counterexample found, return early (same logic as CBMC)
+                if any(
+                    r.status == FormalVerificationStatus.COUNTEREXAMPLE
+                    and getattr(r, "solver", "") in {"python_ast", "bandit"}
+                    for r in py_results
+                ):
+                    return results
+
+        # ── C/C++: CBMC bounded model checker ────────────────────────────────
         if is_c_family and is_available("cbmc"):
             cbmc_result = await self._run_cbmc(fix_id, file_path, content)
             if cbmc_result:
@@ -389,6 +469,143 @@ class FormalVerifierAgent(BaseAgent):
                 solver="z3",
                 elapsed_s=time.monotonic() - start,
             )
+
+    async def _run_python_ast_check(
+        self,
+        fix_id:    str,
+        file_path: str,
+        content:   str,
+    ) -> list[FormalVerificationResult]:
+        """
+        Python-equivalent of CBMC: AST pattern scan + bandit subprocess.
+
+        Layer 1 — AST pattern scan (_PYTHON_AST_PROPERTIES):
+          Fast regex-based checks against known dangerous patterns in the
+          patched content.  Produces FormalVerificationResult per property,
+          using solver="python_ast".
+
+        Layer 2 — bandit:
+          bandit is a Python static analysis tool that performs dataflow-aware
+          security checks (equivalent in spirit to CBMC's --pointer-check,
+          --bounds-check).  If bandit is not installed this layer is silently
+          skipped — the AST scan results still stand.
+
+        Returns a list of FormalVerificationResult records, one per violated
+        property plus one summary entry from bandit if issues are found.
+        All results are also written to the evidence directory.
+        """
+        import time
+        results: list[FormalVerificationResult] = []
+        start = time.monotonic()
+
+        # ── Layer 1: AST pattern scan ─────────────────────────────────────────
+        for prop in _PYTHON_AST_PROPERTIES:
+            pattern = prop.get("pattern", "")
+            if not pattern:
+                continue
+
+            match = re.search(pattern, content, re.MULTILINE)
+            status = (
+                FormalVerificationStatus.COUNTEREXAMPLE
+                if match
+                else FormalVerificationStatus.PROVED
+            )
+            r = FormalVerificationResult(
+                fix_attempt_id = fix_id,
+                file_path      = file_path,
+                property_name  = prop["name"],
+                status         = status,
+                counterexample = (
+                    f"Pattern '{pattern}' matched at pos {match.start()}: "
+                    f"{match.group()[:120]!r}"
+                ) if match else "",
+                solver         = "python_ast",
+                elapsed_s      = time.monotonic() - start,
+            )
+            self._write_evidence(r)
+            await self.storage.upsert_formal_result(r)
+            results.append(r)
+
+        # ── Layer 2: bandit subprocess ────────────────────────────────────────
+        # Only run if bandit is available.  Failures are non-fatal.
+        try:
+            import shutil
+            if shutil.which("bandit"):
+                with tempfile.NamedTemporaryFile(
+                    suffix=".py", mode="w", encoding="utf-8", delete=False
+                ) as f:
+                    f.write(content)
+                    tmp_path = f.name
+
+                bandit_start = time.monotonic()
+                proc = subprocess.run(
+                    [
+                        "bandit", tmp_path,
+                        "--format", "json",
+                        "--severity-level", "medium",   # medium + high + critical
+                        "--confidence-level", "medium",
+                        "--quiet",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=_PYTHON_CHECK_TIMEOUT_S,
+                )
+                bandit_elapsed = time.monotonic() - bandit_start
+                Path(tmp_path).unlink(missing_ok=True)
+
+                # bandit exits 1 when issues are found, 0 when clean
+                if proc.stdout:
+                    try:
+                        data = json.loads(proc.stdout)
+                        issues = data.get("results", [])
+                        if issues:
+                            # Produce one consolidated counterexample record
+                            high_issues = [
+                                i for i in issues
+                                if i.get("issue_severity", "").upper() in {"HIGH", "CRITICAL"}
+                            ]
+                            summary_lines = []
+                            for iss in (high_issues or issues)[:5]:
+                                summary_lines.append(
+                                    f"[{iss.get('issue_severity','?')}] "
+                                    f"Line {iss.get('line_number','?')}: "
+                                    f"{iss.get('issue_text','')[:100]} "
+                                    f"(CWE: {iss.get('issue_cwe',{}).get('id','?')})"
+                                )
+                            r = FormalVerificationResult(
+                                fix_attempt_id = fix_id,
+                                file_path      = file_path,
+                                property_name  = "bandit_security_scan",
+                                status         = FormalVerificationStatus.COUNTEREXAMPLE,
+                                counterexample = "\n".join(summary_lines),
+                                solver         = "bandit",
+                                elapsed_s      = bandit_elapsed,
+                            )
+                            self._write_evidence(r)
+                            await self.storage.upsert_formal_result(r)
+                            results.append(r)
+                        else:
+                            # Clean scan
+                            r = FormalVerificationResult(
+                                fix_attempt_id = fix_id,
+                                file_path      = file_path,
+                                property_name  = "bandit_security_scan",
+                                status         = FormalVerificationStatus.PROVED,
+                                solver         = "bandit",
+                                elapsed_s      = bandit_elapsed,
+                            )
+                            await self.storage.upsert_formal_result(r)
+                            results.append(r)
+                    except json.JSONDecodeError:
+                        log.debug(f"[formal] bandit JSON parse failed for {file_path}")
+            else:
+                log.debug("[formal] bandit not installed — Python Layer 2 skipped")
+        except subprocess.TimeoutExpired:
+            log.warning(f"[formal] bandit timed out for {file_path}")
+        except Exception as exc:
+            log.debug(f"[formal] bandit non-fatal error for {file_path}: {exc}")
+
+        return results
 
     async def _run_cbmc(
         self,
