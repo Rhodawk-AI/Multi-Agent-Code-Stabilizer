@@ -148,7 +148,39 @@ class CPGContextSelector:
                 for _, _, content in excerpts:
                     lines_used += content.count("\n") + 1
 
-        ctx.total_lines  = lines_used
+        ctx.total_lines = lines_used
+
+        # ── Gap 1 Extension: cross-service context block ──────────────────────
+        # Append a Markdown block describing inter-service dependencies that are
+        # invisible to Joern.  This is appended to cpg_header so it appears at
+        # the TOP of the fixer's context prompt — before the file excerpts —
+        # ensuring the model cannot miss it when reasoning about contract safety.
+        if self._cpg and hasattr(self._cpg, "_service_tracker"):
+            tracker = self._cpg._service_tracker
+            if tracker is None:
+                # Lazy scan if not yet run (e.g. CPGEngine initialised without
+                # repo_root but root is available from this selector)
+                try:
+                    from cpg.service_boundary_tracker import ServiceBoundaryTracker
+                    if self._root:
+                        tracker = ServiceBoundaryTracker(repo_root=self._root)
+                        await tracker.scan()
+                        self._cpg._service_tracker = tracker
+                except Exception as exc:
+                    log.debug(f"CPGContextSelector: service tracker lazy init: {exc}")
+
+            if tracker and tracker.is_ready:
+                svc_block = tracker.format_context_block(
+                    file_path=issue_file,
+                    function_names=[issue_function] if issue_function else None,
+                )
+                if svc_block:
+                    ctx.cpg_header = svc_block + "\n" + (ctx.cpg_header or "")
+                    log.info(
+                        f"CPGContextSelector: injected cross-service context block "
+                        f"for {issue_function!r} in {issue_file!r}"
+                    )
+
         ctx.context_text = self._format_context_text(ctx)
         return ctx
 

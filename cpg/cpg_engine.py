@@ -27,6 +27,12 @@ class CPGContextSlice:
     # may return (e.g. no None-check after a function that can return None).
     # Populated only when Joern is available; empty otherwise.
     type_flow_violations: list[dict] = field(default_factory=list)
+    # Gap 1 Extension – cross-service callers: upstream services that call
+    # this function's endpoint via HTTP/gRPC/AsyncAPI.  These are invisible
+    # to Joern because they cross a network boundary.  Populated by
+    # ServiceBoundaryTracker when contract files (.proto, openapi.yaml,
+    # asyncapi.yaml) are present in the repo.
+    cross_service_callers: list[dict] = field(default_factory=list)
     files_in_slice:       list[str]  = field(default_factory=list)
     total_functions:      int        = 0
     total_files:          int        = 0
@@ -48,6 +54,15 @@ class CPGBlastRadius:
     # (lower than a direct caller, but not zero).
     importing_modules:       list[str]  = field(default_factory=list)
     importing_module_count:  int        = 0
+    # Gap 1 Extension – cross-service dependencies: downstream services
+    # that consume this code's output via HTTP/gRPC/AsyncAPI contracts.
+    # These are invisible to Joern and the import graph.  Populated by
+    # ServiceBoundaryTracker; empty when no contract files are found.
+    # A non-empty list forces requires_human_review=True regardless of
+    # the intra-repo blast score, because a contract change can silently
+    # break deployed services that cannot be analysed statically.
+    cross_service_dependencies: list[str]  = field(default_factory=list)
+    cross_service_edge_count:   int        = 0
     blast_radius_score:      float      = 0.0
     requires_human_review:   bool       = False
     source:                  str        = "cpg"
@@ -61,10 +76,12 @@ class CPGEngine:
         joern_url:              str        = "http://localhost:8080",
         graph_engine:           Any | None = None,
         blast_radius_threshold: int        = 50,
+        repo_root:              str        = "",
     ) -> None:
         self.joern_url              = joern_url
         self.graph_engine           = graph_engine
         self.blast_radius_threshold = blast_radius_threshold
+        self._repo_root:     str = repo_root
         self._client:        JoernClient | None = None
         self._ready          = False
         self._project_name:  str = ""
@@ -72,6 +89,11 @@ class CPGEngine:
         self._caller_cache:  dict[str, tuple[float, list]] = {}
         self._callee_cache:  dict[str, tuple[float, list]] = {}
         self._slice_cache:   dict[str, tuple[float, CPGContextSlice]] = {}
+
+        # Gap 1 Extension: service boundary tracker — loads lazily on first use
+        # so CPGEngine construction remains synchronous and zero-cost when no
+        # contract files exist in the repo.
+        self._service_tracker: Any | None = None   # ServiceBoundaryTracker
 
     async def initialise(
         self,
@@ -82,6 +104,8 @@ class CPGEngine:
         if joern_url:
             self.joern_url = joern_url
         self._repo_path    = repo_path
+        if repo_path and not self._repo_root:
+            self._repo_root = repo_path
         self._project_name = project_name
         self._client = JoernClient(base_url=self.joern_url)
         connected = await self._client.connect()
@@ -94,6 +118,10 @@ class CPGEngine:
             if imported:
                 await self._client.set_active_project(project_name)
         self._ready = True
+
+        # Initialise service boundary tracker now that we know the repo root.
+        await self._ensure_service_tracker()
+
         log.info(f"CPGEngine: ready. project={project_name} repo={repo_path}")
         return True
 
@@ -101,6 +129,40 @@ class CPGEngine:
         if self._client:
             await self._client.close()
         self._ready = False
+
+    async def _ensure_service_tracker(self) -> Any | None:
+        """
+        Lazily initialise and scan the ServiceBoundaryTracker.
+
+        Called from initialise() (when we have a confirmed repo_path) and
+        from compute_blast_radius() / compute_context_slice() (as a safety
+        net in case initialise() was not called).
+
+        Returns the tracker after scan(), or None if the repo root is unknown
+        or the import fails.  Never raises.
+        """
+        if self._service_tracker is not None:
+            return self._service_tracker
+
+        root = self._repo_root or self._repo_path
+        if not root:
+            return None
+
+        try:
+            from cpg.service_boundary_tracker import ServiceBoundaryTracker
+            tracker = ServiceBoundaryTracker(repo_root=root)
+            await tracker.scan()
+            self._service_tracker = tracker
+            log.info(
+                f"CPGEngine: ServiceBoundaryTracker ready — "
+                f"{len(tracker.graph.endpoints) if tracker.graph else 0} endpoints, "
+                f"{len(tracker.graph.outbound_edges) if tracker.graph else 0} outbound edges"
+            )
+        except Exception as exc:
+            log.debug(f"CPGEngine._ensure_service_tracker: {exc}")
+            self._service_tracker = None
+
+        return self._service_tracker
 
     @property
     def is_available(self) -> bool:
@@ -153,6 +215,35 @@ class CPGEngine:
             fp = item.get("file", "")
             if fp and fp != "<unknown>":
                 all_files.add(fp)
+
+        # ── Gap 1 Extension: cross-service callers ────────────────────────────
+        # Add upstream services that call this function's endpoint.  These are
+        # invisible to Joern because they cross a network boundary.
+        tracker = await self._ensure_service_tracker()
+        if tracker:
+            svc_edges = tracker.get_cross_service_edges(
+                file_path=issue_file,
+                function_names=[issue_function] if issue_function else None,
+            )
+            result.cross_service_callers = [
+                {
+                    "service":          e.remote_service,
+                    "endpoint":         e.remote_endpoint,
+                    "method":           e.remote_method,
+                    "direction":        e.direction.value,
+                    "contract_type":    e.contract_type.value,
+                    "contract_file":    e.contract_file,
+                    "local_function":   e.local_function,
+                    "relationship":     "cross_service_dependency",
+                }
+                for e in svc_edges
+            ]
+            if result.cross_service_callers:
+                log.info(
+                    f"CPGEngine.compute_context_slice: service boundary tracker "
+                    f"added {len(result.cross_service_callers)} cross-service edges "
+                    f"for {issue_function!r}"
+                )
 
         result.files_in_slice  = sorted(all_files)
         result.total_files     = len(result.files_in_slice)
@@ -436,32 +527,67 @@ class CPGEngine:
             f for f in blast.affected_files if "test" in f.lower() or "spec" in f.lower()
         ]
 
+        # ── Gap 1 Extension: cross-service blast radius ───────────────────────
+        # Joern and the import graph only see intra-repo dependencies.  When
+        # changed functions are exposed via HTTP/gRPC/AsyncAPI contracts, the
+        # blast radius extends to all downstream services that consume those
+        # contracts — even though those services are in separate repos and
+        # invisible to any static analysis tool.
+        #
+        # A non-empty cross_service_dependencies list forces
+        # requires_human_review=True regardless of the intra-repo blast score,
+        # because a contract change can silently break deployed services.
+        tracker = await self._ensure_service_tracker()
+        if tracker:
+            affected_svc_files = list(set(file_paths or []) | set(blast.affected_files))
+            cross_svc = tracker.get_affected_services(
+                file_paths=affected_svc_files,
+                function_names=function_names,
+            )
+            blast.cross_service_dependencies = cross_svc
+            blast.cross_service_edge_count   = len(cross_svc)
+
+            if cross_svc:
+                log.warning(
+                    f"CPGEngine.compute_blast_radius: service boundary tracker "
+                    f"found {len(cross_svc)} downstream service(s) affected: "
+                    f"{cross_svc[:5]}{'…' if len(cross_svc) > 5 else ''}"
+                )
+
         # ── Blast radius score ────────────────────────────────────────────────
         # Score formula:
         #   base     = affected_function_count / 200   (call graph — full weight)
         #   import   = importing_module_count  / 400   (half weight: import-only
         #              modules are less immediately broken than direct callers,
         #              but still contribute risk at 10M-line scale)
-        # Both terms are clamped to [0.0, 1.0] independently, then averaged.
-        # This prevents a pathological codebase with 10k import-only files from
-        # inflating the score above what the call graph alone would produce.
-        call_score   = min(blast.affected_function_count / 200.0, 1.0)
-        import_score = min(blast.importing_module_count  / 400.0, 1.0)
-        # Weight: call graph contributes 80%, import graph contributes 20%.
-        # Rationale: an import-only reference is broken by type/signature changes
-        # but not by pure logic changes — it deserves less weight than a caller.
-        blast.blast_radius_score = round(0.8 * call_score + 0.2 * import_score, 4)
+        #   xservice = cross_service_edge_count / 10   (binary-ish: even 1
+        #              downstream service raises the score significantly because
+        #              the impact surface is now unbounded from a static analysis
+        #              perspective)
+        # All terms are clamped to [0.0, 1.0] independently.
+        # Weights: call graph 70%, import graph 15%, cross-service 15%.
+        call_score    = min(blast.affected_function_count / 200.0, 1.0)
+        import_score  = min(blast.importing_module_count  / 400.0, 1.0)
+        xsvc_score    = min(blast.cross_service_edge_count / 10.0,  1.0)
+        blast.blast_radius_score = round(
+            0.70 * call_score + 0.15 * import_score + 0.15 * xsvc_score, 4
+        )
 
-        # Human review gate fires when the TOTAL affected surface (callers +
-        # importers) exceeds the threshold.  Importers are counted at 0.5 weight
-        # because a pure import reference requires less rework than a call site.
+        # Human review gate:
+        #   - fires when weighted intra-repo total exceeds threshold, OR
+        #   - fires unconditionally when ANY cross-service dependency exists,
+        #     because static tools cannot bound the downstream blast surface.
         weighted_total = blast.affected_function_count + int(blast.importing_module_count * 0.5)
-        blast.requires_human_review = weighted_total >= self.blast_radius_threshold
+        blast.requires_human_review = (
+            weighted_total >= self.blast_radius_threshold
+            or blast.cross_service_edge_count > 0
+        )
 
         log.info(
             f"CPGEngine.compute_blast_radius: changed={len(function_names)} → "
             f"affected={blast.affected_function_count} fns/{blast.affected_file_count} files "
             f"importing_only={blast.importing_module_count} "
+            f"cross_service={blast.cross_service_edge_count} "
             f"score={blast.blast_radius_score:.4f} human_review={blast.requires_human_review} "
             f"source={blast.source}"
         )
@@ -679,6 +805,7 @@ def get_cpg_engine(
     joern_url:              str        = "http://localhost:8080",
     graph_engine:           Any | None = None,
     blast_radius_threshold: int        = 50,
+    repo_root:              str        = "",
 ) -> CPGEngine:
     global _engine
     if _engine is None:
@@ -686,5 +813,6 @@ def get_cpg_engine(
             joern_url=joern_url,
             graph_engine=graph_engine,
             blast_radius_threshold=blast_radius_threshold,
+            repo_root=repo_root,
         )
     return _engine
