@@ -144,21 +144,27 @@ class AdversarialCriticAgent:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # BUG FIX: previously used `idx = len(reports)` to look up the original
+        # candidate, but len(reports) grows only when a *successful* report is
+        # appended — so as soon as one task fails, every subsequent failed task
+        # maps to the wrong candidate.  The correct fix is to iterate over
+        # zip(results, candidates) so each result stays paired with the candidate
+        # that produced it, regardless of how many earlier tasks succeeded or failed.
         reports: list[CriticAttackReport] = []
-        for r in results:
+        for i, (r, candidate) in enumerate(zip(results, candidates)):
             if isinstance(r, CriticAttackReport):
                 reports.append(r)
             elif isinstance(r, Exception):
-                log.warning(f"[critic] attack failed: {r}")
-                # Don't drop the candidate — use neutral score
-                idx = len(reports)
-                if idx < len(candidates):
-                    reports.append(CriticAttackReport(
-                        candidate_id      = candidates[idx].get("id", str(idx)),
-                        attack_confidence = 0.5,   # neutral — can't attack, can't endorse
-                        critic_model      = self.model_router.critic_model(),
-                        raw_critique      = f"Critic error: {r}",
-                    ))
+                cid = candidate.get("id", str(i))
+                log.warning(f"[critic] attack failed for candidate {cid}: {r}")
+                # Don't drop the candidate — use neutral score so it can still
+                # participate in composite ranking (unknown robustness ≠ zero).
+                reports.append(CriticAttackReport(
+                    candidate_id      = cid,
+                    attack_confidence = 0.5,   # neutral — can't attack, can't endorse
+                    critic_model      = self.model_router.critic_model(),
+                    raw_critique      = f"Critic error: {r}",
+                ))
         return reports
 
     async def _attack_candidate(

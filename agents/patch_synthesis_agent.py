@@ -120,11 +120,18 @@ class PatchSynthesisAgent:
     def _synthesis_model(self) -> str:
         if self._model_override:
             return self._model_override
-        # CLOUD_OSS tier: Devstral-small or Llama-4-Scout — different families
-        # from Qwen (Fixer A), DeepSeek (Fixer B), and Llama (Critic).
-        # Devstral is Mistral family; Llama-4-Scout is still Meta but is a
-        # fundamentally different architecture from Llama-3.3.
-        return self.router.primary_model("critical_fix")
+        # INDEPENDENCE FIX: previously called self.router.primary_model("critical_fix")
+        # which can resolve to Llama-4-Scout (Meta family) — the same family as the
+        # adversarial critic (Llama-3.3-70B).  That produces two correlated Meta models
+        # in the pipeline and defeats the four-family independence requirement.
+        #
+        # router.synthesis_model() explicitly returns Devstral-Small (Mistral family),
+        # which is independent from all three other pipeline models:
+        #   Fixer A:   Qwen2.5-Coder-32B  → Alibaba
+        #   Fixer B:   DeepSeek-Coder-16B → DeepSeek
+        #   Critic:    Llama-3.3-70B      → Meta
+        #   Synthesis: Devstral-Small     → Mistral  ← this call
+        return self.router.synthesis_model()
 
     async def synthesize(
         self,
