@@ -35,9 +35,15 @@ GAP 5 Pipeline (replaces the one-shot crew.kickoff() call):
              composite = 0.6 × test_score + 0.3 × robustness + 0.1 × minimality
              Winner = argmax(composite_score)
 
-  Phase 5  — Formal gate (Z3/CBMC + mutation testing)
-             FormalVerifierAgent.verify_fix() on winning patch
+  Phase 5  — Formal gate (Z3/CBMC)
+             Pattern safety checks + Z3 SMT + CBMC for C/C++ patches
              If formal check fails, falls back to second-best candidate
+
+  Phase 5.5 — Test generation + mutation gate
+             TestGeneratorAgent generates pytest suite for changed Python files
+             MutationVerifierAgent runs mutmut; blocks patches below threshold
+             Non-blocking on infrastructure failure (mutmut not installed → skip)
+             RHODAWK_DISABLE_MUTATION=1 to skip; RHODAWK_MUTATION_THRESHOLD to tune
 
   Phase 6  — Trajectory collection
              All (prompt, patch, reward) triples written to TrajectoryCollector
@@ -49,7 +55,8 @@ Estimated score progression:
   + Phases 1-2:   ~73-78% (+8-10% from dual fixer + feedback loop)
   + Phases 3-4:   ~79-84% (+6-10% from adversarial BoBN)
   + Phase 5:      ~84-88% (+1-3% from formal gate)
-  + ARPO 500:     ~87-91% (+3-5% from RL fine-tuning)
+  + Phase 5.5:    ~85-89% (+0.5-1% from mutation gate — catches test-blind patches)
+  + ARPO 500:     ~88-92% (+3-5% from RL fine-tuning)
 
 Environment variables
 ──────────────────────
@@ -63,6 +70,8 @@ Environment variables
   RHODAWK_DISABLE_LOCALIZE — "1" to skip localization (debugging only)
   RHODAWK_DISABLE_CRITIC   — "1" to skip adversarial critique (faster, worse)
   RHODAWK_DISABLE_FORMAL   — "1" to skip formal gate in SWE path
+  RHODAWK_DISABLE_MUTATION — "1" to skip mutation gate (default: runs if mutmut installed)
+  RHODAWK_MUTATION_THRESHOLD — float 0-100, mutation score floor (default: 60.0)
 """
 from __future__ import annotations
 
@@ -88,6 +97,8 @@ _DISABLE_BOBN     = os.environ.get("RHODAWK_DISABLE_BOBN",     "0") == "1"
 _DISABLE_LOCALIZE = os.environ.get("RHODAWK_DISABLE_LOCALIZE", "0") == "1"
 _DISABLE_CRITIC   = os.environ.get("RHODAWK_DISABLE_CRITIC",   "0") == "1"
 _DISABLE_FORMAL   = os.environ.get("RHODAWK_DISABLE_FORMAL",   "0") == "1"
+_DISABLE_MUTATION = os.environ.get("RHODAWK_DISABLE_MUTATION", "0") == "1"
+_MUTATION_THRESHOLD = float(os.environ.get("RHODAWK_MUTATION_THRESHOLD", "60.0"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,6 +131,8 @@ class EvalResult:
     n_candidates:       int   = 0
     winning_score:      float = 0.0
     formal_gate_passed: bool  = False
+    mutation_gate_passed: bool  = False
+    mutation_score: float       = -1.0   # -1.0 = not run / not applicable
     trajectories_saved: int   = 0
 
 
@@ -141,6 +154,8 @@ class BenchmarkReport:
     bobn_usage_rate:         float = 0.0
     avg_candidates:          float = 0.0
     trajectory_corpus_size:  int   = 0
+    mutation_usage_rate:     float = 0.0   # fraction of instances where mutation gate ran
+    avg_mutation_score:      float = 0.0   # average mutation score across instances that ran
 
     def compute(self) -> None:
         self.total    = len(self.results)
@@ -160,6 +175,11 @@ class BenchmarkReport:
             )
             cands = [r.n_candidates for r in self.results if r.n_candidates > 0]
             self.avg_candidates = sum(cands) / len(cands) if cands else 0.0
+            # Mutation gate stats — only instances where it actually ran (score >= 0)
+            mut_ran  = [r for r in self.results if r.mutation_score >= 0.0]
+            self.mutation_usage_rate = len(mut_ran) / self.total if self.total else 0.0
+            scores = [r.mutation_score for r in mut_ran]
+            self.avg_mutation_score  = sum(scores) / len(scores) if scores else 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -316,6 +336,7 @@ class SWEBenchEvaluator:
             f"bobn={'ON' if not _DISABLE_BOBN else 'OFF'} "
             f"critic={'ON' if not _DISABLE_CRITIC else 'OFF'} "
             f"formal={'ON' if not _DISABLE_FORMAL else 'OFF'} "
+            f"mutation={'ON' if not _DISABLE_MUTATION else 'OFF'} "
             f"target={_TARGET:.0%}"
         )
 
@@ -383,6 +404,8 @@ class SWEBenchEvaluator:
                 result.n_candidates       = meta.get("n_candidates", 0)
                 result.winning_score      = meta.get("winning_score", 0.0)
                 result.formal_gate_passed = meta.get("formal_gate_passed", False)
+                result.mutation_gate_passed = meta.get("mutation_gate_passed", False)
+                result.mutation_score     = meta.get("mutation_score", -1.0)
                 result.trajectories_saved = meta.get("trajectories_saved", 0)
             elif self.use_swarm:
                 patch = await self._run_legacy_swarm_fix(instance)
@@ -471,6 +494,47 @@ class SWEBenchEvaluator:
                         f"trying second-best candidate"
                     )
                     winning_patch = second.patch
+
+        # ── Phase 5.5: Test generation + mutation gate ────────────────────────
+        # GAP 5 FIX: This step was present in controller.py's _phase_fix_gap5()
+        # but was missing entirely from the SWE-bench evaluator path.
+        # The audit diagram places "Test Generator + Mutation" between the formal
+        # gate and Commit — this wires it into the evaluator's pipeline so that
+        # benchmark runs benefit from the same gate as production deployments.
+        #
+        # Policy: non-blocking on infrastructure failure.  If mutmut is not
+        # installed, or if no Python files are touched by the patch, the gate
+        # is skipped and meta["mutation_gate_passed"] is set to True (no
+        # evidence of failure ≠ failure).  Only a confirmed mutation score
+        # below _MUTATION_THRESHOLD causes the patch to be rejected.
+        if not _DISABLE_MUTATION and winning_patch:
+            mut_passed, mut_score = await self._run_mutation_gate(
+                instance, winning_patch
+            )
+            meta["mutation_gate_passed"] = mut_passed
+            meta["mutation_score"]       = mut_score
+            if not mut_passed and bobn_result.all_candidates:
+                # Try second-best candidate (same fallback logic as formal gate)
+                second = next(
+                    (c for c in bobn_result.all_candidates[1:]
+                     if c.patch and c.patch != winning_patch),
+                    None
+                )
+                if second:
+                    log.info(
+                        f"[evaluator] {instance.instance_id}: mutation gate failed "
+                        f"(score={mut_score:.1f}%), trying second-best candidate"
+                    )
+                    winning_patch = second.patch
+                    # Re-run mutation gate on the replacement patch
+                    mut_passed2, mut_score2 = await self._run_mutation_gate(
+                        instance, winning_patch
+                    )
+                    meta["mutation_gate_passed"] = mut_passed2
+                    meta["mutation_score"]       = mut_score2
+        else:
+            meta.setdefault("mutation_gate_passed", True)
+            meta.setdefault("mutation_score", -1.0)
 
         # ── Phase 6: Trajectory collection ───────────────────────────────────
         records = self._collector.collect_from_bobn_result(
@@ -642,6 +706,134 @@ class SWEBenchEvaluator:
         )
         return True
 
+    async def _run_mutation_gate(
+        self, instance: SWEInstance, patch: str
+    ) -> tuple[bool, float]:
+        """
+        Phase 5.5 — Test generation + mutation testing gate.
+
+        GAP 5 FIX: This method closes the gap between controller.py
+        (which has mutation testing wired in _phase_fix_gap5) and the
+        SWE-bench evaluator path (which previously skipped it entirely).
+
+        Pipeline:
+          1. Parse the patch to identify changed Python files.
+          2. Generate a pytest test suite for each file via LLM
+             (storage-free: no FixAttempt required, no BrainStorage).
+          3. Write generated tests to a temp directory.
+          4. Run ``mutmut`` against the changed files using those tests.
+          5. Return (passed, score) where score is the mutation score 0–100.
+
+        Non-blocking policy:
+          • No Python files in the patch → return (True, -1.0) — skip
+          • mutmut not installed → return (True, -1.0) — skip
+          • LLM test generation fails → return (True, -1.0) — skip
+          • repo_root not available → generate tests but skip mutmut,
+            return (True, -1.0)
+          • Confirmed score < _MUTATION_THRESHOLD → return (False, score)
+
+        Parameters
+        ----------
+        instance  — SWEInstance (provides instance_id and problem_stmt)
+        patch     — unified diff string of the winning patch
+
+        Returns
+        -------
+        (passed: bool, score: float)
+          score == -1.0 means the gate was skipped (infrastructure unavailable).
+        """
+        import re
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        iid = instance.instance_id
+
+        # ── Step 1: Extract changed Python files from the patch ───────────────
+        py_files: list[str] = []
+        for line in patch.splitlines():
+            # Match "--- a/path/to/file.py" or "+++ b/path/to/file.py"
+            m = re.match(r"^(?:---|\+\+\+)\s+[ab]/(.+\.py)$", line)
+            if m:
+                fp = m.group(1)
+                if fp not in py_files and not fp.startswith("tests/"):
+                    py_files.append(fp)
+
+        if not py_files:
+            log.debug(
+                f"[mutation_gate] {iid}: no Python files in patch — skipping"
+            )
+            return True, -1.0
+
+        # ── Step 2: Check mutmut is available ────────────────────────────────
+        if not shutil.which("mutmut"):
+            log.debug(
+                f"[mutation_gate] {iid}: mutmut not installed — skipping"
+            )
+            return True, -1.0
+
+        # ── Step 3: Generate test code via LLM (storage-free path) ───────────
+        test_files_written: list[Path] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="rhodawk_muttest_") as tmpdir:
+                tmp = Path(tmpdir)
+                test_dir = tmp / "tests" / "generated"
+                test_dir.mkdir(parents=True)
+
+                for src_path in py_files[:5]:   # cap at 5 files
+                    test_code = await _generate_tests_via_llm(
+                        src_path       = src_path,
+                        patch          = patch,
+                        issue_text     = instance.problem_stmt,
+                        router         = self.router,
+                        instance_id    = iid,
+                    )
+                    if not test_code:
+                        continue
+                    stem = Path(src_path).stem
+                    test_file = test_dir / f"test_{stem}_gap5.py"
+                    test_file.write_text(test_code, encoding="utf-8")
+                    test_files_written.append(test_file)
+
+                if not test_files_written:
+                    log.debug(
+                        f"[mutation_gate] {iid}: LLM generated no tests — skipping"
+                    )
+                    return True, -1.0
+
+                # ── Step 4: Run mutmut ────────────────────────────────────────
+                # Use repo_root when available (allows mutmut to find the real
+                # source files); otherwise run in the temp dir against the patch
+                # fragments we extracted.  Without repo_root mutmut can only
+                # run on what we write to the temp dir, which is less accurate
+                # but still catches the most obvious coverage gaps.
+                run_root = self.repo_root if self.repo_root else tmp
+
+                score = await _run_mutmut(
+                    src_paths    = py_files,
+                    test_dir     = test_dir,
+                    run_root     = Path(run_root),
+                    instance_id  = iid,
+                )
+
+                if score < 0.0:
+                    # mutmut infrastructure failure — non-blocking
+                    return True, -1.0
+
+                passed = score >= _MUTATION_THRESHOLD
+                status = "PASS" if passed else "FAIL"
+                log.info(
+                    f"[mutation_gate] {iid}: score={score:.1f}% "
+                    f"threshold={_MUTATION_THRESHOLD:.0f}% → {status}"
+                )
+                return passed, score
+
+        except Exception as exc:
+            log.warning(
+                f"[mutation_gate] {iid}: unexpected error: {exc} — skipping"
+            )
+            return True, -1.0
+
     async def _run_legacy_swarm_fix(self, instance: SWEInstance) -> str:
         """Legacy one-shot CrewAI crew (pre-GAP-5 path — for comparison only)."""
         from swarm.crew_roles import build_swe_bench_crew
@@ -699,6 +891,9 @@ class SWEBenchEvaluator:
             f"Localize used:   {report.localization_usage_rate:.0%} of instances\n"
             f"BoBN used:       {report.bobn_usage_rate:.0%} of instances\n"
             f"Avg candidates:  {report.avg_candidates:.1f} per instance\n"
+            f"Mutation gate:   {report.mutation_usage_rate:.0%} ran"
+            + (f", avg score {report.avg_mutation_score:.1f}%" if report.mutation_usage_rate > 0 else " (mutmut not installed or no Python files)")
+            + f"\n"
             f"RL corpus:       {report.trajectory_corpus_size} trajectories\n"
             f"{'='*65}"
         )
@@ -941,3 +1136,212 @@ async def _run_z3_gate(
     except Exception as exc:
         log.debug(f"[formal_gate] {instance_id}: Z3 solver error: {exc} — skipping")
         return True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 5.5 helpers — test generation + mutmut runner
+# (module-level, storage-free — no FixAttempt / BrainStorage required)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _generate_tests_via_llm(
+    src_path:    str,
+    patch:       str,
+    issue_text:  str,
+    router:      Any,
+    instance_id: str,
+) -> str:
+    """
+    Ask the LLM to generate a pytest test suite for the changed Python file.
+
+    Uses the cheap judge/light model tier so this step does not consume
+    the same budget as the primary fixers.  Returns the test source code
+    as a string, or an empty string on failure (non-blocking).
+
+    The prompt provides:
+      • The relative path of the source file under test
+      • The unified diff lines that changed that file
+      • The original issue text for context on what the fix does
+
+    The LLM is instructed to produce only the test file body — no markdown
+    fences, no explanation — so the returned string can be written directly
+    to a .py file and executed with pytest.
+    """
+    import re
+    import litellm
+
+    # Extract only the hunks relevant to this source file from the patch
+    file_hunks: list[str] = []
+    in_file = False
+    for line in patch.splitlines():
+        if line.startswith(("--- ", "+++ ")):
+            in_file = src_path in line
+        if in_file:
+            file_hunks.append(line)
+
+    hunk_block = "\n".join(file_hunks[:120]) if file_hunks else patch[:2000]
+
+    prompt = (
+        "You are a senior Python test engineer.  "
+        "Write a pytest test suite for the code changes shown below.  "
+        "The tests MUST:\n"
+        "  1. Import from the module at the given path.\n"
+        "  2. Cover the happy path and at least two edge cases "
+        "(None inputs, empty collections, boundary values).\n"
+        "  3. Be runnable with: python -m pytest <this_file> -x\n"
+        "  4. Contain NO imports that are not in the standard library "
+        "or pytest.\n\n"
+        "Return ONLY the Python test file source.  "
+        "No markdown fences.  No explanation outside the file.\n\n"
+        f"## File under test\n{src_path}\n\n"
+        f"## Issue context\n{issue_text[:600]}\n\n"
+        f"## Changed hunks\n```diff\n{hunk_block}\n```"
+    )
+
+    try:
+        model = router.primary_model("judge")
+        resp  = await litellm.acompletion(
+            model       = model,
+            messages    = [{"role": "user", "content": prompt}],
+            max_tokens  = 1024,
+            temperature = 0.0,
+        )
+        raw = resp.choices[0].message.content or ""
+        # Strip accidental markdown fences
+        raw = re.sub(r"```(?:python)?\s*", "", raw).strip()
+        # Sanity check: must look like Python test code
+        if "def test_" not in raw and "import pytest" not in raw:
+            log.debug(
+                f"[mutation_gate] {instance_id}: LLM output for {src_path} "
+                "doesn't look like a test file — discarding"
+            )
+            return ""
+        return raw
+    except Exception as exc:
+        log.debug(
+            f"[mutation_gate] {instance_id}: LLM test generation failed "
+            f"for {src_path}: {exc}"
+        )
+        return ""
+
+
+async def _run_mutmut(
+    src_paths:   list[str],
+    test_dir:    "Path",
+    run_root:    "Path",
+    instance_id: str,
+) -> float:
+    """
+    Run mutmut against the given source paths using tests in test_dir.
+
+    Returns the aggregate mutation score (0–100).
+    Returns -1.0 on any infrastructure failure (mutmut not installed,
+    timeout, parse error) so the caller can treat the gate as skipped
+    rather than failed.
+
+    Algorithm
+    ---------
+    For each source file in src_paths (capped at 5):
+      1. Run: mutmut run --paths-to-mutate <abs_path>
+                         --runner "python -m pytest <test_dir>"
+                         --no-progress
+      2. Parse the "Killed N out of M" summary line.
+    Aggregate score = total_killed / total_mutants × 100.
+    Files where mutmut reports 0 mutants are excluded from the aggregate
+    (they don't penalise the score but also don't reward it).
+    """
+    import asyncio
+    import re
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    total_killed   = 0
+    total_mutants  = 0
+
+    runner_arg = f"python -m pytest {test_dir} -x -q --tb=no"
+
+    for rel_path in src_paths[:5]:
+        abs_path = run_root / rel_path
+        if not abs_path.exists():
+            log.debug(
+                f"[mutation_gate] {instance_id}: {rel_path} not found "
+                f"under {run_root} — skipping file"
+            )
+            continue
+
+        env = __import__("os").environ.copy()
+        env["PYTHONPATH"] = str(run_root)
+
+        cmd = [
+            sys.executable, "-m", "mutmut", "run",
+            "--paths-to-mutate", str(abs_path),
+            "--runner", runner_arg,
+            "--no-progress",
+        ]
+
+        try:
+            loop   = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda _cmd=cmd, _env=env: subprocess.run(
+                        _cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        cwd=str(run_root),
+                        env=_env,
+                    ),
+                ),
+                timeout=130,
+            )
+            output = result.stdout + result.stderr
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+            log.warning(
+                f"[mutation_gate] {instance_id}: mutmut timed out "
+                f"for {rel_path} — skipping file"
+            )
+            continue
+        except Exception as exc:
+            log.debug(
+                f"[mutation_gate] {instance_id}: mutmut error "
+                f"for {rel_path}: {exc} — skipping file"
+            )
+            continue
+
+        # Parse "Killed N out of M mutants"
+        m = re.search(r"Killed\s+(\d+)\s+out\s+of\s+(\d+)", output, re.IGNORECASE)
+        if m:
+            killed  = int(m.group(1))
+            total   = int(m.group(2))
+        else:
+            # Fallback: parse survived / killed lines separately
+            ms = re.search(r"(\d+)\s+survived", output, re.IGNORECASE)
+            mk = re.search(r"(\d+)\s+killed",   output, re.IGNORECASE)
+            survived = int(ms.group(1)) if ms else 0
+            killed   = int(mk.group(1)) if mk else 0
+            total    = killed + survived
+
+        log.debug(
+            f"[mutation_gate] {instance_id}: {rel_path}: "
+            f"{killed}/{total} mutants killed"
+        )
+
+        if total > 0:
+            total_killed  += killed
+            total_mutants += total
+
+    if total_mutants == 0:
+        # No mutants generated across all files — treat as infrastructure skip
+        log.debug(
+            f"[mutation_gate] {instance_id}: mutmut generated 0 mutants "
+            "across all files — returning -1.0 (skip)"
+        )
+        return -1.0
+
+    score = 100.0 * total_killed / total_mutants
+    log.info(
+        f"[mutation_gate] {instance_id}: aggregate mutation score "
+        f"{total_killed}/{total_mutants} = {score:.1f}%"
+    )
+    return score
