@@ -38,16 +38,27 @@ from models.router import get_router, ModelTier
 # LLM adapter
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _crewai_llm(task_type: str = "audit") -> Any:
-    """Return a CrewAI-compatible LLM object for the given task type."""
+def _crewai_llm(
+    task_type:      str   = "audit",
+    model_override: str   = "",
+    temperature:    float = 0.0,
+) -> Any:
+    """
+    Return a CrewAI-compatible LLM object for the given task type.
+
+    GAP 5 extension: model_override and temperature allow the BoBNSampler
+    to inject different models (Fixer A vs Fixer B) and temperatures
+    (0.2 / 0.4 / 0.6 / 0.3 / 0.7) into the same crew structure.
+    This is what makes each BoBN candidate genuinely independent.
+    """
     if not _CREWAI_AVAILABLE:
         return None
     router = get_router()
-    model  = router.primary_model(task_type)
+    model  = model_override or router.primary_model(task_type)
     try:
         from crewai import LLM  # type: ignore[import]
-        return LLM(model=model)
-    except ImportError:
+        return LLM(model=model, temperature=temperature)
+    except (ImportError, TypeError):
         return model
 
 
@@ -145,27 +156,46 @@ def build_security_crew(code_context: str, repo_path: str) -> Any | None:
 # SWE-Bench Crew (optimised for benchmark tasks)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_swe_bench_crew(issue_text: str, repo_context: str) -> Any | None:
+def build_swe_bench_crew(
+    issue_text:     str,
+    repo_context:   str,
+    model_override: str   = "",
+    temperature:    float = 0.0,
+) -> Any | None:
     """
     Crew optimised for SWE-bench style issue resolution.
 
+    GAP 5 extension: model_override and temperature are injected by the
+    BoBNSampler so each of the 5 candidates uses a different model/temperature
+    combination, producing genuinely diverse patches:
+      Fixer A (Qwen-32B) candidates: temp=0.2, 0.4, 0.6
+      Fixer B (DeepSeek-16B) candidates: temp=0.3, 0.7
+
+    Without these parameters, all candidates would be identical — the same
+    model at temperature=0.0, producing the same patch every time.
+
     Structure:
-    1. Issue analyst — parses the issue, identifies root cause
-    2. Test author   — writes a failing test that captures the bug
-    3. Fix engineer  — implements the minimal fix that passes the test
-    4. Verifier      — confirms fix doesn't regress other tests
+    1. Issue Analyst  — parses the issue, identifies root cause
+    2. Test Author    — writes a failing test that captures the bug
+    3. Fix Engineer   — implements the minimal fix (uses model_override + temp)
+    4. Code Verifier  — confirms fix doesn't regress other tests
     """
     if not _CREWAI_AVAILABLE:
         return None
 
+    # Analyst and test author always run cheap (7B-equivalent tasks)
+    # Fix engineer runs the candidate model at the BoBN temperature
+    # Verifier runs the primary model deterministically
     analyst = Agent(
         role="Issue Analyst",
         goal="Precisely identify the root cause of the reported issue",
         backstory=(
             "You are an expert at reading GitHub issues, understanding stack traces, "
-            "and pinpointing the exact line and condition that causes the bug."
+            "and pinpointing the exact line and condition that causes the bug. "
+            "When localization context (edit files and functions) is provided, "
+            "use it — don't guess what files to look at."
         ),
-        llm=_crewai_llm("audit"),
+        llm=_crewai_llm("audit", model_override=model_override, temperature=0.0),
         verbose=False,
     )
 
@@ -174,9 +204,11 @@ def build_swe_bench_crew(issue_text: str, repo_context: str) -> Any | None:
         goal="Write a minimal failing test that captures exactly the reported bug",
         backstory=(
             "You write test-first. Your tests are the specification. "
-            "You never write tests that pass without the fix."
+            "You never write tests that pass without the fix. "
+            "If specific functions are identified as edit targets, write tests "
+            "that exercise those exact functions with the edge cases from the issue."
         ),
-        llm=_crewai_llm("simple_codegen"),
+        llm=_crewai_llm("simple_codegen", model_override=model_override, temperature=0.0),
         verbose=False,
     )
 
@@ -185,9 +217,12 @@ def build_swe_bench_crew(issue_text: str, repo_context: str) -> Any | None:
         goal="Implement the minimal correct fix that makes the failing test pass",
         backstory=(
             "You are surgical. You touch the minimum amount of code. "
-            "Every line you change has a reason. You never introduce regressions."
+            "Every line you change has a reason. You never introduce regressions. "
+            "You produce unified diff patches starting with '--- ' headers. "
+            "If localization context identifies specific files and functions, "
+            "your patch targets those exact locations."
         ),
-        llm=_crewai_llm("critical_fix"),
+        llm=_crewai_llm("fix", model_override=model_override, temperature=temperature),
         verbose=False,
     )
 
@@ -196,43 +231,59 @@ def build_swe_bench_crew(issue_text: str, repo_context: str) -> Any | None:
         goal="Confirm the fix is complete, correct, and doesn't regress other behavior",
         backstory=(
             "You are the last line of defense before code ships. "
-            "You read the diff adversarially looking for anything that could break."
+            "You read the diff adversarially looking for anything that could break. "
+            "You verify the patch actually targets the root cause identified by the analyst."
         ),
-        llm=_crewai_llm("review"),
+        llm=_crewai_llm("review", temperature=0.0),
         verbose=False,
     )
 
     t1 = Task(
         description=(
             f"Analyze this GitHub issue and identify the root cause.\n"
-            f"Issue:\n{issue_text}\n\n"
-            f"Relevant code:\n{repo_context[:6000]}"
+            f"Issue:\n{issue_text[:6000]}\n\n"
+            f"Localization context (pre-computed — USE THESE TARGETS):\n"
+            f"{repo_context[:3000]}"
         ),
         agent=analyst,
-        expected_output="Root cause analysis with exact file, function, and line range",
+        expected_output=(
+            "Root cause analysis: exact file, function, line range, "
+            "and one-sentence description of what needs to change"
+        ),
     )
 
     t2 = Task(
-        description="Write a minimal pytest test that will FAIL before the fix and PASS after.",
+        description=(
+            "Write a minimal pytest test that will FAIL before the fix and PASS after. "
+            "Target the specific functions identified in the root cause analysis."
+        ),
         agent=test_author,
-        expected_output="Complete Python test file content",
+        expected_output="Complete Python test function(s) as a code block",
         context=[t1],
     )
 
     t3 = Task(
-        description="Implement the minimal fix. Return complete file content for each changed file.",
+        description=(
+            "Implement the minimal fix. Produce a unified diff patch.\n"
+            "CRITICAL: Output ONLY the diff starting with '--- ' headers.\n"
+            "Do NOT output explanations, JSON, or prose — only the raw diff.\n"
+            "The diff must apply cleanly with 'patch -p0'."
+        ),
         agent=fix_engineer,
-        expected_output="JSON: {fixed_files: [{path, content, changes_summary}]}",
+        expected_output="Raw unified diff patch (starts with '--- a/...')",
         context=[t1, t2],
     )
 
     t4 = Task(
         description=(
-            "Review the fix diff. Confirm it fixes the issue without introducing regressions. "
-            "Return {approved: bool, reason: str, confidence: float}."
+            "Review the fix diff from the previous step. "
+            "Confirm it addresses the root cause without regressions. "
+            "If the fix is correct, output the SAME diff unchanged. "
+            "If you find a critical flaw, output a corrected diff. "
+            "Output ONLY the diff — no JSON, no prose."
         ),
         agent=verifier,
-        expected_output="JSON approval decision",
+        expected_output="Raw unified diff patch (verified or corrected)",
         context=[t3],
     )
 
