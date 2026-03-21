@@ -64,7 +64,9 @@ except ImportError:
     _CPG_AVAILABLE = False
 
 # ── Gap 2: Synthesis Agent — cross-domain compound findings ──────────────────
-from agents.synthesis_agent import SynthesisAgent
+from agents.synthesis_agent     import SynthesisAgent
+# ── Gap 5: Localization Agent — causal context slice for BoBN pipeline ───────
+from agents.localization_agent  import LocalizationAgent
 
 # ── Gap 5: Multi-Intelligence / Adversarial Ensemble ─────────────────────────
 try:
@@ -176,10 +178,26 @@ class StabilizerConfig(BaseModel):
     synthesis_enabled:          bool   = True
     synthesis_dedup_enabled:    bool   = True
     synthesis_compound_enabled: bool   = True
-    # Dedicated model for synthesis — should be a DIFFERENT family from primary
-    # auditors so it brings genuinely fresh cross-domain reasoning.
-    # Defaults to critical_fix_model; override with RHODAWK_SYNTHESIS_MODEL env var.
-    synthesis_model:            str    = ""
+    # Dedicated model for synthesis — MUST be a different family from the
+    # primary auditor model so cross-domain compound reasoning comes from a
+    # genuinely independent training distribution.
+    #
+    # BUG FIX: was "" (empty string), which caused a silent fallback to
+    # ``critical_fix_model`` — potentially the same family as the auditors —
+    # whenever no config file or RHODAWK_SYNTHESIS_MODEL env var was present.
+    # The result was that out-of-the-box deployments never actually got
+    # cross-family synthesis even though the architecture requires it.
+    #
+    # Fix: default to DeepSeek-Coder-V2 (DeepSeek family).  When the primary
+    # model is Qwen/Granite (Alibaba/IBM), this guarantees independence.
+    # When the primary model IS DeepSeek, the family-check warning fires and
+    # the operator is prompted to pick a different model — the same safety net
+    # that existed before, but now triggered only for genuine conflicts rather
+    # than always.
+    #
+    # Override with: RHODAWK_SYNTHESIS_MODEL env var or synthesis_model in
+    # the [synthesis] section of your config TOML.
+    synthesis_model:            str    = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
     synthesis_max_compound:     int    = 20
     # ── Gap 5: Multi-Intelligence / Adversarial Ensemble (BoBN pipeline) ─────
     # Master switch.  When False the existing single-fixer path is used unchanged.
@@ -291,8 +309,12 @@ class StabilizerController:
         self._last_compound_findings: list[CompoundFinding] = []
         # ── Gap 5: BoBN adversarial ensemble ─────────────────────────────────
         # Initialised in _init_antagonist() when gap5_enabled=True.
-        self._bobn_sampler:       Any | None = None
-        self._adversarial_critic: Any | None = None
+        self._bobn_sampler:           Any | None = None
+        self._adversarial_critic:     Any | None = None
+        # LocalizationAgent — discrete Gap 5 component, replaces inline logic
+        # in _phase_fix_gap5().  Instantiated in _init_gap5() so it shares the
+        # same CPG / hybrid retriever references as the rest of the pipeline.
+        self._localization_agent:     LocalizationAgent | None = None
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -963,65 +985,50 @@ class StabilizerController:
         # ── Gap 2: Synthesis — dedup + cross-domain compound detection ────────
         if self.config.synthesis_enabled and all_issues:
             synthesis_model = (
-                self.config.synthesis_model
-                or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
-                or self.config.critical_fix_model
+                os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
+                or self.config.synthesis_model
+                or "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
             )
 
             # ── GAP 2 FIX: Enforce synthesis model family independence ──────────
             # The spec requires synthesis to use a DIFFERENT model family from
             # the auditors so cross-domain reasoning comes from genuinely fresh
-            # eyes.  When synthesis_model is blank it falls back to
-            # critical_fix_model (potentially the same family as the auditors).
+            # eyes.  synthesis_model now defaults to DeepSeek-Coder-V2 so
+            # out-of-the-box deployments no longer silently fall back to the
+            # same family as the auditors.
             #
             # Enforcement levels:
             #   • MILITARY / AEROSPACE / NUCLEAR: raises ConfigurationError
             #     (same-family synthesis is a compliance failure in these modes)
             #   • All other domains: logs a WARNING (advisory only)
-            _synthesis_model_is_default = not (
-                self.config.synthesis_model
-                or os.environ.get("RHODAWK_SYNTHESIS_MODEL", "")
-            )
-            if _synthesis_model_is_default:
-                self.log.warning(
-                    "[audit] synthesis_model is not configured — falling back to "
-                    f"critical_fix_model ({self.config.critical_fix_model}). "
-                    "This may be the same model family as the auditors and reduces "
-                    "cross-domain reasoning independence. "
-                    "Set synthesis_model in [synthesis] config or "
-                    "RHODAWK_SYNTHESIS_MODEL env var to a different family "
-                    "(e.g. DeepSeek-Coder-V2 or Qwen2.5-Coder-32B) for best results."
-                )
-            else:
-                # When synthesis_model IS explicitly set, verify the families differ.
-                try:
-                    from verification.independence_enforcer import extract_model_family
-                    primary_family   = extract_model_family(self.config.primary_model)
-                    synthesis_family = extract_model_family(synthesis_model)
-                    if (
-                        primary_family
-                        and synthesis_family
-                        and primary_family == synthesis_family
-                    ):
-                        _family_msg = (
-                            f"[audit] synthesis_model ({synthesis_model}) appears to be "
-                            f"the same model family as primary_model "
-                            f"({self.config.primary_model}): both resolve to "
-                            f"'{primary_family}'. Cross-domain compound finding quality "
-                            "will be reduced. Set synthesis_model to a model from a "
-                            "different provider/family for genuine independence."
-                        )
-                        if self.config.domain_mode in {
-                            DomainMode.MILITARY, DomainMode.AEROSPACE, DomainMode.NUCLEAR
-                        }:
-                            raise ConfigurationError(_family_msg)
-                        else:
-                            self.log.warning(_family_msg)
-                except (ImportError, Exception) as _family_exc:
-                    # extract_model_family is best-effort; never block the pipeline
-                    self.log.debug(
-                        f"[audit] synthesis model family check skipped: {_family_exc}"
+            try:
+                from verification.independence_enforcer import extract_model_family
+                primary_family   = extract_model_family(self.config.primary_model)
+                synthesis_family = extract_model_family(synthesis_model)
+                if (
+                    primary_family
+                    and synthesis_family
+                    and primary_family == synthesis_family
+                ):
+                    _family_msg = (
+                        f"[audit] synthesis_model ({synthesis_model}) appears to be "
+                        f"the same model family as primary_model "
+                        f"({self.config.primary_model}): both resolve to "
+                        f"'{primary_family}'. Cross-domain compound finding quality "
+                        "will be reduced. Set synthesis_model to a model from a "
+                        "different provider/family for genuine independence."
                     )
+                    if self.config.domain_mode in {
+                        DomainMode.MILITARY, DomainMode.AEROSPACE, DomainMode.NUCLEAR
+                    }:
+                        raise ConfigurationError(_family_msg)
+                    else:
+                        self.log.warning(_family_msg)
+            except (ImportError, Exception) as _family_exc:
+                # extract_model_family is best-effort; never block the pipeline
+                self.log.debug(
+                    f"[audit] synthesis model family check skipped: {_family_exc}"
+                )
 
             synthesis_agent = SynthesisAgent(
                 storage=self.storage,
@@ -1293,6 +1300,22 @@ class StabilizerController:
                 mutation_threshold   = getattr(self.config, "mutation_score_threshold", None),
             )
 
+            # ── LocalizationAgent — discrete Gap 5 component ─────────────────
+            # Constructed here (not in __init__) so it can reference the same
+            # CPG / hybrid retriever instances that the controller already owns.
+            # The agent is reused across all issues in a run; it is stateless
+            # between localize() calls.
+            self._localization_agent = LocalizationAgent(
+                cpg_context_selector = getattr(self, "_cpg_context_selector", None),
+                cpg_engine           = getattr(self, "_cpg_engine", None),
+                program_slicer       = getattr(self, "_program_slicer", None),
+                hybrid_retriever     = getattr(self, "_hybrid_retriever", None),
+                repo_root            = self.config.repo_root,
+                top_files            = getattr(self.config, "localization_top_files", 5),
+                top_functions        = getattr(self.config, "localization_top_functions", 10),
+                max_slice_nodes      = getattr(self.config, "cpg_max_slice_nodes", 50),
+            )
+
             self.log.info(
                 "[gap5] Adversarial ensemble ready: "
                 "fixer_a=%s fixer_b=%s critic=%s synthesis=%s "
@@ -1351,30 +1374,25 @@ class StabilizerController:
                 f"{issue.description}"
             )
 
-            # Build localization context: prefer CPG causal slice, fall back to
-            # hybrid retriever.  This is the Gap 1 / Gap 5 integration point.
+            # ── Localization — Gap 1 / Gap 5 integration point ───────────────
+            # LocalizationAgent encapsulates the CPG causal slice → hybrid
+            # retriever → empty-context fallback chain that was previously
+            # inlined here.  Using the agent makes this step independently
+            # testable and replaceable without touching the controller.
             localization_context = ""
-            if self._cpg_context_selector and self._cpg_engine and \
-               getattr(self._cpg_engine, "is_available", False):
+            if self._localization_agent is not None:
                 try:
-                    ctx = await self._cpg_context_selector.select_context(
-                        issue=issue, max_nodes=self.config.cpg_max_slice_nodes
-                    )
-                    localization_context = ctx.formatted_context if hasattr(ctx, "formatted_context") else str(ctx)
-                except Exception as exc:
-                    self.log.debug(f"[gap5] CPG context failed for {issue.id[:8]}: {exc}")
-
-            if not localization_context and self._hybrid_retriever:
-                try:
-                    hits = await self._hybrid_retriever.query(
-                        query=issue.description[:500],
-                        top_k=5,
-                    )
-                    localization_context = "\n\n".join(
-                        h.get("content", "") for h in (hits or []) if h.get("content")
+                    loc_result = await self._localization_agent.localize(issue)
+                    localization_context = loc_result.context_text
+                    self.log.debug(
+                        "[gap5] localization: issue=%s source=%s files=%d fns=%d",
+                        issue.id[:8],
+                        loc_result.source,
+                        loc_result.total_files_found,
+                        loc_result.total_functions_found,
                     )
                 except Exception as exc:
-                    self.log.debug(f"[gap5] Hybrid retriever fallback failed: {exc}")
+                    self.log.debug(f"[gap5] LocalizationAgent failed for {issue.id[:8]}: {exc}")
 
             # Update sampler context for this issue before sampling.
             self._bobn_sampler.issue   = issue_text
