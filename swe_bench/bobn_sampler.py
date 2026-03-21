@@ -31,7 +31,14 @@ BoBN Pipeline
    returns CriticAttackReport per candidate.
 
 4. RANK: Composite score = test_score × 0.6 + robustness × 0.3 + minimality × 0.1.
-   Winner = argmax(composite_score).
+   Candidates sorted descending by composite_score.
+
+4.5 SYNTHESIZE: PatchSynthesisAgent reviews the ranked candidates and their
+   attack reports.  It either selects the best single candidate (PICK_BEST)
+   or produces a merged patch combining elements from multiple candidates
+   (MERGE).  This step replaces the prior pure argmax selection.
+   Model family: CLOUD_OSS (Devstral/Llama-4) — different from both fixers
+   and the adversarial critic.  Falls back to argmax if the LLM call fails.
 
 5. FORMAL GATE: Winner patch passes through Z3/CBMC if available.
 
@@ -52,6 +59,11 @@ from agents.adversarial_critic import (
     CriticAttackReport,
     PatchMinimalityScore,
     compute_composite_score,
+)
+from agents.patch_synthesis_agent import (
+    PatchSynthesisAgent,
+    SynthesisDecision,
+    apply_synthesis_decision,
 )
 from swe_bench.execution_loop import ExecutionFeedbackLoop, ExecutionLoopResult
 
@@ -78,6 +90,9 @@ class BoBNCandidate:
     minimality:      PatchMinimalityScore | None = None
     composite_score: float  = 0.0
 
+    # Filled after synthesis step (GAP 5 fix)
+    synthesis_decision: SynthesisDecision | None = None
+
     def to_dict(self) -> dict:
         return {
             "id":          self.candidate_id,
@@ -98,6 +113,8 @@ class BoBNResult:
     n_candidates:     int              = 0
     n_fully_passing:  int              = 0    # candidates where all tests pass
     strategy:         str              = ""   # "bobn" / "fallback"
+    # Populated after synthesis step (GAP 5 fix)
+    synthesis_action: str              = ""   # "pick_best" | "merge" | "argmax_fallback"
 
     @property
     def winning_patch(self) -> str:
@@ -111,12 +128,19 @@ class BoBNResult:
 class BoBNSampler:
     """
     Behavior Best-of-N sampler — orchestrates the full GAP 5 pipeline:
-    dual-fixer generation → execution loops → adversarial critique → ranking.
+    dual-fixer generation → execution loops → adversarial critique →
+    patch synthesis → ranking.
+
+    GAP 5 FIX: PatchSynthesisAgent is now called between the adversarial
+    critique (step 3) and the final winner selection (step 4).  This replaces
+    the pure composite_score argmax with an LLM-reasoned decision that can
+    MERGE the best elements of multiple candidates.
 
     Parameters
     ──────────
     model_router  — TieredModelRouter
     critic        — AdversarialCriticAgent (must be different model family)
+    synthesis     — PatchSynthesisAgent (optional; auto-created if None)
     localization  — LocalizationResult from SWEBenchLocalizer
     """
 
@@ -126,11 +150,15 @@ class BoBNSampler:
         critic:        AdversarialCriticAgent,
         issue_text:    str                = "",
         localization_context: str        = "",
+        synthesis:     PatchSynthesisAgent | None = None,
     ) -> None:
-        self.router   = model_router
-        self.critic   = critic
-        self.issue    = issue_text
-        self.loc_ctx  = localization_context
+        self.router    = model_router
+        self.critic    = critic
+        self.issue     = issue_text
+        self.loc_ctx   = localization_context
+        # Synthesis agent: use provided instance or auto-create from same router.
+        # Auto-create uses CLOUD_OSS tier — different family from all vLLM models.
+        self._synthesis = synthesis or PatchSynthesisAgent(model_router=model_router)
 
     async def sample(
         self,
@@ -146,7 +174,7 @@ class BoBNSampler:
 
         Generates N candidates from two model families, runs each through
         test-execution feedback loop, attacks with adversarial critic,
-        and returns the highest composite-score candidate.
+        synthesizes the winner (merge or pick_best), and returns the result.
         """
         start = time.monotonic()
         result = BoBNResult(
@@ -198,7 +226,7 @@ class BoBNSampler:
             pass_tests = pass_tests,
         )
 
-        # ── Step 4: Compute composite scores and rank ─────────────────────────
+        # ── Step 4: Compute composite scores and sort ─────────────────────────
         for candidate, report in zip(candidates, attack_reports):
             candidate.attack_report   = report
             candidate.minimality      = AdversarialCriticAgent.compute_minimality_score(
@@ -213,8 +241,20 @@ class BoBNSampler:
         # Sort descending by composite score
         candidates.sort(key=lambda c: c.composite_score, reverse=True)
         result.all_candidates = candidates
-        result.winner         = candidates[0] if candidates else None
 
+        # ── Step 4.5: Patch synthesis — pick_best or merge ────────────────────
+        # GAP 5 FIX: This step was previously missing.  Pure argmax selection
+        # cannot merge the best elements of candidates A and B when each fixes
+        # a different sub-problem.  PatchSynthesisAgent does.
+        log.info(f"[bobn] {instance_id}: running patch synthesis (step 4.5)")
+        winner = await self._synthesize_winner(
+            instance_id    = instance_id,
+            candidates     = candidates,
+            attack_reports = attack_reports,
+            result         = result,
+        )
+
+        result.winner         = winner
         result.total_elapsed_s = time.monotonic() - start
 
         if result.winner:
@@ -223,9 +263,72 @@ class BoBNSampler:
                 f"model={result.winner.model} temp={result.winner.temperature} "
                 f"test_score={result.winner.test_score:.2f} "
                 f"composite={result.winner.composite_score:.2f} "
+                f"synthesis={result.synthesis_action} "
                 f"elapsed={result.total_elapsed_s:.1f}s"
             )
         return result
+
+    async def _synthesize_winner(
+        self,
+        instance_id:    str,
+        candidates:     list[BoBNCandidate],
+        attack_reports: list[CriticAttackReport],
+        result:         BoBNResult,
+    ) -> BoBNCandidate | None:
+        """
+        Run PatchSynthesisAgent and resolve to a winning BoBNCandidate.
+
+        Falls back to composite argmax (candidates[0]) if synthesis fails.
+        Updates result.synthesis_action for observability.
+        """
+        if not candidates:
+            return None
+
+        try:
+            decision = await self._synthesis.synthesize(
+                issue_text       = self.issue,
+                localization_ctx = self.loc_ctx,
+                candidates       = candidates,
+                attack_reports   = attack_reports,
+            )
+        except Exception as exc:
+            log.warning(
+                f"[bobn] {instance_id}: synthesis raised unexpectedly: {exc} "
+                "— using argmax winner"
+            )
+            result.synthesis_action = "argmax_fallback"
+            return candidates[0]
+
+        if decision.fallback:
+            log.info(
+                f"[bobn] {instance_id}: synthesis fallback "
+                f"({decision.fallback_reason}) — using argmax winner"
+            )
+            result.synthesis_action = "argmax_fallback"
+            return candidates[0]
+
+        winner = apply_synthesis_decision(decision, candidates)
+        if winner is None:
+            result.synthesis_action = "argmax_fallback"
+            return candidates[0]
+
+        winner.synthesis_decision = decision
+        result.synthesis_action   = decision.action
+
+        if decision.action == "merge":
+            log.info(
+                f"[bobn] {instance_id}: synthesis produced MERGED patch "
+                f"(confidence={decision.confidence:.2f}) — "
+                f"{decision.reasoning[:120]}"
+            )
+        else:
+            log.info(
+                f"[bobn] {instance_id}: synthesis PICK_BEST "
+                f"candidate={decision.winner_id} "
+                f"(confidence={decision.confidence:.2f})"
+            )
+
+        return winner
 
     async def _generate_all_candidates(
         self, n_a: int, n_b: int

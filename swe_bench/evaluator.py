@@ -508,34 +508,100 @@ class SWEBenchEvaluator:
         self, instance: SWEInstance, patch: str
     ) -> bool:
         """
-        Run Z3/CBMC formal gate on the winning patch.
-        Returns True if patch passes formal verification or if verifier unavailable.
-        """
-        try:
-            from agents.formal_verifier import FormalVerifierAgent
-            from brain.schemas import FixAttempt, FixedFile
-            import uuid
+        Run a formal gate on the winning patch before committing.
 
-            # Construct a minimal FixAttempt for the verifier
-            fix = FixAttempt(
-                run_id    = f"swe_{instance.instance_id}",
-                issue_ids = [],
-                fixed_files = [FixedFile(
-                    path         = "patch.diff",
-                    diff_summary = f"SWE-bench patch for {instance.instance_id}",
-                    changes_made = patch[:200],
-                )],
-                fixer_model = self.router.primary_model("fix"),
+        GAP 5 FIX: The prior implementation was a complete stub that logged
+        "skipping (storage not wired)" and returned True unconditionally.
+        That means the formal gate never ran, defeating its purpose.
+
+        This implementation runs three verification layers without requiring
+        the storage-backed FormalVerifierAgent:
+
+        Layer 1 — Pattern-based safety checks (always runs, zero dependencies):
+          Scans the patch for patterns that indicate the fix introduced a new
+          hazard rather than fixing the existing one.  Uses the same property
+          set as FormalVerifierAgent._MILITARY_PROPERTIES but applied directly
+          to the +lines of the unified diff.  A patch that ADDS a goto, a
+          malloc-post-init, an unbounded while(true), or an unsafe atoi() call
+          fails immediately.
+
+        Layer 2 — Z3 SMT constraint check (runs if z3-solver is installed):
+          Asks the LLM to extract Z3 assertions for the key fix invariants
+          and verifies them with the Z3 solver.  Non-blocking — if Z3 is not
+          installed or the LLM extraction fails, this layer is skipped.
+
+        Layer 3 — Structural diff sanity (always runs):
+          Validates that the patch is a well-formed unified diff with at least
+          one hunk, no conflict markers, and that it actually modifies code
+          (not just whitespace).
+
+        Returns True  — patch passes all available gates.
+        Returns False — patch has a critical violation; caller should try the
+                        second-best candidate.
+
+        Policy: non-blocking on infrastructure failures.  If Z3 isn't installed
+        or the LLM call fails, those layers are skipped but Layer 1 and Layer 3
+        still run.  A patch is only rejected (False) for concrete violations, not
+        for failure to run the verifier.
+        """
+        if not patch or not patch.strip():
+            log.debug(f"[formal_gate] {instance.instance_id}: empty patch — skipping")
+            return True
+
+        # ── Layer 3: Structural diff sanity ───────────────────────────────────
+        from agents.patch_synthesis_agent import _validate_diff
+        if not _validate_diff(patch):
+            log.warning(
+                f"[formal_gate] {instance.instance_id}: "
+                "patch failed structural diff validation (malformed hunk headers or conflict markers)"
             )
-            # FormalVerifierAgent needs storage — skip if not wired
-            log.debug(
-                f"[evaluator] Formal gate: skipping (storage not wired in SWE path) "
-                f"for {instance.instance_id}"
+            return False
+
+        # Check that the patch has actual code changes, not just blank lines
+        added_lines = [
+            l[1:] for l in patch.split("\n")
+            if l.startswith("+") and not l.startswith("+++")
+        ]
+        if not any(l.strip() for l in added_lines):
+            log.warning(
+                f"[formal_gate] {instance.instance_id}: "
+                "patch adds no non-whitespace lines — likely empty fix"
             )
-            return True  # Don't block if formal verifier not fully wired
+            return False
+
+        # ── Layer 1: Pattern-based safety checks ──────────────────────────────
+        # Only scan lines ADDED by the patch (+lines), not context or removed.
+        added_content = "\n".join(added_lines)
+        violations = _check_safety_patterns(added_content, instance.instance_id)
+        if violations:
+            log.warning(
+                f"[formal_gate] {instance.instance_id}: "
+                f"Layer 1 safety violation(s): {'; '.join(violations)}"
+            )
+            return False
+
+        # ── Layer 2: Z3 SMT constraint check ──────────────────────────────────
+        try:
+            z3_ok = await _run_z3_gate(
+                issue_text   = instance.problem_stmt,
+                patch        = patch,
+                router       = self.router,
+                instance_id  = instance.instance_id,
+            )
+            if not z3_ok:
+                log.warning(
+                    f"[formal_gate] {instance.instance_id}: "
+                    "Z3 gate found a counterexample — patch may be unsound"
+                )
+                return False
         except Exception as exc:
-            log.debug(f"[evaluator] formal gate error: {exc}")
-            return True  # Non-blocking — don't drop the patch on verifier error
+            # Z3 infrastructure failure is non-blocking
+            log.debug(f"[formal_gate] {instance.instance_id}: Z3 layer skipped: {exc}")
+
+        log.info(
+            f"[formal_gate] {instance.instance_id}: patch passed all formal gates"
+        )
+        return True
 
     async def _run_legacy_swarm_fix(self, instance: SWEInstance) -> str:
         """Legacy one-shot CrewAI crew (pre-GAP-5 path — for comparison only)."""
@@ -597,3 +663,154 @@ class SWEBenchEvaluator:
             f"RL corpus:       {report.trajectory_corpus_size} trajectories\n"
             f"{'='*65}"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Formal gate helpers (module-level, no storage dependency)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Safety patterns that must NOT appear in newly-added lines.
+# Subset of FormalVerifierAgent._MILITARY_PROPERTIES tuned for Python/generic code.
+_FORMAL_GATE_PATTERNS: list[tuple[str, str]] = [
+    # (regex_pattern, violation_label)
+    (r"\bwhile\s*\(\s*true\s*\)|\bfor\s*\(\s*;;\s*\)",         "unbounded_loop(while_true/for_ever)"),
+    (r"\bgoto\b",                                                 "goto_statement"),
+    (r"\bmalloc\s*\(|\bcalloc\s*\(|\brealloc\s*\(",              "dynamic_alloc_c"),
+    (r"\batoi\s*\(|\batol\s*\(|\batof\s*\(|\batoll\s*\(",        "unsafe_string_conversion"),
+    (r"eval\s*\(",                                                "eval_call"),
+    (r"__import__\s*\(",                                          "dynamic_import"),
+    (r"os\.system\s*\(|subprocess\.call\s*\(.*shell\s*=\s*True", "shell_injection_risk"),
+    (r"pickle\.loads?\s*\(",                                      "unsafe_deserialization"),
+    (r"<{7}|>{7}",                                               "conflict_marker"),
+]
+
+
+def _check_safety_patterns(added_content: str, instance_id: str) -> list[str]:
+    """
+    Scan the added lines of a patch for safety anti-patterns.
+
+    Returns a list of violation labels.  Empty list = clean.
+    """
+    import re
+    violations: list[str] = []
+    for pattern, label in _FORMAL_GATE_PATTERNS:
+        if re.search(pattern, added_content):
+            log.debug(f"[formal_gate] {instance_id}: pattern hit → {label}")
+            violations.append(label)
+    return violations
+
+
+async def _run_z3_gate(
+    issue_text:  str,
+    patch:       str,
+    router:      Any,
+    instance_id: str,
+) -> bool:
+    """
+    Ask the LLM to extract Z3 assertions for the fix invariants, then
+    verify them with the Z3 solver.
+
+    Returns True if:
+      • Z3 proves all assertions (no counterexample)
+      • Z3 is not installed (non-blocking skip)
+      • The LLM produces no assertions (nothing to verify)
+
+    Returns False only if Z3 finds a concrete counterexample.
+    """
+    try:
+        import z3  # type: ignore[import]
+    except ImportError:
+        log.debug(f"[formal_gate] {instance_id}: z3 not installed — Z3 layer skipped")
+        return True
+
+    import litellm, json, re
+
+    # Ask a cheap model to extract key invariants as Z3 Python expressions
+    extract_prompt = (
+        "You are a formal verification assistant. "
+        "Given the patch below, extract up to 3 key correctness invariants "
+        "as Z3-Python boolean expressions over symbolic variables.\n\n"
+        "Return ONLY a JSON object:\n"
+        '{"assertions": ["z3_expr_string", ...], "variables": {"name": "sort", ...}}\n\n'
+        "Use simple sorts: IntSort(), BoolSort(), StringSort().\n"
+        "If no meaningful invariant can be extracted, return {\"assertions\": []}.\n\n"
+        f"## Issue\n{issue_text[:800]}\n\n"
+        f"## Patch\n```diff\n{patch[:2000]}\n```"
+    )
+
+    try:
+        resp = await litellm.acompletion(
+            model       = router.primary_model("judge"),
+            messages    = [{"role": "user", "content": extract_prompt}],
+            max_tokens  = 512,
+            temperature = 0.0,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception as exc:
+        log.debug(f"[formal_gate] {instance_id}: LLM extraction failed: {exc} — skipping Z3")
+        return True
+
+    # Parse the JSON response
+    clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
+    match = re.search(r"\{.*\}", clean, re.DOTALL)
+    if not match:
+        return True
+
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return True
+
+    assertions_src: list[str] = data.get("assertions", [])
+    variables_def:  dict      = data.get("variables", {})
+
+    if not assertions_src:
+        log.debug(f"[formal_gate] {instance_id}: no Z3 assertions extracted — skipping")
+        return True
+
+    # Build the Z3 context and check each assertion
+    try:
+        solver = z3.Solver()
+        # Declare symbolic variables
+        var_map: dict[str, Any] = {}
+        sort_map = {
+            "IntSort":    z3.IntSort(),
+            "BoolSort":   z3.BoolSort(),
+            "StringSort": z3.StringSort(),
+        }
+        for var_name, sort_name in variables_def.items():
+            sort = sort_map.get(sort_name, z3.IntSort())
+            var_map[var_name] = z3.Const(var_name, sort)
+
+        # Evaluate assertions in Z3 context
+        counterexample_found = False
+        for assertion_src in assertions_src[:3]:
+            try:
+                assertion_expr = eval(  # noqa: S307 — controlled Z3 DSL only
+                    assertion_src,
+                    {"__builtins__": {}},
+                    {**z3.__dict__, **var_map},
+                )
+                # Check satisfiability of the negation — if SAT, we have a counterexample
+                s = z3.Solver()
+                s.add(z3.Not(assertion_expr))
+                result = s.check()
+                if result == z3.sat:
+                    log.warning(
+                        f"[formal_gate] {instance_id}: Z3 counterexample for "
+                        f"assertion: {assertion_src[:80]}"
+                    )
+                    counterexample_found = True
+                    break
+            except Exception as exc:
+                log.debug(
+                    f"[formal_gate] {instance_id}: Z3 eval failed for "
+                    f"'{assertion_src[:60]}': {exc}"
+                )
+                continue
+
+        return not counterexample_found
+
+    except Exception as exc:
+        log.debug(f"[formal_gate] {instance_id}: Z3 solver error: {exc} — skipping")
+        return True
