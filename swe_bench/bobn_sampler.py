@@ -43,7 +43,12 @@ BoBN Pipeline
 5. FORMAL GATE: Winner patch passes through Z3/CBMC if available.
 
 6. COLLECT: All (prompt, patch, test_result, reward) triples written to
-   TrajectoryCollector for ARPO fine-tuning.
+   TrajectoryCollector for ARPO fine-tuning.  TrajectoryCollector is passed
+   in at construction time (optional).  When provided, collect_from_bobn_result
+   is called after synthesis so every candidate — winner and losers — becomes
+   a training triple.  GRPO benefits from the contrast between good and bad
+   attempts from the same distribution.  The controller and evaluator paths
+   both pass their own collector instances so no double-counting occurs.
 """
 from __future__ import annotations
 
@@ -66,6 +71,7 @@ from agents.patch_synthesis_agent import (
     apply_synthesis_decision,
 )
 from swe_bench.execution_loop import ExecutionFeedbackLoop, ExecutionLoopResult
+from swe_bench.trajectory_collector import TrajectoryCollector
 
 log = logging.getLogger(__name__)
 
@@ -138,24 +144,30 @@ class BoBNSampler:
 
     Parameters
     ──────────
-    model_router  — TieredModelRouter
-    critic        — AdversarialCriticAgent (must be different model family)
-    synthesis     — PatchSynthesisAgent (optional; auto-created if None)
-    localization  — LocalizationResult from SWEBenchLocalizer
+    model_router         — TieredModelRouter
+    critic               — AdversarialCriticAgent (must be different model family)
+    synthesis            — PatchSynthesisAgent (optional; auto-created if None)
+    localization         — LocalizationResult from SWEBenchLocalizer
+    trajectory_collector — TrajectoryCollector (optional).  When provided, every
+                           candidate in a completed BoBN run is recorded as an
+                           ARPO training triple at the end of sample().  Pass None
+                           to skip trajectory collection (e.g. during unit tests).
     """
 
     def __init__(
         self,
-        model_router:  Any,
-        critic:        AdversarialCriticAgent,
-        issue_text:    str                = "",
-        localization_context: str        = "",
-        synthesis:     PatchSynthesisAgent | None = None,
+        model_router:           Any,
+        critic:                 AdversarialCriticAgent,
+        issue_text:             str                       = "",
+        localization_context:   str                       = "",
+        synthesis:              PatchSynthesisAgent | None = None,
+        trajectory_collector:   TrajectoryCollector | None = None,
     ) -> None:
-        self.router    = model_router
-        self.critic    = critic
-        self.issue     = issue_text
-        self.loc_ctx   = localization_context
+        self.router       = model_router
+        self.critic       = critic
+        self.issue        = issue_text
+        self.loc_ctx      = localization_context
+        self._collector   = trajectory_collector
         # Synthesis agent: use provided instance or auto-create from same router.
         # Auto-create uses CLOUD_OSS tier — different family from all vLLM models.
         self._synthesis = synthesis or PatchSynthesisAgent(model_router=model_router)
@@ -266,6 +278,38 @@ class BoBNSampler:
                 f"synthesis={result.synthesis_action} "
                 f"elapsed={result.total_elapsed_s:.1f}s"
             )
+
+        # ── Step 6: Trajectory collection for ARPO fine-tuning ────────────────
+        # Record every candidate — winner and losers — as a training triple.
+        # GRPO learns from the contrast between attempts; only recording the
+        # winner would throw away the most informative negative signal.
+        # resolved=True only when the winner passed all FAIL_TO_PASS tests
+        # (all_passed flag).  Production paths where fail_tests=[] will have
+        # all_passed=False, which correctly labels those runs as unresolved
+        # rather than poisoning the training corpus with false positives.
+        if self._collector is not None and result.all_candidates:
+            _resolved = bool(result.winner and result.winner.all_passed)
+            try:
+                self._collector.collect_from_bobn_result(
+                    instance_id = instance_id,
+                    bobn_result = result,
+                    resolved    = _resolved,
+                    issue_text  = self.issue,
+                    loc_context = self.loc_ctx,
+                )
+                _corpus = self._collector.corpus_size()
+                log.debug(
+                    f"[bobn] {instance_id}: trajectories recorded "
+                    f"(corpus={_corpus}, resolved={_resolved})"
+                )
+                if self._collector.is_ready_for_training():
+                    log.info(
+                        f"[bobn] RL corpus ready ({_corpus} trajectories) — "
+                        "run: python scripts/arpo_trainer.py"
+                    )
+            except Exception as _tc_exc:
+                log.warning(f"[bobn] trajectory collection non-fatal: {_tc_exc}")
+
         return result
 
     async def _synthesize_winner(
