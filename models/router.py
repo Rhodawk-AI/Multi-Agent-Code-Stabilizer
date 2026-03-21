@@ -5,11 +5,11 @@ Tiered model router for Rhodawk AI — GAP 5 Edition.
 
 GAP 5 CHANGES (Swarm Intelligence / ≥90% SWE-bench)
 ──────────────────────────────────────────────────────
-• ModelTier.VLLM_SECONDARY  — DeepSeek-Coder-V2-Lite-Instruct (16B).
-  Fixer B in the dual-fixer BoBN pipeline. MLA architecture generates
-  genuinely different patches from Qwen2.5-Coder-32B, reducing correlation
-  between candidates and lifting BoBN effectiveness toward the theoretical
-  ceiling (1 − (1−p)^N).
+• ModelTier.VLLM_SECONDARY  — DeepSeek-Coder-V2-Instruct (236B MoE / 21B active,
+  32B-class capability).  Fixer B in the dual-fixer BoBN pipeline.  MLA
+  architecture generates genuinely different patches from Qwen2.5-Coder-32B,
+  reducing correlation between candidates and lifting BoBN effectiveness toward
+  the theoretical ceiling (1 − (1−p)^N).
 
 • ModelTier.VLLM_CRITIC     — Llama-3.3-70B-Instruct via OpenRouter or vLLM.
   Adversarial Critic — its only job is finding ways to break candidate
@@ -20,7 +20,7 @@ GAP 5 CHANGES (Swarm Intelligence / ≥90% SWE-bench)
   PatchSynthesisAgent.  Choosing Mistral here gives four distinct model
   families across the pipeline:
     Fixer A   → Qwen2.5-Coder-32B   (Alibaba)
-    Fixer B   → DeepSeek-Coder-16B  (DeepSeek)
+    Fixer B   → DeepSeek-Coder-V2   (DeepSeek, 32B-class MoE)
     Critic    → Llama-3.3-70B       (Meta)
     Synthesis → Devstral-Small      (Mistral)  ← new
   Four independent training distributions ensure no systematic correlated
@@ -38,7 +38,7 @@ Dual-fixer vLLM setup (reference)
     vllm serve Qwen/Qwen2.5-Coder-32B-Instruct \\
         --tensor-parallel-size 2 --max-model-len 32768 --port 8000
     # Fixer B — secondary (different GPU partition)
-    vllm serve deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \\
+    vllm serve deepseek-ai/DeepSeek-Coder-V2-Instruct \\
         --tensor-parallel-size 1 --max-model-len 32768 --port 8001
     # Critic — 70B (4×A100) or route to OpenRouter
     vllm serve meta-llama/Llama-3.3-70B-Instruct \\
@@ -49,7 +49,7 @@ Dual-fixer vLLM setup (reference)
     VLLM_CRITIC_BASE_URL=http://localhost:8002/v1      # blank → OpenRouter
     VLLM_SYNTHESIS_BASE_URL=http://localhost:8003/v1   # blank → OpenRouter Devstral
     VLLM_PRIMARY_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
-    VLLM_SECONDARY_MODEL=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+    VLLM_SECONDARY_MODEL=deepseek-ai/DeepSeek-Coder-V2-Instruct
     VLLM_CRITIC_MODEL=meta-llama/Llama-3.3-70B-Instruct
     VLLM_SYNTHESIS_MODEL=mistralai/Devstral-Small-2505  # local Devstral if served
 
@@ -73,7 +73,7 @@ log = logging.getLogger(__name__)
 
 class ModelTier(str, Enum):
     VLLM_PRIMARY   = "vllm_primary"     # Qwen2.5-Coder-32B — Fixer A
-    VLLM_SECONDARY = "vllm_secondary"   # DeepSeek-Coder-V2-Lite-16B — Fixer B (GAP 5)
+    VLLM_SECONDARY = "vllm_secondary"   # DeepSeek-Coder-V2-Instruct (32B-class MoE) — Fixer B (GAP 5)
     VLLM_LIGHT     = "vllm_light"       # Qwen2.5-Coder-7B — judge/cheap
     VLLM_CRITIC    = "vllm_critic"      # Llama-3.3-70B — adversarial critic (GAP 5)
     VLLM_SYNTHESIS = "vllm_synthesis"   # Devstral-Small — patch synthesis (GAP 5 FIX)
@@ -126,8 +126,8 @@ _TIER_MODELS: dict[ModelTier, list[str]] = {
         "ollama/granite-code:8b",
     ],
     ModelTier.VLLM_SECONDARY: [
-        _vllm_model("VLLM_SECONDARY_MODEL", "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
-        "ollama/deepseek-coder-v2:16b",
+        _vllm_model("VLLM_SECONDARY_MODEL", "deepseek-ai/DeepSeek-Coder-V2-Instruct"),
+        "ollama/deepseek-coder-v2",
         "openrouter/deepseek/deepseek-coder-v2-0724",
     ],
     ModelTier.VLLM_LIGHT: [
@@ -172,12 +172,11 @@ _TIER_MODELS: dict[ModelTier, list[str]] = {
 _COST_MAP: dict[str, tuple[float, float]] = {
     "openai/Qwen/Qwen2.5-Coder-32B-Instruct":              (0.0, 0.0),
     "openai/Qwen/Qwen2.5-Coder-7B-Instruct":               (0.0, 0.0),
-    "openai/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct":  (0.0, 0.0),
     "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct":       (0.0, 0.0),
     "openai/meta-llama/Llama-3.3-70B-Instruct":            (0.0, 0.0),
     "ollama/qwen2.5-coder:32b":                             (0.0, 0.0),
     "ollama/qwen2.5-coder:7b":                              (0.0, 0.0),
-    "ollama/deepseek-coder-v2:16b":                         (0.0, 0.0),
+    "ollama/deepseek-coder-v2":                             (0.0, 0.0),
     "ollama/granite-code:3b":                               (0.0, 0.0),
     "ollama/granite-code:8b":                               (0.0, 0.0),
     "openrouter/meta-llama/llama-4-scout":                  (0.00018, 0.00090),
@@ -224,7 +223,7 @@ _TASK_TIERS: dict[str, ModelTier] = {
 }
 
 # BoBN temperature strategy — diversity through controlled randomness.
-# N=10 total: 6 from Fixer A (Qwen-32B) + 4 from Fixer B (DeepSeek-16B).
+# N=10 total: 6 from Fixer A (Qwen-32B) + 4 from Fixer B (DeepSeek-V2 32B-class MoE).
 # Temperatures are spread across [0.2, 0.9] so candidates explore different
 # regions of the solution space.  Critic and Synthesis remain deterministic.
 BOBN_TEMPERATURES: dict[str, float] = {
@@ -252,7 +251,7 @@ class TieredModelRouter:
     Routes LLM calls to the cheapest appropriate model tier.
 
     GAP 5 Extensions:
-      secondary_model()           — DeepSeek-Coder-V2-16B (Fixer B)
+      secondary_model()           — DeepSeek-Coder-V2 32B-class MoE (Fixer B)
       critic_model()              — Llama-3.3-70B (AdversarialCriticAgent)
       synthesis_model()           — Devstral-Small (PatchSynthesisAgent) [NEW]
       judge_model()               — Qwen-7B (BoBN patch scoring)
@@ -283,7 +282,7 @@ class TieredModelRouter:
         return self._select_model(tier, models)
 
     def secondary_model(self) -> str:
-        """Fixer B — DeepSeek-Coder-V2-Lite-16B."""
+        """Fixer B — DeepSeek-Coder-V2-Instruct (236B MoE / 21B active, 32B-class)."""
         models = _TIER_MODELS[ModelTier.VLLM_SECONDARY]
         return self._select_model(ModelTier.VLLM_SECONDARY, models)
 
