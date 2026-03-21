@@ -835,3 +835,172 @@ class FixerAgent(BaseAgent):
             except Exception:
                 pass
         return ''
+
+    # ── Gap 5: BoBN winning-patch ingestion ───────────────────────────────────
+
+    async def run_with_patch(
+        self,
+        issues:      list,
+        patch:       str,
+        patch_model: str,
+        patch_meta:  dict | None = None,
+    ) -> list[FixAttempt]:
+        """
+        Accept a pre-computed winning patch from the BoBN adversarial ensemble
+        and persist it as a FixAttempt without re-running the LLM fixer.
+
+        Called by StabilizerController._phase_fix_gap5() after BoBNSampler
+        selects the composite-score winner.  The caller already ran the full
+        execution-feedback loop and adversarial critique — this method only
+        handles persistence and issue-status bookkeeping.
+
+        Parameters
+        ----------
+        issues:
+            The Issue objects being fixed by this patch.
+        patch:
+            Unified-diff text of the winning candidate patch.
+        patch_model:
+            LiteLLM model identifier that generated the patch.
+        patch_meta:
+            Optional dict with BoBN scoring fields:
+              bobn_candidate_id, bobn_composite_score, bobn_test_score,
+              bobn_n_candidates, attack_confidence.
+            Stored verbatim as JSON in FixAttempt.extra_notes so the audit
+            trail and API surface full ensemble provenance.
+
+        Returns
+        -------
+        list[FixAttempt]
+            Single-element list containing the persisted FixAttempt, or an
+            empty list if the patch is empty (falls back to standard run()).
+        """
+        if not patch or not patch.strip():
+            self.log.warning(
+                '[run_with_patch] Empty patch — falling back to standard run()'
+            )
+            return await self.run()
+
+        fixed_files = self._parse_unified_diff_to_fixed_files(patch, patch_model)
+
+        # Encode BoBN metadata into extra_notes as compact JSON
+        import json as _json
+        meta = patch_meta or {}
+        extra_notes = _json.dumps({
+            'bobn_candidate_id':    meta.get('bobn_candidate_id', ''),
+            'bobn_composite_score': meta.get('bobn_composite_score', 0.0),
+            'bobn_test_score':      meta.get('bobn_test_score', 0.0),
+            'bobn_n_candidates':    meta.get('bobn_n_candidates', 0),
+            'attack_confidence':    meta.get('attack_confidence', 0.5),
+        }, separators=(',', ':'))
+
+        fix = FixAttempt(
+            run_id             = self.run_id,
+            issue_ids          = [i.id for i in issues],
+            fixed_files        = fixed_files,
+            fixer_model        = patch_model,
+            fixer_model_family = extract_model_family(patch_model),
+            patch_mode         = PatchMode.UNIFIED_DIFF,
+            extra_notes        = extra_notes,
+        )
+        await self.storage.upsert_fix(fix)
+
+        # Update issue status — mirrors the bookkeeping in _fix_group()
+        for issue in issues:
+            issue.fix_attempts += 1
+            issue.status = IssueStatus.FIX_GENERATED
+            await self.storage.upsert_issue(issue)
+
+        self.log.info(
+            f'[run_with_patch] Persisted BoBN winner '
+            f'fix_id={fix.id[:12]} '
+            f'files={len(fixed_files)} '
+            f'candidate={meta.get("bobn_candidate_id", "?")}'
+        )
+        return [fix]
+
+    def _parse_unified_diff_to_fixed_files(
+        self,
+        patch:       str,
+        patch_model: str,
+    ) -> list[FixedFile]:
+        """
+        Parse a unified-diff string into a list of FixedFile objects.
+
+        Handles both git-style headers (``--- a/path`` / ``+++ b/path``)
+        and plain diff headers (``--- path`` / ``+++ path``).  Git ``a/``
+        and ``b/`` prefixes are stripped so the stored path matches the
+        actual repo-relative file path.
+
+        For each file hunk the method counts ``lines_changed`` as the sum
+        of added (``+``) and removed (``-``) lines, excluding the ``---``
+        and ``+++`` header lines.  The full hunk text is stored in
+        ``FixedFile.patch`` so downstream agents can apply it with
+        ``patch -p0``.
+
+        Parameters
+        ----------
+        patch:
+            Raw unified-diff text covering one or more files.
+        patch_model:
+            Model identifier; stored in FixedFile.diff_summary for tracing.
+
+        Returns
+        -------
+        list[FixedFile]
+            One element per changed file, in the order they appear in the
+            diff.  Returns an empty list when the patch is blank.
+        """
+        import re as _re
+
+        if not patch or not patch.strip():
+            return []
+
+        fixed_files: list[FixedFile] = []
+        # Split on '--- ' headers to isolate per-file hunks.
+        # The pattern captures the header start so we can reconstruct each
+        # file's full diff text.
+        file_blocks = _re.split(r'(?=^--- )', patch, flags=_re.MULTILINE)
+
+        for block in file_blocks:
+            if not block.strip():
+                continue
+
+            # Extract old-file path from the '--- ' header line
+            old_match = _re.match(r'^--- (.+)', block)
+            if not old_match:
+                continue
+
+            # Extract new-file path from the '+++ ' header line
+            new_match = _re.search(r'^\+\+\+ (.+)', block, _re.MULTILINE)
+            if not new_match:
+                continue
+
+            raw_path = new_match.group(1).strip()
+            # Strip git-style 'b/' prefix and any trailing whitespace / tab
+            # that some diff generators emit after the path.
+            path = _re.sub(r'^[ab]/', '', raw_path)
+            # Strip anything after a tab (diff timestamp field)
+            path = path.split('\t')[0].strip()
+
+            if not path or path == '/dev/null':
+                continue
+
+            # Count changed lines: any line starting with '+' or '-' that
+            # is NOT the '+++' or '---' header.
+            lines      = block.splitlines()
+            added      = sum(1 for l in lines if l.startswith('+') and not l.startswith('+++'))
+            removed    = sum(1 for l in lines if l.startswith('-') and not l.startswith('---'))
+            lines_changed = added + removed
+
+            fixed_files.append(FixedFile(
+                path          = path,
+                content       = '',
+                patch         = block,
+                patch_mode    = PatchMode.UNIFIED_DIFF,
+                changes_made  = f'BoBN patch from {patch_model}',
+                diff_summary  = f'BoBN adversarial winner: {added}+/{removed}- lines',
+                lines_changed = lines_changed,
+            ))
+
+        return fixed_files
