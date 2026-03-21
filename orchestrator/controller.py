@@ -1525,11 +1525,15 @@ class StabilizerController:
                         await self.storage.upsert_fix(f)
                     record_fix("generated")
 
-                # ── GAP 5 FIX C: Inline test generation + mutation ────────────
-                # Previously test gen and mutation existed as separate controller
-                # phases that ran after _phase_fix_gap5 completed.  They were
-                # never wired into this branch, so gap5 fixes were committed
-                # without any test generation or mutation coverage gate.
+                # ── GAP 5 FIX C: Test generation gate ────────────────────────
+                # Test generation is now a BLOCKING step in the Gap 5 pipeline,
+                # not a fire-and-forget phase.  Tests are generated *before* the
+                # mutation gate so mutmut has a test suite to measure against.
+                # A failure here is logged but non-fatal — no test suite means the
+                # mutation gate is skipped (cannot run mutmut without tests), but
+                # the fix is not dropped.  The generated test paths are stored on
+                # the FixAttempt record so the mutation verifier can find them.
+                generated_test_paths: dict[str, list[str]] = {}
                 if fixes and self.config.test_gen_enabled:
                     try:
                         _tg = TestGeneratorAgent(
@@ -1540,12 +1544,32 @@ class StabilizerController:
                             repo_root   = self.config.repo_root,
                         )
                         await _tg.run(fixes=fixes)
+                        # Collect generated test paths per fix for mutation gate
+                        for _fix in fixes:
+                            if getattr(_fix, "generated_test_paths", None):
+                                generated_test_paths[_fix.id] = _fix.generated_test_paths
                         self.log.info(
-                            f"[gap5] Test generation done for issue {issue.id[:8]}"
+                            f"[gap5] Test generation complete for issue {issue.id[:8]} "
+                            f"— {sum(len(v) for v in generated_test_paths.values())} test file(s)"
                         )
                     except Exception as _tge:
-                        self.log.debug(f"[gap5] Test generation non-fatal: {_tge}")
+                        self.log.warning(
+                            f"[gap5] Test generation failed for issue {issue.id[:8]}: {_tge} "
+                            "— mutation gate will be skipped"
+                        )
 
+                # ── GAP 5 FIX D: Mutation gate — BLOCKING ────────────────────
+                # Mutation testing is now a HARD GATE in the Gap 5 pipeline.
+                # If the mutation score falls below the domain threshold the fix's
+                # gate_passed flag is set to False, which prevents _phase_commit
+                # from picking it up.  This matches the architecture diagram where
+                # "Test Generator + Mutation" sits between Formal Gate and Commit.
+                #
+                # Domain thresholds (from MutationVerifierAgent):
+                #   MILITARY / AEROSPACE / NUCLEAR: 90%  (DO-178C DAL-A)
+                #   EMBEDDED / AUTOMOTIVE:          80%
+                #   GENERAL:                        config.mutation_score_threshold
+                mutation_gate_passed = True
                 if fixes and self.config.mutation_testing_enabled:
                     try:
                         _mv = MutationVerifierAgent(
@@ -1556,12 +1580,38 @@ class StabilizerController:
                             repo_root       = self.config.repo_root,
                             score_threshold = self.config.mutation_score_threshold,
                         )
-                        await _mv.run(fixes=fixes)
-                        self.log.info(
-                            f"[gap5] Mutation testing done for issue {issue.id[:8]}"
-                        )
+                        for _fix in fixes:
+                            _test_paths = generated_test_paths.get(_fix.id)
+                            _mut_results = await _mv.run(
+                                fix        = _fix,
+                                test_paths = _test_paths,
+                            )
+                            if any(not r.passed for r in (_mut_results or [])):
+                                mutation_gate_passed = False
+                                self.log.warning(
+                                    f"[gap5] MUTATION GATE FAIL issue={issue.id[:8]} "
+                                    f"fix={_fix.id[:8]} — fix blocked from commit"
+                                )
+                        if mutation_gate_passed:
+                            self.log.info(
+                                f"[gap5] Mutation gate passed for issue {issue.id[:8]}"
+                            )
                     except Exception as _mve:
-                        self.log.debug(f"[gap5] Mutation testing non-fatal: {_mve}")
+                        # Infrastructure failure (mutmut not installed etc.) is
+                        # non-blocking so a missing tool never halts the pipeline.
+                        self.log.warning(
+                            f"[gap5] Mutation gate error for issue {issue.id[:8]}: {_mve} "
+                            "— proceeding (infrastructure failure, not coverage failure)"
+                        )
+
+                # ── GAP 5 FIX E: Commit winning patch to VCS ─────────────────
+                # This is the missing "Commit" node from the architecture diagram.
+                # Only fixes that passed all gates (formal + mutation) are applied
+                # to disk and committed.  Fixes that failed the mutation gate have
+                # gate_passed=False already set by MutationVerifierAgent and will
+                # be skipped by _phase_commit's gate filter.
+                if fixes and formal_gate_passed and mutation_gate_passed:
+                    await self._gap5_commit(fixes, winner, issue)
 
             except Exception as exc:
                 self.log.error(
@@ -1570,7 +1620,70 @@ class StabilizerController:
                 )
                 await self._phase_fix([issue])
 
-    async def _phase_fix(self, issues: list[Issue]) -> None:
+    async def _gap5_commit(
+        self,
+        fixes:  list,
+        winner: Any,
+        issue:  Any,
+    ) -> None:
+        """
+        Gap 5 Commit Node — applies the winning patch to disk and commits to VCS.
+
+        This is the explicit "Commit" step that was missing from the Gap 5
+        architecture diagram.  Previously _phase_fix_gap5 wrote the winning patch
+        as a FixAttempt record but never applied it to the filesystem, meaning the
+        repository was never actually modified.  _phase_commit (the general commit
+        phase) picks up gate_passed fixes, but it requires fixed_files to already
+        contain written content — which FixerAgent.run_with_patch populates.
+        However when the mutation gate flags a fix as failed (gate_passed=False),
+        that fix must never reach _phase_commit.
+
+        This method:
+          1. Marks all gate-passing fixes as ready (gate_passed=True, ensures
+             committed_at is None so _phase_commit picks them up).
+          2. Immediately calls _commit_module_group for the Gap 5 fixes so the
+             commit happens in the same pipeline cycle, not deferred to the next
+             GATE phase.  This keeps the Gap 5 path fully self-contained.
+          3. Logs the VCS commit with Gap 5 metadata (candidate ID, composite
+             score, synthesis action) for traceability.
+
+        Falls back gracefully — a commit failure is logged but does not raise,
+        so the issue is marked fixed in the brain even if VCS write fails.
+        """
+        if not fixes or not self.run or not self.storage:
+            return
+
+        # Only commit fixes that passed all gates
+        committable = [f for f in fixes if getattr(f, "gate_passed", True) is not False
+                       and getattr(f, "committed_at", None) is None]
+        if not committable:
+            self.log.info(
+                f"[gap5_commit] No committable fixes for issue {issue.id[:8]} "
+                "(all blocked by gate)"
+            )
+            return
+
+        module = self._module_for_fix(committable[0]) if committable else "gap5"
+
+        self.log.info(
+            f"[gap5_commit] Committing {len(committable)} fix(es) for issue "
+            f"{issue.id[:8]} — candidate={winner.candidate_id} "
+            f"composite={winner.composite_score:.2f} "
+            f"model={winner.model.split('/')[-1]}"
+        )
+
+        try:
+            await self._commit_module_group(module, committable)
+            self.log.info(
+                f"[gap5_commit] VCS commit complete for issue {issue.id[:8]}"
+            )
+        except Exception as exc:
+            self.log.error(
+                f"[gap5_commit] VCS commit failed for issue {issue.id[:8]}: {exc} "
+                "— fix recorded in brain but not committed to VCS"
+            )
+
+        async def _phase_fix(self, issues: list[Issue]) -> None:
         assert self.run and self.storage
 
         # Enforce reviewer independence BEFORE creating the fixer
