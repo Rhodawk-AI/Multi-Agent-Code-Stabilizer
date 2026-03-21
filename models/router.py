@@ -55,10 +55,11 @@ Dual-fixer vLLM setup (reference)
 
 BoBN temperature strategy
 ───────────────────────────
-    Fixer A (Qwen-32B)  → temp=0.2 / 0.4 / 0.6  (3 candidates)
-    Fixer B (DeepSeek)  → temp=0.3 / 0.7          (2 candidates)
-    Critic  (Llama-70B) → temp=0.0                (deterministic attack)
-    Synthesis           → temp=0.1                (slight creativity for merge)
+    Fixer A (Qwen-32B)  → temp=0.2 / 0.3 / 0.4 / 0.5 / 0.6 / 0.7  (6 candidates)
+    Fixer B (DeepSeek)  → temp=0.3 / 0.5 / 0.7 / 0.9               (4 candidates)
+    Critic  (Llama-70B) → temp=0.0                                  (deterministic attack)
+    Synthesis           → temp=0.1                                  (slight creativity for merge)
+    Total N=10: P(≥1 success | p=0.4) = 1-(0.6)^10 = 99.4%
 """
 from __future__ import annotations
 
@@ -222,20 +223,28 @@ _TASK_TIERS: dict[str, ModelTier] = {
     "critical_review": ModelTier.CLOUD_CLAUDE,
 }
 
-# BoBN temperature strategy — diversity through controlled randomness
+# BoBN temperature strategy — diversity through controlled randomness.
+# N=10 total: 6 from Fixer A (Qwen-32B) + 4 from Fixer B (DeepSeek-16B).
+# Temperatures are spread across [0.2, 0.9] so candidates explore different
+# regions of the solution space.  Critic and Synthesis remain deterministic.
 BOBN_TEMPERATURES: dict[str, float] = {
     "fixer_a_0": 0.2,
-    "fixer_a_1": 0.4,
-    "fixer_a_2": 0.6,
+    "fixer_a_1": 0.3,
+    "fixer_a_2": 0.4,
+    "fixer_a_3": 0.5,
+    "fixer_a_4": 0.6,
+    "fixer_a_5": 0.7,
     "fixer_b_0": 0.3,
-    "fixer_b_1": 0.7,
+    "fixer_b_1": 0.5,
+    "fixer_b_2": 0.7,
+    "fixer_b_3": 0.9,
     "critic":    0.0,
     "synthesis": 0.1,
 }
 
-BOBN_N_CANDIDATES = int(os.environ.get("RHODAWK_BOBN_CANDIDATES", "5"))
-BOBN_FIXER_A_COUNT = int(os.environ.get("RHODAWK_BOBN_FIXER_A", "3"))
-BOBN_FIXER_B_COUNT = int(os.environ.get("RHODAWK_BOBN_FIXER_B", "2"))
+BOBN_N_CANDIDATES = int(os.environ.get("RHODAWK_BOBN_CANDIDATES", "10"))
+BOBN_FIXER_A_COUNT = int(os.environ.get("RHODAWK_BOBN_FIXER_A", "6"))
+BOBN_FIXER_B_COUNT = int(os.environ.get("RHODAWK_BOBN_FIXER_B", "4"))
 
 
 class TieredModelRouter:
