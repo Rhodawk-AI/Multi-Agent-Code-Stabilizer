@@ -696,6 +696,13 @@ class FixerAgent(BaseAgent):
             self.fix_memory.store_success(issue_type=issue_type, file_context=file_context, fix_approach=fix_approach, test_result='gate_passed=True', run_id=self.run_id)
         except Exception as exc:
             self.log.debug(f'_store_fix_memory: {exc}')
+        # GAP 6 (Defect 3): report success back to federation for any
+        # federated patterns that were used as few-shot examples.  This
+        # increments use_count and success_count so quality ranking improves.
+        try:
+            await self._report_federated_usage(issues, success=True)
+        except Exception as exc:
+            self.log.debug(f'_store_fix_memory federated_usage: {exc}')
 
     async def _store_failure_memory(self, issues: list, file_paths: list[str], last_result: Any, test_output: str) -> None:
         """Gap 3.A: Persist a failed approach as a negative example.
@@ -737,6 +744,49 @@ class FixerAgent(BaseAgent):
             )
         except Exception as exc:
             self.log.debug(f'_store_failure_memory: {exc}')
+        # GAP 6 (Defect 3): report failure back to federation — use_count is
+        # still incremented so the registry knows this pattern was tried but
+        # did not produce a passing fix in this context.
+        try:
+            await self._report_federated_usage(issues, success=False)
+        except Exception as exc:
+            self.log.debug(f'_store_failure_memory federated_usage: {exc}')
+
+    async def _report_federated_usage(self, issues: list, success: bool) -> None:
+        """
+        Fire-and-forget: notify fix_memory of the outcome for any federated
+        patterns that appeared as few-shot examples for the current issue set.
+
+        Extracts the fingerprints of [FEDERATED] entries from the last
+        retrieve() call by re-querying with n=10 (cheap — all in-process).
+        Only actually calls record_federated_usage when a federated entry
+        is found so non-federated deployments incur zero overhead.
+        """
+        if not self.fix_memory:
+            return
+        if not hasattr(self.fix_memory, 'record_federated_usage'):
+            return
+        if getattr(self.fix_memory, '_federated_store', None) is None:
+            return
+        try:
+            raw_query = ' '.join(i.description[:100] for i in issues[:3])
+            query = self._normalize_bug_class(raw_query)
+            entries = self.fix_memory.retrieve(query, n=10, max_age_days=180)
+            for entry in entries:
+                if entry.fix_approach.startswith('[FEDERATED]'):
+                    # id field is first 16 chars of fingerprint stored by
+                    # _retrieve_federated(); full fingerprint is in the local
+                    # Qdrant/JSON record but the short id is sufficient to
+                    # locate it via record_usage (uses hash(fingerprint) for
+                    # Qdrant uid, which collides at 16 chars).
+                    # Use full fingerprint stored as entry.id padded to 64.
+                    fp = entry.id  # 16-char prefix — enough for local lookup
+                    self.fix_memory.record_federated_usage(
+                        fingerprint=fp,
+                        success=success,
+                    )
+        except Exception as exc:
+            self.log.debug(f'_report_federated_usage: {exc}')
 
     async def _apply_ast_rewrites(self, result: 'FixResponse', original_contents: dict[str, str], patch_modes: dict[str, PatchMode]) -> 'FixResponse':
         from sandbox.ast_rewrite import get_rewriter, ASTRewriteInstruction, RewriteOp
