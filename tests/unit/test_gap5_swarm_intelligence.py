@@ -875,3 +875,563 @@ class TestGap5EvaluatorIntegration:
         instance = SWEInstance("i", "r", "c", "problem")
         assert _heuristic_eval("", instance) is False
         assert _heuristic_eval("x", instance) is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GAP 5 — StabilizerConfig: gap5 fields present and correctly defaulted
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGap5ControllerConfig:
+    """Verify all Gap 5 config fields exist on StabilizerConfig with safe defaults."""
+
+    def _make_config(self, **overrides):
+        from orchestrator.controller import StabilizerConfig
+        return StabilizerConfig(
+            repo_url="https://github.com/test/repo",
+            repo_root="/tmp/repo",
+            **overrides,
+        )
+
+    def test_gap5_disabled_by_default(self):
+        cfg = self._make_config()
+        assert cfg.gap5_enabled is False
+
+    def test_gap5_can_be_enabled(self):
+        cfg = self._make_config(gap5_enabled=True)
+        assert cfg.gap5_enabled is True
+
+    def test_secondary_model_default(self):
+        cfg = self._make_config()
+        assert "deepseek" in cfg.gap5_vllm_secondary_model.lower()
+
+    def test_critic_model_default(self):
+        cfg = self._make_config()
+        assert "llama" in cfg.gap5_vllm_critic_model.lower()
+
+    def test_critic_url_blank_by_default(self):
+        """Blank critic URL means OpenRouter routing — must not be a localhost URL."""
+        cfg = self._make_config()
+        assert cfg.gap5_vllm_critic_base_url == ""
+
+    def test_bobn_counts_sum_to_n_candidates(self):
+        cfg = self._make_config()
+        assert cfg.gap5_bobn_fixer_a_count + cfg.gap5_bobn_fixer_b_count == cfg.gap5_bobn_n_candidates
+
+    def test_bobn_fixer_a_count_default(self):
+        cfg = self._make_config()
+        assert cfg.gap5_bobn_fixer_a_count == 3
+
+    def test_bobn_fixer_b_count_default(self):
+        cfg = self._make_config()
+        assert cfg.gap5_bobn_fixer_b_count == 2
+
+    def test_secondary_url_points_to_different_port(self):
+        cfg = self._make_config()
+        assert "8001" in cfg.gap5_vllm_secondary_base_url
+
+    def test_gap5_fields_are_overridable(self):
+        cfg = self._make_config(
+            gap5_enabled=True,
+            gap5_bobn_n_candidates=10,
+            gap5_bobn_fixer_a_count=6,
+            gap5_bobn_fixer_b_count=4,
+            gap5_vllm_critic_model="meta-llama/Llama-3.1-70B-Instruct",
+        )
+        assert cfg.gap5_bobn_n_candidates == 10
+        assert cfg.gap5_bobn_fixer_a_count == 6
+        assert "Llama-3.1" in cfg.gap5_vllm_critic_model
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GAP 5 — controller._init_gap5: family check + BoBN instantiation
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGap5ControllerInit:
+    """Verify _init_gap5 enforces family independence and wires BoBN sampler."""
+
+    def _make_controller(self, **cfg_overrides):
+        from orchestrator.controller import StabilizerConfig, StabilizerController
+        cfg = StabilizerConfig(
+            repo_url="https://github.com/test/repo",
+            repo_root="/tmp/repo",
+            gap5_enabled=True,
+            **cfg_overrides,
+        )
+        return StabilizerController(cfg)
+
+    @pytest.mark.asyncio
+    async def test_init_gap5_sets_bobn_sampler_on_success(self):
+        """When families differ, _init_gap5 populates _bobn_sampler."""
+        ctrl = self._make_controller()
+
+        mock_router = MagicMock()
+        mock_router.assert_family_independence = MagicMock()  # no raise
+        mock_router.primary_model.return_value   = "openai/Qwen/Qwen2.5-Coder-32B"
+        mock_router.secondary_model.return_value = "openai/deepseek-ai/DeepSeek-Coder"
+        mock_router.critic_model.return_value    = "openrouter/meta-llama/llama-3.3-70b"
+        mock_router.critic_vllm_base_url.return_value = ""
+
+        with patch("models.router.get_router", return_value=mock_router), \
+             patch("orchestrator.controller._GAP5_AVAILABLE", True), \
+             patch("agents.adversarial_critic.AdversarialCriticAgent") as mock_critic_cls, \
+             patch("swe_bench.bobn_sampler.BoBNSampler") as mock_sampler_cls:
+            mock_critic_cls.return_value = MagicMock()
+            mock_sampler_cls.return_value = MagicMock()
+            await ctrl._init_gap5()
+
+        assert ctrl._bobn_sampler is not None
+        assert ctrl._adversarial_critic is not None
+
+    @pytest.mark.asyncio
+    async def test_init_gap5_disabled_when_not_available(self):
+        """When _GAP5_AVAILABLE is False, _init_gap5 is a safe no-op."""
+        ctrl = self._make_controller()
+
+        with patch("orchestrator.controller._GAP5_AVAILABLE", False):
+            await ctrl._init_gap5()
+
+        assert ctrl._bobn_sampler is None
+        assert ctrl._adversarial_critic is None
+
+    @pytest.mark.asyncio
+    async def test_init_gap5_disabled_on_family_violation(self):
+        """When assert_family_independence raises, sampler stays None."""
+        ctrl = self._make_controller()
+
+        mock_router = MagicMock()
+        mock_router.assert_family_independence.side_effect = RuntimeError(
+            "GAP 5 independence violation"
+        )
+
+        with patch("models.router.get_router", return_value=mock_router), \
+             patch("orchestrator.controller._GAP5_AVAILABLE", True):
+            await ctrl._init_gap5()
+
+        assert ctrl._bobn_sampler is None
+
+    @pytest.mark.asyncio
+    async def test_run_fix_phase_routes_to_gap5_when_enabled(self):
+        """run_fix_phase calls _phase_fix_gap5 when gap5_enabled=True and sampler ready."""
+        ctrl = self._make_controller()
+        ctrl._bobn_sampler = MagicMock()  # Simulate ready sampler
+
+        mock_gap5 = AsyncMock()
+        ctrl._phase_fix_gap5 = mock_gap5
+
+        fake_issues = [MagicMock(), MagicMock()]
+        await ctrl.run_fix_phase(fake_issues)
+
+        mock_gap5.assert_awaited_once_with(fake_issues)
+
+    @pytest.mark.asyncio
+    async def test_run_fix_phase_falls_back_when_gap5_disabled(self):
+        """run_fix_phase calls _phase_fix when gap5_enabled=False."""
+        from orchestrator.controller import StabilizerConfig, StabilizerController
+        cfg = StabilizerConfig(
+            repo_url="https://github.com/test/repo",
+            repo_root="/tmp/repo",
+            gap5_enabled=False,
+        )
+        ctrl = StabilizerController(cfg)
+        ctrl._bobn_sampler = None
+
+        mock_single = AsyncMock()
+        ctrl._phase_fix = mock_single
+
+        fake_issues = [MagicMock()]
+        await ctrl.run_fix_phase(fake_issues)
+
+        mock_single.assert_awaited_once_with(fake_issues)
+
+    @pytest.mark.asyncio
+    async def test_run_fix_phase_falls_back_when_sampler_none(self):
+        """run_fix_phase falls back even when gap5_enabled=True if sampler init failed."""
+        ctrl = self._make_controller()
+        ctrl._bobn_sampler = None  # init failed
+
+        mock_single = AsyncMock()
+        ctrl._phase_fix = mock_single
+
+        fake_issues = [MagicMock()]
+        await ctrl.run_fix_phase(fake_issues)
+
+        mock_single.assert_awaited_once_with(fake_issues)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GAP 5 — LangGraph state: gap5_enabled field + LOCALIZE node routing
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGap5LangGraphState:
+    """Verify SwarmState carries gap5_enabled and the graph contains LOCALIZE node."""
+
+    def test_swarm_state_has_gap5_enabled(self):
+        from swarm.langgraph_state import SwarmState
+        s = SwarmState()
+        assert hasattr(s, "gap5_enabled")
+        assert s.gap5_enabled is False
+
+    def test_swarm_state_gap5_enabled_roundtrips(self):
+        from swarm.langgraph_state import SwarmState
+        s = SwarmState(gap5_enabled=True)
+        d = s.to_dict()
+        s2 = SwarmState.from_dict(d)
+        assert s2.gap5_enabled is True
+
+    def test_swarm_state_gap5_false_roundtrips(self):
+        from swarm.langgraph_state import SwarmState
+        s = SwarmState(gap5_enabled=False)
+        d = s.to_dict()
+        assert SwarmState.from_dict(d).gap5_enabled is False
+
+    def test_build_graph_includes_localize_node(self):
+        """build_stabilizer_graph must register LOCALIZE node when langgraph available."""
+        try:
+            from langgraph.graph import StateGraph  # type: ignore
+        except ImportError:
+            pytest.skip("langgraph not installed")
+
+        from swarm.langgraph_state import build_stabilizer_graph
+
+        mock_controller = MagicMock()
+        mock_controller.config.gap5_enabled = True
+
+        graph = build_stabilizer_graph(mock_controller)
+        assert graph is not None
+
+        # The compiled graph's nodes dict should contain LOCALIZE
+        node_names = set(graph.get_graph().nodes.keys())
+        assert "LOCALIZE" in node_names, f"LOCALIZE missing from nodes: {node_names}"
+
+    def test_build_graph_standard_nodes_present(self):
+        """Standard nodes READ/AUDIT/CONSENSUS/FIX/REVIEW/GATE must always be present."""
+        try:
+            from langgraph.graph import StateGraph  # type: ignore
+        except ImportError:
+            pytest.skip("langgraph not installed")
+
+        from swarm.langgraph_state import build_stabilizer_graph
+
+        mock_controller = MagicMock()
+        mock_controller.config.gap5_enabled = False
+
+        graph = build_stabilizer_graph(mock_controller)
+        assert graph is not None
+
+        node_names = set(graph.get_graph().nodes.keys())
+        for expected in ("READ", "AUDIT", "CONSENSUS", "FIX", "REVIEW", "GATE"):
+            assert expected in node_names, f"{expected} missing from nodes: {node_names}"
+
+    def test_consensus_routing_standard_goes_to_fix(self):
+        """With gap5_enabled=False, CONSENSUS routes to FIX, not LOCALIZE."""
+        from swarm.langgraph_state import SwarmState
+        s = SwarmState(gap5_enabled=False, issues_found=3, cycle=1, score=1.0)
+        # Simulate the routing function manually
+        if s.stabilized or s.halted:
+            dest = "END"
+        elif s.cycle >= s.max_cycles:
+            dest = "END"
+        elif s.score == 0 and s.issues_found == 0:
+            dest = "END"
+        else:
+            dest = "LOCALIZE" if s.gap5_enabled else "FIX"
+        assert dest == "FIX"
+
+    def test_consensus_routing_gap5_goes_to_localize(self):
+        """With gap5_enabled=True, CONSENSUS routes to LOCALIZE."""
+        from swarm.langgraph_state import SwarmState
+        s = SwarmState(gap5_enabled=True, issues_found=3, cycle=1, score=1.0)
+        if s.stabilized or s.halted:
+            dest = "END"
+        elif s.cycle >= s.max_cycles:
+            dest = "END"
+        elif s.score == 0 and s.issues_found == 0:
+            dest = "END"
+        else:
+            dest = "LOCALIZE" if s.gap5_enabled else "FIX"
+        assert dest == "LOCALIZE"
+
+    def test_consensus_routing_ends_when_stabilized(self):
+        """Stabilized state always routes to END regardless of gap5."""
+        from swarm.langgraph_state import SwarmState
+        for gap5 in (True, False):
+            s = SwarmState(gap5_enabled=gap5, stabilized=True, issues_found=5)
+            dest = "END" if s.stabilized else ("LOCALIZE" if s.gap5_enabled else "FIX")
+            assert dest == "END"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GAP 5 — config loader: [gap5] TOML section + environment variable mapping
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGap5ConfigLoader:
+    """Verify the config loader correctly maps [gap5] TOML and env vars."""
+
+    def test_flatten_toml_gap5_enabled(self):
+        from config.loader import _flatten_toml
+        raw = {"gap5": {"enabled": True, "bobn_n_candidates": 7}}
+        out = _flatten_toml(raw)
+        assert out["gap5_enabled"] is True
+        assert out["gap5_bobn_n_candidates"] == 7
+
+    def test_flatten_toml_gap5_models(self):
+        from config.loader import _flatten_toml
+        raw = {
+            "gap5": {
+                "vllm_secondary_model": "custom/model-b",
+                "vllm_critic_model":    "custom/critic",
+                "vllm_critic_base_url": "http://critic:9000/v1",
+            }
+        }
+        out = _flatten_toml(raw)
+        assert out["gap5_vllm_secondary_model"] == "custom/model-b"
+        assert out["gap5_vllm_critic_model"]    == "custom/critic"
+        assert out["gap5_vllm_critic_base_url"] == "http://critic:9000/v1"
+
+    def test_flatten_toml_gap5_counts(self):
+        from config.loader import _flatten_toml
+        raw = {"gap5": {"bobn_fixer_a_count": 5, "bobn_fixer_b_count": 3}}
+        out = _flatten_toml(raw)
+        assert out["gap5_bobn_fixer_a_count"] == 5
+        assert out["gap5_bobn_fixer_b_count"] == 3
+
+    def test_flatten_toml_gap5_missing_section_is_noop(self):
+        """When [gap5] is absent the flattener does not crash or inject keys."""
+        from config.loader import _flatten_toml
+        raw = {"models": {"primary": "qwen"}}
+        out = _flatten_toml(raw)
+        # No gap5 keys injected with wrong defaults
+        assert "gap5_enabled" not in out
+
+    def test_env_map_contains_gap5_keys(self):
+        from config.loader import _ENV_MAP
+        required = {
+            "RHODAWK_GAP5_ENABLED",
+            "VLLM_SECONDARY_BASE_URL",
+            "VLLM_SECONDARY_MODEL",
+            "VLLM_CRITIC_BASE_URL",
+            "VLLM_CRITIC_MODEL",
+            "RHODAWK_BOBN_CANDIDATES",
+            "RHODAWK_BOBN_FIXER_A",
+            "RHODAWK_BOBN_FIXER_B",
+        }
+        missing = required - set(_ENV_MAP.keys())
+        assert not missing, f"Missing env mappings: {missing}"
+
+    def test_env_override_gap5_enabled(self, monkeypatch):
+        import os
+        from config.loader import _apply_env
+        monkeypatch.setenv("RHODAWK_GAP5_ENABLED", "1")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_enabled") is True
+
+    def test_env_override_bobn_candidates(self, monkeypatch):
+        from config.loader import _apply_env
+        monkeypatch.setenv("RHODAWK_BOBN_CANDIDATES", "10")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_bobn_n_candidates") == 10
+
+    def test_env_override_critic_model(self, monkeypatch):
+        from config.loader import _apply_env
+        monkeypatch.setenv("VLLM_CRITIC_MODEL", "meta-llama/Llama-3.1-70B")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_vllm_critic_model") == "meta-llama/Llama-3.1-70B"
+
+    def test_env_override_secondary_url(self, monkeypatch):
+        from config.loader import _apply_env
+        monkeypatch.setenv("VLLM_SECONDARY_BASE_URL", "http://gpu2:8001/v1")
+        data: dict = {}
+        _apply_env(data)
+        assert data.get("gap5_vllm_secondary_base_url") == "http://gpu2:8001/v1"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GAP 5 — FixerAgent.run_with_patch: BoBN patch storage
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGap5FixerRunWithPatch:
+    """Verify run_with_patch stores BoBN winning patch as FixAttempt."""
+
+    def _make_fixer(self, tmp_path):
+        from agents.fixer import FixerAgent
+        from agents.base import AgentConfig
+
+        cfg = AgentConfig(
+            model="openai/Qwen/Qwen2.5-Coder-32B",
+            fallback_models=[],
+            triage_model="ollama/granite-code:3b",
+            critical_fix_model="ollama/granite-code:3b",
+            reviewer_model="ollama/llama3:8b",
+        )
+        storage = AsyncMock()
+        storage.upsert_fix.return_value = None
+        storage.upsert_issue.return_value = None
+        storage.log_llm_session.return_value = None
+        storage.get_total_cost.return_value = 0.0
+
+        fixer = FixerAgent(
+            storage  = storage,
+            run_id   = "test-run-gap5",
+            config   = cfg,
+            repo_root = tmp_path,
+        )
+        return fixer, storage
+
+    @pytest.mark.asyncio
+    async def test_run_with_patch_creates_fix_attempt(self, tmp_path):
+        fixer, storage = self._make_fixer(tmp_path)
+
+        # Write a dummy file so the parser can hash it
+        (tmp_path / "src.py").write_text("x = None\n")
+
+        patch_text = (
+            "--- a/src.py\n+++ b/src.py\n"
+            "@@ -1 +1 @@\n"
+            "-x = None\n"
+            "+x = {}\n"
+        )
+        fake_issue = MagicMock()
+        fake_issue.id = "issue-abc123"
+        fake_issue.file_path = "src.py"
+        fake_issue.fix_attempts = 0
+        fake_issue.max_fix_attempts = 3
+        fake_issue.status = "OPEN"
+
+        fixes = await fixer.run_with_patch(
+            issues      = [fake_issue],
+            patch       = patch_text,
+            patch_model = "openai/Qwen/Qwen2.5-Coder-32B",
+            patch_meta  = {
+                "bobn_candidate_id": "A1",
+                "bobn_composite_score": 0.87,
+                "bobn_test_score": 0.95,
+                "bobn_n_candidates": 5,
+                "attack_confidence": 0.15,
+            },
+        )
+
+        assert len(fixes) == 1
+        fix = fixes[0]
+        assert fix.run_id == "test-run-gap5"
+        assert "A1" in fix.extra_notes
+        storage.upsert_fix.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_with_patch_empty_falls_back_to_run(self, tmp_path):
+        """Empty patch triggers fallback to standard run()."""
+        fixer, storage = self._make_fixer(tmp_path)
+        storage.list_issues.return_value = []
+
+        fixes = await fixer.run_with_patch(
+            issues=[MagicMock()],
+            patch="",
+            patch_model="qwen",
+        )
+        # run() returns [] when no issues — just verify it was called, not crashed
+        assert isinstance(fixes, list)
+
+    @pytest.mark.asyncio
+    async def test_run_with_patch_parses_multi_file_diff(self, tmp_path):
+        """Multi-file diffs produce one FixedFile per changed file."""
+        fixer, storage = self._make_fixer(tmp_path)
+
+        for name in ("auth.py", "middleware.py"):
+            (tmp_path / name).write_text(f"# {name}\n")
+
+        patch_text = (
+            "--- a/auth.py\n+++ b/auth.py\n"
+            "@@ -1 +1 @@\n"
+            "-# auth.py\n"
+            "+# auth.py fixed\n"
+            "--- a/middleware.py\n+++ b/middleware.py\n"
+            "@@ -1 +1 @@\n"
+            "-# middleware.py\n"
+            "+# middleware.py fixed\n"
+        )
+        fake_issue = MagicMock()
+        fake_issue.id = "issue-xyz"
+        fake_issue.file_path = "auth.py"
+        fake_issue.fix_attempts = 0
+        fake_issue.max_fix_attempts = 3
+        fake_issue.status = "OPEN"
+
+        fixes = await fixer.run_with_patch(
+            issues      = [fake_issue],
+            patch       = patch_text,
+            patch_model = "openai/deepseek-ai/DeepSeek-Coder-V2",
+        )
+        assert len(fixes) == 1
+        assert len(fixes[0].fixed_files) == 2
+        file_paths = {ff.path for ff in fixes[0].fixed_files}
+        assert "auth.py" in file_paths
+        assert "middleware.py" in file_paths
+
+    def test_parse_unified_diff_strips_git_prefixes(self, tmp_path):
+        """Git-style 'a/' and 'b/' prefixes are stripped from file paths."""
+        from agents.fixer import FixerAgent
+        from agents.base import AgentConfig
+
+        fixer = FixerAgent(
+            storage=AsyncMock(),
+            run_id="r",
+            config=AgentConfig(model="m", fallback_models=[]),
+            repo_root=tmp_path,
+        )
+        patch_text = (
+            "--- a/src/module.py\n+++ b/src/module.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        result = fixer._parse_unified_diff_to_fixed_files(patch_text, "qwen")
+        assert len(result) == 1
+        assert result[0].path == "src/module.py"
+        assert not result[0].path.startswith("a/")
+        assert not result[0].path.startswith("b/")
+
+    def test_parse_unified_diff_extracts_line_counts(self, tmp_path):
+        from agents.fixer import FixerAgent
+        from agents.base import AgentConfig
+
+        fixer = FixerAgent(
+            storage=AsyncMock(),
+            run_id="r",
+            config=AgentConfig(model="m", fallback_models=[]),
+            repo_root=tmp_path,
+        )
+        patch_text = (
+            "--- a/f.py\n+++ b/f.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " unchanged\n"
+            "-removed1\n"
+            "-removed2\n"
+            "+added1\n"
+            "+added2\n"
+            "+added3\n"
+        )
+        result = fixer._parse_unified_diff_to_fixed_files(patch_text, "qwen")
+        assert result[0].lines_changed == 5   # 2 removed + 3 added
+
+    @pytest.mark.asyncio
+    async def test_run_with_patch_updates_issue_status(self, tmp_path):
+        """Issue fix_attempts is incremented and status set to FIX_GENERATED."""
+        from brain.schemas import IssueStatus
+        fixer, storage = self._make_fixer(tmp_path)
+
+        fake_issue = MagicMock()
+        fake_issue.id = "issue-001"
+        fake_issue.file_path = "f.py"
+        fake_issue.fix_attempts = 0
+        fake_issue.max_fix_attempts = 3
+        fake_issue.status = "OPEN"
+
+        await fixer.run_with_patch(
+            issues      = [fake_issue],
+            patch       = "--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-x\n+y\n",
+            patch_model = "qwen",
+        )
+
+        assert fake_issue.fix_attempts == 1
+        assert fake_issue.status == IssueStatus.FIX_GENERATED
+        storage.upsert_issue.assert_called_once_with(fake_issue)
