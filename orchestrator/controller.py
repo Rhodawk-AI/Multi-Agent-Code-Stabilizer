@@ -1416,16 +1416,27 @@ class StabilizerController:
 
                 # ── GAP 5 FIX A: Formal gate on winning patch ─────────────────
                 # Previously MISSING from the controller path entirely.
-                # Runs three layers: diff sanity → safety pattern scan → Z3.
-                # On failure tries the second-best candidate before giving up.
+                # Runs four layers:
+                #   1. Diff sanity      — structural validation of the unified diff
+                #   2. Safety patterns  — static pattern scan for dangerous constructs
+                #   3. CBMC             — bounded model checking for C/C++ patches
+                #                        (HARD block on confirmed counterexample)
+                #   4. Z3               — SMT constraint check (advisory only)
+                # On hard failure (layers 1-3) tries the second-best candidate
+                # before giving up.
                 winning_patch      = winner.patch
                 formal_gate_passed = True
 
                 if self.config.formal_verification and winning_patch:
                     try:
-                        from swe_bench.evaluator import _check_safety_patterns, _run_z3_gate
+                        from swe_bench.evaluator import (
+                            _check_safety_patterns,
+                            _run_cbmc_gate,
+                            _run_z3_gate,
+                        )
                         from agents.patch_synthesis_agent import _validate_diff
                         from models.router import get_router as _get_router
+                        import shutil as _shutil
 
                         added_lines = [
                             ln[1:] for ln in winning_patch.split("\n")
@@ -1456,22 +1467,81 @@ class StabilizerController:
                                     f"candidate={winner.candidate_id} for issue {issue.id[:8]}"
                                 )
                         else:
-                            # Z3 layer — advisory, never blocks in production
-                            try:
-                                z3_ok = await _run_z3_gate(
-                                    issue_text  = issue_text,
-                                    patch       = winning_patch,
-                                    router      = _get_router(),
-                                    instance_id = issue.id[:8],
-                                )
-                                if not z3_ok:
-                                    self.log.warning(
-                                        f"[gap5] Z3 advisory: counterexample found for "
-                                        f"issue {issue.id[:8]} — patch may be unsound "
-                                        "(proceeding: Z3 is advisory in production)"
+                            # ── Layer 3: CBMC — hard gate for C/C++ patches ───
+                            # Detect whether the patch touches any C/C++ files by
+                            # inspecting the diff's file headers.  Only invoke CBMC
+                            # when cbmc is installed and at least one touched file is
+                            # a C/C++ translation unit.  Non-blocking on tooling
+                            # failure (cbmc not installed, timeout) — only a
+                            # confirmed counterexample (rc=10) blocks the commit.
+                            _c_extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"}
+                            _touched_files = [
+                                ln.split()[-1]
+                                for ln in winning_patch.splitlines()
+                                if ln.startswith("--- ") and not ln.startswith("--- /dev/null")
+                            ]
+                            _has_c_files = any(
+                                any(f.endswith(ext) for ext in _c_extensions)
+                                for f in _touched_files
+                            )
+                            if _has_c_files and _shutil.which("cbmc"):
+                                try:
+                                    cbmc_ok = await _run_cbmc_gate(
+                                        patch       = winning_patch,
+                                        instance_id = issue.id[:8],
                                     )
-                            except Exception as _z3e:
-                                self.log.debug(f"[gap5] Z3 layer skipped: {_z3e}")
+                                    if not cbmc_ok:
+                                        self.log.warning(
+                                            f"[gap5] CBMC counterexample found for "
+                                            f"issue {issue.id[:8]} — trying second-best candidate"
+                                        )
+                                        formal_gate_passed = False
+                                        second = next(
+                                            (c for c in bobn_result.all_candidates[1:]
+                                             if c.patch and c.patch != winning_patch),
+                                            None,
+                                        )
+                                        if second:
+                                            winning_patch      = second.patch
+                                            winner             = second
+                                            formal_gate_passed = True
+                                            self.log.info(
+                                                f"[gap5] Formal gate (CBMC): promoted second-best "
+                                                f"candidate={winner.candidate_id} for issue {issue.id[:8]}"
+                                            )
+                                    else:
+                                        self.log.info(
+                                            f"[gap5] CBMC passed for C/C++ patch "
+                                            f"issue={issue.id[:8]}"
+                                        )
+                                except Exception as _cbmc_e:
+                                    # Infrastructure failure — never block the pipeline
+                                    self.log.debug(
+                                        f"[gap5] CBMC layer skipped (infrastructure): {_cbmc_e}"
+                                    )
+                            elif _has_c_files:
+                                self.log.debug(
+                                    f"[gap5] CBMC not installed — C/C++ patch for "
+                                    f"issue {issue.id[:8]} proceeds without CBMC proof"
+                                )
+
+                            # ── Layer 4: Z3 — advisory only, never blocks ─────
+                            if formal_gate_passed:
+                                try:
+                                    z3_ok = await _run_z3_gate(
+                                        issue_text  = issue_text,
+                                        patch       = winning_patch,
+                                        router      = _get_router(),
+                                        instance_id = issue.id[:8],
+                                    )
+                                    if not z3_ok:
+                                        self.log.warning(
+                                            f"[gap5] Z3 advisory: counterexample found for "
+                                            f"issue {issue.id[:8]} — patch may be unsound "
+                                            "(proceeding: Z3 is advisory in production)"
+                                        )
+                                except Exception as _z3e:
+                                    self.log.debug(f"[gap5] Z3 layer skipped: {_z3e}")
 
                     except ImportError as _ie:
                         self.log.debug(f"[gap5] Formal gate helpers unavailable: {_ie}")
@@ -1690,15 +1760,15 @@ class StabilizerController:
             )
 
         async def _phase_fix(self, issues: list[Issue]) -> None:
-        assert self.run and self.storage
+            assert self.run and self.storage
 
-        # Enforce reviewer independence BEFORE creating the fixer
-        if self._independence_enforcer:
-            self._independence_enforcer.verify_or_raise(
-                context=f"run={self.run.id[:8]}"
-            )
+            # Enforce reviewer independence BEFORE creating the fixer
+            if self._independence_enforcer:
+                self._independence_enforcer.verify_or_raise(
+                    context=f"run={self.run.id[:8]}"
+                )
 
-        fixer = FixerAgent(
+            fixer = FixerAgent(
             storage=self.storage,
             run_id=self.run.id,
             config=_agent_cfg(self.config, self.run.id),
