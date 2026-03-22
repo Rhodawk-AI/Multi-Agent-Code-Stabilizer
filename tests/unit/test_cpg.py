@@ -1889,3 +1889,177 @@ class TestFQNResolution:
             f"ARCH-02: no FQN containing 'validate_token' in output {result!r}. "
             f"Joern FQNs are not being appended to the result."
         )
+
+
+class TestArch02BlastRadiusSmoke:
+    """
+    ARCH-02 smoke tests — verify blast_radius_score > 0 when Joern returns
+    callers for a known cross-file dependency, and verify the correct
+    Joern-QL predicate is used for FQN-style names.
+
+    These tests use lightweight mocks so they run without a real Joern server.
+    The key assertion is that:
+      1.  get_callers() uses cpg.method.filter(_.fullName == "…") for FQNs
+          (not cpg.method.name("…"), which matches bare names only and returns
+          zero results for any FQN — the root cause of the silent blast-radius=0
+          failure mode).
+      2.  compute_blast_radius() returns blast_radius_score > 0 when Joern
+          resolves the symbol and reports callers.
+      3.  resolve_function_names() emits a WARNING when zero FQNs are returned.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_callers_uses_fullname_predicate_for_fqn(self):
+        """
+        ARCH-02: get_callers() MUST use cpg.method.filter(_.fullName == "…")
+        when the supplied name is a Joern FQN (contains "::" or 2+ dots).
+        Using cpg.method.name("…") on a FQN always returns zero results
+        because Joern's .name field stores only the rightmost component.
+        """
+        from cpg.joern_client import JoernClient
+
+        client        = JoernClient(base_url="http://localhost:8080")
+        client._ready = True
+        client._session = MagicMock()
+
+        captured_queries: list[str] = []
+
+        async def _fake_query(q: str) -> list:
+            captured_queries.append(q)
+            return [{"callerName": "test_endpoint", "callerFile": "api/routes.py",
+                     "callerLine": 42, "calleeName": "services.payment.PaymentService.charge"}]
+
+        client._query = _fake_query
+
+        fqn = "services.payment.PaymentService.charge"
+        await client.get_callers(fqn, depth=1)
+
+        assert captured_queries, "ARCH-02: get_callers() made no Joern query"
+        q = captured_queries[0]
+        assert 'fullName' in q or 'fullName ==' in q or 'filter' in q.lower(), (
+            f"ARCH-02: get_callers() used cpg.method.name() for FQN '{fqn}'. "
+            f"Query was: {q!r}. "
+            f"cpg.method.name() looks up the bare name field and returns nothing "
+            f"for FQNs. Must use cpg.method.filter(_.fullName == "…") instead."
+        )
+        assert 'method.name(' not in q or fqn not in q, (
+            f"ARCH-02: get_callers() passed FQN '{fqn}' to cpg.method.name() — "
+            f"this always returns [] in Joern because .name is the bare name only. "
+            f"Query: {q!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_callers_uses_name_predicate_for_bare_name(self):
+        """
+        ARCH-02: bare names (no "::" and fewer than 2 dots) must continue to
+        use the cheaper cpg.method.name("…") lookup — do not regress this.
+        """
+        from cpg.joern_client import JoernClient
+
+        client        = JoernClient(base_url="http://localhost:8080")
+        client._ready = True
+        client._session = MagicMock()
+
+        captured_queries: list[str] = []
+
+        async def _fake_query(q: str) -> list:
+            captured_queries.append(q)
+            return []
+
+        client._query = _fake_query
+
+        await client.get_callers("handle_request", depth=1)
+
+        assert captured_queries, "ARCH-02: get_callers() made no Joern query for bare name"
+        q = captured_queries[0]
+        assert 'method.name("handle_request")' in q, (
+            f"ARCH-02: bare name 'handle_request' should use cpg.method.name() "
+            f"but query was: {q!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_blast_radius_score_nonzero_with_joern_callers(self):
+        """
+        ARCH-02 end-to-end smoke: when Joern resolves a FQN and returns callers,
+        compute_blast_radius() must produce blast_radius_score > 0.
+
+        This is the integration point that was silently broken: bare names passed
+        to the old get_callers() returned [] from Joern, leaving score=0 and
+        requires_human_review=False for every fix regardless of true blast radius.
+        """
+        from cpg.cpg_engine import CPGEngine, CPGBlastRadius
+
+        engine        = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+
+        # Joern resolves the bare name to an FQN
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=["services.payment.PaymentService.charge"]
+        )
+        # Joern returns 3 callers for the FQN
+        mock_client.compute_impact_set = AsyncMock(return_value=[
+            {"function_name": "test_charge_ok",    "file_path": "tests/test_payment.py", "line_number": 10},
+            {"function_name": "process_invoice",   "file_path": "billing/invoicer.py",   "line_number": 55},
+            {"function_name": "handle_refund",     "file_path": "billing/refunds.py",    "line_number": 88},
+        ])
+        mock_client.get_importing_files = AsyncMock(return_value=[])
+
+        engine._client    = mock_client
+        engine.is_sharded = False
+        engine._gcf       = None
+
+        blast = await engine.compute_blast_radius(
+            function_names=["charge"],
+            file_paths=["services/payment.py"],
+            depth=3,
+        )
+
+        assert blast.blast_radius_score > 0, (
+            f"ARCH-02 smoke: blast_radius_score={blast.blast_radius_score} — "
+            f"expected > 0 when Joern returns 3 callers. "
+            f"This indicates get_callers/compute_impact_set is not being reached "
+            f"or is returning empty despite a mocked non-empty response. "
+            f"Source: {getattr(blast, 'source', 'unknown')}, "
+            f"affected_function_count={blast.affected_function_count}"
+        )
+        assert blast.affected_function_count == 3, (
+            f"ARCH-02 smoke: expected 3 affected functions, got "
+            f"{blast.affected_function_count}. "
+            f"Blast details: score={blast.blast_radius_score}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_warns_on_zero_fqns(self, caplog):
+        """
+        ARCH-02: resolve_function_names() must emit a WARNING when Joern is
+        reachable but returns zero FQNs for every queried symbol.
+        Zero FQNs = CPG built from wrong commit or incomplete import.
+        """
+        import logging
+        from cpg.cpg_engine import CPGEngine
+
+        engine        = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        # Joern returns nothing for every symbol
+        mock_client.resolve_method_fqn = AsyncMock(return_value=[])
+        engine._client = mock_client
+
+        with caplog.at_level(logging.WARNING, logger="cpg.cpg_engine"):
+            await engine.resolve_function_names(
+                bare_names=["handle_request", "process_payment"],
+                file_paths=["api/handler.py"],
+            )
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("ZERO FQN" in m or "zero FQN" in m.lower() for m in warning_msgs), (
+            f"ARCH-02: no WARNING emitted when Joern returned zero FQNs. "
+            f"Log records: {warning_msgs}. "
+            f"This warning is the primary operator diagnostic for the silent "
+            f"blast-radius=0 failure mode."
+        )
