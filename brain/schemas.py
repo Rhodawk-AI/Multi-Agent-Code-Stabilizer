@@ -689,6 +689,15 @@ class SynthesisReport(BaseModel):
     synthesis_summary: str = ''
     duration_s: float = 0.0
     created_at: datetime = Field(default_factory=_utcnow)
+    # ARCH-03 FIX: track how many issues have no fail_tests so operators know
+    # when BoBN composite scoring is operating at reduced signal (40% instead of
+    # 100%). Issues sourced from static analysis never have fail_tests populated,
+    # so the test_score=0 collapse is the dominant case in production usage.
+    # These fields are exposed in the API response and included in benchmark
+    # score output so published results are qualified appropriately.
+    issues_without_fail_tests: int = 0    # count of deduped issues with no fail_tests
+    bobn_inactive_pct: float = 0.0        # percentage of issues where BoBN test signal is absent
+    heuristic_tests_matched: int = 0      # issues that received fail_tests via heuristic matching
 
 class AuditScore(BaseModel):
     id: str = Field(default_factory=_new_id)
