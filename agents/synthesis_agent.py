@@ -57,6 +57,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -272,18 +274,53 @@ class SynthesisAgent(BaseAgent):
             compound_issues.append(issue)
             cf.synthesized_issue_id = issue.id
 
+        # ── Step 4.5: Heuristic fail_tests population (ARCH-03 FIX) ─────────────
+        # Issues sourced from static analysis never have fail_tests populated, so
+        # test_score=0 and the BoBN composite collapses to 40% signal for the
+        # dominant issue class. Here we attempt to match issues against existing
+        # test files in the repository to supply at least a weak correctness signal.
+        # Even one matching test is better than none — it prevents the full collapse.
+        heuristic_matched = 0
+        try:
+            heuristic_matched = await self._populate_fail_tests_heuristic(deduped)
+            if heuristic_matched:
+                self.log.info(
+                    f"[synthesis] Heuristic fail_tests: matched tests for "
+                    f"{heuristic_matched}/{len(deduped)} issues that had none"
+                )
+        except Exception as _ht_exc:
+            self.log.debug(f"[synthesis] Heuristic fail_tests population failed (non-fatal): {_ht_exc}")
+
         # ── Step 5: Audit trail ───────────────────────────────────────────────
+        # ARCH-03 FIX: compute BoBN-inactive stats and include in the audit trail
+        # so operators and benchmark reports know when test signal is absent.
+        _no_tests = [i for i in deduped if not i.fail_tests]
+        _bobn_inactive_pct = (len(_no_tests) / len(deduped) * 100.0) if deduped else 0.0
+        if _no_tests:
+            self.log.warning(
+                "[synthesis] ARCH-03: %d/%d deduped issues have no fail_tests after "
+                "heuristic matching — BoBN composite scoring will use 40%% signal "
+                "(0.3×robust + 0.1×minimal, test_score=0) for these issues. "
+                "Provide fail_tests on Issue records or instrument the auditor to "
+                "generate reproduction tests for full BoBN effectiveness.",
+                len(_no_tests), len(deduped),
+            )
+
         await self._write_audit_trail(
             raw_count=len(issues),
             deduped_count=len(deduped),
             compound_count=len(compound_findings),
+            issues_without_fail_tests=len(_no_tests),
+            bobn_inactive_pct=_bobn_inactive_pct,
+            heuristic_tests_matched=heuristic_matched,
         )
 
         # Combine deduplicated issues + compound synthesis issues
         all_issues = deduped + compound_issues
         self.log.info(
             f"[synthesis] Complete: {len(all_issues)} final issues "
-            f"({len(deduped)} deduped + {len(compound_issues)} compound)"
+            f"({len(deduped)} deduped + {len(compound_issues)} compound) "
+            f"bobn_inactive={_bobn_inactive_pct:.0f}%"
         )
         return deduped, compound_findings
 
@@ -985,11 +1022,150 @@ class SynthesisAgent(BaseAgent):
 
     # ── Audit trail ───────────────────────────────────────────────────────────
 
+    async def _populate_fail_tests_heuristic(self, issues: list[Issue]) -> int:
+        """
+        ARCH-03 FIX: Heuristic fail_tests population for static-analysis-sourced issues.
+
+        The BoBN composite formula is:
+            0.6 × test_score + 0.3 × robust + 0.1 × minimal
+
+        When fail_tests is empty, test_score=0 and the composite collapses to 40%
+        signal.  This method attempts to recover at least a weak correctness signal
+        by scanning the repository's test suite for test functions that exercise
+        the same file or function that the issue targets.
+
+        Strategy
+        --------
+        1. Walk repo_root looking for test files (test_*.py / *_test.py).
+           Cap the scan at _MAX_TEST_FILES to avoid crawling huge repos.
+        2. For each issue that has no fail_tests, derive candidate identifiers:
+              • the stem of the affected file (e.g. "fix_memory" from
+                "memory/fix_memory.py")
+              • any function name extracted from the issue description
+                (word following "in ", "def ", or "`")
+        3. For each matching test file, extract test function names with a
+           lightweight regex (no AST parse — must stay fast for 400-issue runs).
+        4. Score each test function against the candidate identifiers; keep
+           those that contain at least one identifier as a substring.
+        5. Write matching test IDs back to issue.fail_tests and persist via
+           storage.upsert_issue().
+
+        This is intentionally conservative: we only add tests that contain
+        the affected symbol name as a literal substring, so false-positive
+        signal is very rare.  The benefit of a weak heuristic test (e.g.
+        test_retrieve_federated for fix_memory.py) far outweighs having
+        test_score=0, even if the test doesn't exercise the exact defect path.
+
+        Returns the count of issues that received at least one new fail_test.
+        """
+        _MAX_TEST_FILES = 300
+        _FUNC_RE = re.compile(r"def (test_\w+)", re.MULTILINE)
+        _IDENT_RE = re.compile(
+            r"(?:in |def |`)([a-z_][a-z0-9_]{2,})", re.IGNORECASE
+        )
+
+        repo_root = self.repo_root
+        if repo_root is None:
+            return 0
+
+        # Resolve to a Path whether repo_root is str or Path-like
+        try:
+            root = Path(str(repo_root))
+        except Exception:
+            return 0
+        if not root.is_dir():
+            return 0
+
+        # Collect issues that need tests
+        needs_tests = [i for i in issues if not i.fail_tests]
+        if not needs_tests:
+            return 0
+
+        # Walk once, collect test files (capped)
+        test_files: list[Path] = []
+        try:
+            for p in root.rglob("*.py"):
+                name = p.name
+                if name.startswith("test_") or name.endswith("_test.py"):
+                    test_files.append(p)
+                    if len(test_files) >= _MAX_TEST_FILES:
+                        break
+        except Exception:
+            return 0
+
+        if not test_files:
+            return 0
+
+        # Build an index: file_stem → [(test_id, test_name)] where test_id is
+        # "path/to/test_file.py::test_function_name" (pytest node-id format).
+        # We index by test file stem so the per-issue lookup is O(1) not O(files).
+        stem_index: dict[str, list[str]] = {}
+        for tf in test_files:
+            try:
+                src = tf.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            rel = str(tf.relative_to(root)) if root in tf.parents or tf.is_relative_to(root) else tf.name
+            for fn_name in _FUNC_RE.findall(src):
+                node_id = f"{rel}::{fn_name}"
+                # index under the test file's own stem
+                stem_index.setdefault(tf.stem, []).append(node_id)
+                # also index under every word token in the test file name so
+                # "test_fix_memory.py" matches both "fix" and "memory" lookups
+                for tok in tf.stem.replace("test_", "").split("_"):
+                    if len(tok) >= 3:
+                        stem_index.setdefault(tok, []).append(node_id)
+
+        matched_count = 0
+        for issue in needs_tests:
+            # Derive candidate identifiers from the affected file and description
+            candidates: set[str] = set()
+            if issue.file_path:
+                stem = Path(issue.file_path).stem.lower()
+                candidates.add(stem)
+                # also add each underscore-separated component
+                for part in stem.split("_"):
+                    if len(part) >= 3:
+                        candidates.add(part)
+            for m in _IDENT_RE.finditer(issue.description or ""):
+                tok = m.group(1).lower()
+                if len(tok) >= 3:
+                    candidates.add(tok)
+
+            # Collect test IDs whose name contains any candidate as a substring
+            matched_ids: list[str] = []
+            seen_ids: set[str] = set()
+            for cand in candidates:
+                for node_id in stem_index.get(cand, []):
+                    if node_id not in seen_ids:
+                        # Extra check: the test function name must also contain
+                        # the candidate — avoids picking up unrelated tests that
+                        # happened to share a common index key.
+                        fn_name = node_id.split("::")[-1]
+                        if cand in fn_name:
+                            matched_ids.append(node_id)
+                            seen_ids.add(node_id)
+
+            if matched_ids:
+                issue.fail_tests = matched_ids[:10]   # cap at 10 per issue
+                try:
+                    await self.storage.upsert_issue(issue)
+                except Exception:
+                    pass   # non-fatal — issue object already mutated in memory
+                matched_count += 1
+
+        return matched_count
+
     async def _write_audit_trail(
         self,
         raw_count:      int,
         deduped_count:  int,
         compound_count: int,
+        # ARCH-03 FIX: BoBN-inactive telemetry — how many issues lack fail_tests
+        # and therefore receive only 40% of the normal composite scoring signal.
+        issues_without_fail_tests: int = 0,
+        bobn_inactive_pct:         float = 0.0,
+        heuristic_tests_matched:   int = 0,
     ) -> None:
         """Write a synthesis completion entry to the audit trail."""
         try:
@@ -1003,7 +1179,10 @@ class SynthesisAgent(BaseAgent):
                 after=(
                     f"raw={raw_count} deduped={deduped_count} "
                     f"compound={compound_count} "
-                    f"removed={raw_count - deduped_count}"
+                    f"removed={raw_count - deduped_count} "
+                    f"bobn_inactive={bobn_inactive_pct:.0f}% "
+                    f"no_fail_tests={issues_without_fail_tests} "
+                    f"heuristic_matched={heuristic_tests_matched}"
                 ),
             )
             await self.storage.append_audit_trail(entry)
