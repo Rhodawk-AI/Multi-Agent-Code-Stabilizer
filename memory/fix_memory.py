@@ -438,20 +438,42 @@ class FixMemory:
         """
         Synchronous wrapper around the async federated pull.
 
-        When called from a sync context (no running event loop), executes the
-        pull via run_until_complete.  When called from an async context (event
-        loop already running — e.g. inside the fixer pipeline), schedules the
-        pull as a background task and returns the local-cache results only for
-        this call; the fresh peer results will be available on the next call
-        once the task completes.
+        BUG-01 FIX: Previously, when called from an async context (the
+        common case for all pipeline callers), this method entered the
+        `if loop.is_running()` branch, scheduled a background pull via
+        ensure_future(), then executed:
+            cached = loop.run_until_complete(...) if not loop.is_running() else []
+        Since loop.is_running() was True, the ternary always evaluated to [].
+        The method returned an empty list on every async call — federated
+        augmentation silently never happened.
 
-        Callers that are themselves async (fixer._get_memory_examples,
-        fixer._report_federated_usage) should call retrieve_async() instead
-        so they get the full federated augmentation without any deferral.
+        Fix: when the event loop is running, raise RuntimeError immediately
+        so callers are forced to use retrieve_async(). All async pipeline
+        callers (fixer._get_memory_examples, fixer._report_federated_usage)
+        already call retrieve_async(). The sync retrieve() path is only
+        legitimate in a non-async context (e.g. CLI tooling, unit tests).
         """
         if self._federated_store is None:
             return []
         if not getattr(self._federated_store, "receive", False):
+            return []
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # BUG-01 FIX: raise instead of silently returning empty.
+                # All async callers must use retrieve_async() so they get the
+                # full federated augmentation without deferral.
+                raise RuntimeError(
+                    "FixMemory._retrieve_federated() was called from an async "
+                    "context (event loop is running). Use retrieve_async() instead "
+                    "to receive federated patterns without blocking or silent empty "
+                    "results. This is a programming error — callers in the fixer "
+                    "pipeline must use the async API path."
+                )
+        except RuntimeError as exc:
+            if "event loop is running" in str(exc) or "retrieve_async" in str(exc):
+                raise
             return []
 
         async def _pull() -> list:
@@ -470,27 +492,6 @@ class FixMemory:
 
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Async context: schedule as fire-and-forget so the cache is
-                # populated for the next retrieve() call.  Return the current
-                # local cache immediately rather than silently dropping results.
-                asyncio.ensure_future(_pull())
-                log.debug(
-                    "FixMemory._retrieve_federated: async context detected — "
-                    "pull scheduled as background task; returning cached results"
-                )
-                # Return whatever the local cache already has synchronously
-                try:
-                    cached = loop.run_until_complete(
-                        self._federated_store._retrieve_from_cache(
-                            issue_description.split()[0].lower()[:32]
-                            if issue_description else "",
-                            n,
-                        )
-                    ) if not loop.is_running() else []
-                except Exception:
-                    cached = []
-                return self._patterns_to_entries(cached)
             patterns = loop.run_until_complete(_pull())
         except RuntimeError:
             return []

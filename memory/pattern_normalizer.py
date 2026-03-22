@@ -318,7 +318,17 @@ class PatternNormalizer:
         #   - Different bug classes → different fingerprints (issue_type prefix)
         #   - Different normalizer paths → different fingerprints (path prefix)
         #   - Same bug class + same normalizer → same fingerprint (stable)
-        prefixed = f"issue:{issue_type}|path:{path}\n{norm_text}"
+        # BUG-03 FIX: do NOT include normalizer path in the fingerprint prefix.
+        # Previously: f"issue:{issue_type}|path:{path}\n{norm_text}"
+        # The path value ("tree_sitter", "pygments", "regex") varies across
+        # deployments depending on which grammar packages are installed. Two
+        # deployments producing the same structural pattern via different
+        # normalizer tiers would hash to different fingerprints, making
+        # cross-deployment deduplication impossible and the federation
+        # compounding advantage void.
+        # Fix: fingerprint only on issue_type + normalized_text. The normalizer
+        # path is retained in normalizer_path for diagnostics only.
+        prefixed = f"issue:{issue_type}\n{norm_text}"
         fingerprint = hashlib.sha256(prefixed.encode("utf-8")).hexdigest()
         complexity   = _compute_complexity(norm_text, id_count, lit_count)
 
