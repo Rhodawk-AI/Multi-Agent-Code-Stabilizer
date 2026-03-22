@@ -57,6 +57,35 @@ class JoernQueryError(RuntimeError):
     pass
 
 
+def _is_fqn(name: str) -> bool:
+    """Return True when *name* looks like a Joern fully-qualified name rather
+    than a bare method name.
+
+    Joern stores FQNs in language-specific formats:
+      C/C++  : ``<namespace>::<class>::<method>``   → contains ``::``
+      Java   : ``pkg.Class.method:signature``        → multi-dot + colon
+      Python : ``module.submodule.Class.method``     → 2+ dots
+
+    A plain tree-sitter bare name such as ``handle_request`` or a
+    short identifier will not match — it is safe to look it up via
+    ``cpg.method.name()``.  A resolved Joern FQN MUST be looked up via
+    ``cpg.method.filter(_.fullName == "…")`` because Joern's ``.name``
+    property stores only the rightmost component (the bare name), not the
+    full path.  Using ``.name("a.b.c.method")`` on a FQN will ALWAYS
+    return zero results and silently zero-out the blast radius.
+
+    This helper is used by ``get_callers`` and ``get_callees`` to choose
+    the correct Joern-QL predicate so that the blast-radius gate produces
+    correct, non-zero results for both bare names and resolved FQNs.
+    """
+    if "::" in name:
+        return True
+    # 2+ dots suggests a qualified path (module.Class.method or deeper).
+    # A single dot could be a legitimate class attribute access name used
+    # as a bare identifier in some languages — keep the threshold at 2.
+    return name.count(".") >= 2
+
+
 @dataclass
 class JoernMethodResult:
     name:            str  = ""
@@ -218,19 +247,44 @@ class JoernClient:
             return []
 
     async def get_callers(self, function_name: str, depth: int = 1) -> list[JoernCallChain]:
+        """Return callers of *function_name* up to *depth* hops.
+
+        ARCH-02 FIX
+        -----------
+        ``get_callers`` previously always used ``cpg.method.name("{name}")``
+        which is a bare-name lookup.  When ``function_name`` is a Joern FQN
+        (resolved by ``resolve_method_fqn``, e.g.
+        ``services.payment.PaymentService.handle_request``) this query matches
+        nothing — Joern stores the FQN in ``.fullName``, not ``.name``.  The
+        result was a silent ``blast_radius_score=0`` for every fix that went
+        through the FQN-resolution path, making the blast-radius gate a no-op.
+
+        Fix: ``_is_fqn()`` detects FQN-style names.  FQNs are looked up via
+        ``cpg.method.filter(_.fullName == "…")``; bare names continue to use
+        the cheaper ``cpg.method.name("…")`` path.  Both variants then traverse
+        the caller chain with the same ``.repeat(_.caller)`` logic.
+        """
         if not self.is_ready:
             return []
         try:
+            # Choose the right CPG predicate based on name format.
+            if _is_fqn(function_name):
+                # FQN path: exact fullName match avoids ambiguity.
+                base_traversal = f'cpg.method.filter(_.fullName == "{_esc(function_name)}")'
+            else:
+                # Bare name path: original behaviour, cheap and common.
+                base_traversal = f'cpg.method.name("{_esc(function_name)}")'
+
             if depth == 1:
                 q = (
-                    f'cpg.method.name("{_esc(function_name)}").caller'
+                    f'{base_traversal}.caller'
                     '.map(m => Map("callerName" -> m.name,"callerFile" -> m.filename,'
                     f'"callerLine" -> m.lineNumber.getOrElse(0),"calleeName" -> "{_esc(function_name)}"'
                     ')).l'
                 )
             else:
                 q = (
-                    f'cpg.method.name("{_esc(function_name)}")'
+                    f'{base_traversal}'
                     f'.repeat(_.caller)(_.times({depth}))'
                     '.map(m => Map("callerName" -> m.name,"callerFile" -> m.filename,'
                     f'"callerLine" -> m.lineNumber.getOrElse(0),"calleeName" -> "{_esc(function_name)}"'
@@ -252,18 +306,28 @@ class JoernClient:
             return []
 
     async def get_callees(self, function_name: str, depth: int = 1) -> list[JoernCallChain]:
+        """Return callees of *function_name* up to *depth* hops.
+
+        ARCH-02 FIX: same FQN-vs-bare-name predicate dispatch as ``get_callers``.
+        See that method's docstring for the full explanation.
+        """
         if not self.is_ready:
             return []
         try:
+            if _is_fqn(function_name):
+                base_traversal = f'cpg.method.filter(_.fullName == "{_esc(function_name)}")'
+            else:
+                base_traversal = f'cpg.method.name("{_esc(function_name)}")'
+
             if depth == 1:
                 q = (
-                    f'cpg.method.name("{_esc(function_name)}").callee'
+                    f'{base_traversal}.callee'
                     '.map(m => Map("calleeName" -> m.name,"calleeFile" -> m.filename,'
                     '"calleeLine" -> m.lineNumber.getOrElse(0))).l'
                 )
             else:
                 q = (
-                    f'cpg.method.name("{_esc(function_name)}")'
+                    f'{base_traversal}'
                     f'.repeat(_.callee)(_.times({depth}))'
                     '.map(m => Map("calleeName" -> m.name,"calleeFile" -> m.filename,'
                     '"calleeLine" -> m.lineNumber.getOrElse(0))).dedup.l'

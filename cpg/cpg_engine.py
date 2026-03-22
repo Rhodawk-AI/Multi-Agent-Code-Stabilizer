@@ -823,7 +823,24 @@ class CPGEngine:
         bare_names: list[str],
         file_paths: list[str] | None = None,
     ) -> list[str]:
-        """Resolve bare symbol names to CPG fully-qualified names. (Unchanged.)"""
+        """Resolve bare symbol names to CPG fully-qualified names.
+
+        ARCH-02 FIX
+        -----------
+        Previously this method was silent when Joern returned zero FQNs for
+        every input symbol.  In that case ``resolved`` contains only the
+        original bare names, which are passed on to ``compute_impact_set`` →
+        ``get_callers`` / ``get_callees``.  Those methods now handle bare names
+        correctly (see ARCH-02 fix in joern_client.py), but zero FQN resolution
+        is still a strong operational signal: it means the CPG index does not
+        contain the methods being fixed — wrong codebase version, incomplete
+        import, or path mismatch — and blast-radius results may be
+        systematically under-counted.
+
+        A WARNING is now emitted when Joern is reachable but resolved no FQNs
+        for any of the input symbols so operators can diagnose a blast-radius
+        gate that silently returns score=0.
+        """
         if not self.is_available or not self._client:
             return list(bare_names)
 
@@ -842,6 +859,7 @@ class CPGEngine:
                 resolved.append(name)
                 seen.add(name)
 
+        fqn_found: int = 0
         for bare in bare_only:
             for fp in (file_paths or [None]):
                 try:
@@ -850,14 +868,32 @@ class CPGEngine:
                         if fqn not in seen:
                             resolved.append(fqn)
                             seen.add(fqn)
+                            fqn_found += 1
                 except Exception as exc:
                     log.debug(f"CPGEngine.resolve_function_names({bare!r}, {fp!r}): {exc}")
 
-        if len(resolved) > len(bare_names):
+        if fqn_found > 0:
             log.info(
-                f"CPGEngine.resolve_function_names: {len(bare_names)} → "
-                f"{len(resolved)} after CPG FQN resolution"
+                f"CPGEngine.resolve_function_names: {len(bare_names)} bare name(s) → "
+                f"+{fqn_found} FQN(s) resolved via Joern (total={len(resolved)})"
             )
+        elif bare_only:
+            # Joern is reachable but returned no FQNs for any of the symbols.
+            # This is the key diagnostic for the ARCH-02 blast-radius silent-zero
+            # failure mode: bare names will still be used as fallback (get_callers
+            # handles them correctly), but cross-file impact may be undercounted if
+            # the CPG was built from a different commit or has an incomplete import.
+            log.warning(
+                "CPGEngine.resolve_function_names: Joern returned ZERO FQNs for "
+                "%d symbol(s) — CPG may not contain these methods. "
+                "Blast-radius score may be underestimated even if Joern is running. "
+                "Symbols queried: %s. "
+                "Verify JOERN_REPO_PATH points to the current checkout and that "
+                "'cpg import' completed without errors.",
+                len(bare_only),
+                bare_only[:5],
+            )
+
         return resolved
 
     async def compute_blast_radius(
