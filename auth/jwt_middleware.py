@@ -5,7 +5,13 @@ JWT authentication for the Rhodawk AI REST API and WebSocket connections.
 
 Security fixes applied
 ───────────────────────
-• B2: API and WebSocket had zero authentication.  This module enforces
+• BUG-7: python-jose absence now raises RuntimeError at import time instead of
+  silently falling back to a stub that accepts any token as anonymous with
+  wildcard scopes. The previous silent fallback meant any deployment where jose
+  failed to install had completely open authentication with no visible error.
+• Algorithm confusion: RHODAWK_JWT_ALGORITHM is constrained to HS256/RS256/ES256.
+  The "none" algorithm is explicitly rejected to prevent alg:none JWT attacks.
+• B2: API and WebSocket had zero authentication. This module enforces
   Bearer-token JWT auth on every protected endpoint.
 • B3: JWT secret loaded from environment — fails fast at startup if missing,
   never falls back to a hard-coded default.
@@ -18,7 +24,7 @@ Security fixes applied
 Environment variables
 ──────────────────────
     RHODAWK_JWT_SECRET     REQUIRED — minimum 32 chars, base64-encoded secret
-    RHODAWK_JWT_ALGORITHM  Optional — default HS256
+    RHODAWK_JWT_ALGORITHM  Optional — default HS256 (allowed: HS256, RS256, ES256)
     RHODAWK_JWT_TTL_MIN    Optional — access token TTL in minutes (default 60)
 """
 from __future__ import annotations
@@ -34,6 +40,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 log = logging.getLogger(__name__)
 
 _BEARER = HTTPBearer(auto_error=False)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Allowed JWT algorithms — "none" is explicitly excluded to prevent
+# the alg:none algorithm confusion attack where an attacker strips the
+# signature and sets alg to "none" to bypass verification.
+# ──────────────────────────────────────────────────────────────────────────────
+_ALLOWED_ALGORITHMS = frozenset({"HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "ES512"})
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Environment loading with fail-fast
@@ -63,23 +77,45 @@ def _init_config() -> None:
     if _SECRET_KEY is not None:
         return
     _SECRET_KEY  = _require_env("RHODAWK_JWT_SECRET", min_len=32)
-    _ALGORITHM   = os.environ.get("RHODAWK_JWT_ALGORITHM", "HS256")
+    raw_alg      = os.environ.get("RHODAWK_JWT_ALGORITHM", "HS256").strip().upper()
+
+    # BUG-7 FIX: Reject the "none" algorithm and any algorithm not in the
+    # explicitly allowed set. python-jose will raise JWTError for "none" tokens
+    # when algorithms=[_ALGORITHM] is passed, but explicitly blocking it at
+    # config time makes the policy intent unambiguous.
+    if raw_alg not in _ALLOWED_ALGORITHMS:
+        raise RuntimeError(
+            f"FATAL: RHODAWK_JWT_ALGORITHM='{raw_alg}' is not allowed. "
+            f"Must be one of: {', '.join(sorted(_ALLOWED_ALGORITHMS))}. "
+            "The 'none' algorithm is explicitly prohibited."
+        )
+
+    _ALGORITHM   = raw_alg
     _TTL_MINUTES = int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60"))
     log.info(f"JWT configured: algorithm={_ALGORITHM}, ttl={_TTL_MINUTES}min")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional jose import
+# jose import — hard failure if not available
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
     from jose import JWTError, jwt as _jwt  # type: ignore[import]
     _JOSE_AVAILABLE = True
 except ImportError:
-    _JOSE_AVAILABLE = False
-    log.warning(
-        "python-jose not installed — JWT auth disabled. "
-        "Run: pip install python-jose[cryptography]"
+    # BUG-7 FIX: Previously this set _JOSE_AVAILABLE = False and allowed the
+    # application to start with verify_token() returning
+    #     TokenData(sub="anonymous", scopes=["*"])
+    # for ANY input — complete open authentication with no visible error.
+    #
+    # Fix: raise RuntimeError immediately at import time so the container
+    # process exits and the orchestrator marks it as unhealthy. A deployment
+    # with open authentication must never silently serve traffic.
+    raise RuntimeError(
+        "FATAL: python-jose[cryptography] is not installed. "
+        "JWT authentication cannot function without it. "
+        "Install with: pip install 'python-jose[cryptography]>=3.3.0' "
+        "This package must be in your requirements or the Dockerfile fallback install list."
     )
 
 
@@ -105,9 +141,6 @@ def create_access_token(
         Override default TTL.
     """
     _init_config()
-    if not _JOSE_AVAILABLE:
-        return f"stub-token-{sub}"
-
     expire = datetime.now(tz=timezone.utc) + timedelta(
         minutes=ttl_minutes or _TTL_MINUTES
     )
@@ -143,19 +176,40 @@ def verify_token(token: str) -> TokenData:
     Raises
     ------
     HTTPException 401 if the token is invalid or expired.
+
+    Security notes
+    --------------
+    - algorithms=[_ALGORITHM] is passed explicitly so python-jose cannot
+      accept a token whose header declares a different algorithm (e.g. "none").
+    - _ALGORITHM is constrained to _ALLOWED_ALGORITHMS at startup, which
+      excludes "none" explicitly.
     """
     _init_config()
-    if not _JOSE_AVAILABLE:
-        # Stub mode: accept anything
-        return TokenData(sub="anonymous", scopes=["*"])
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is empty",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     try:
+        # Passing algorithms=[_ALGORITHM] (singular, from config) prevents the
+        # algorithm confusion attack: if the token header declares a different
+        # algorithm, jose raises JWTError("The specified alg value is not allowed").
         payload = _jwt.decode(token, _SECRET_KEY, algorithms=[_ALGORITHM])  # type: ignore[arg-type]
         sub: str | None = payload.get("sub")
         if sub is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Token missing subject claim",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # Verify expiry is present — defend against tokens crafted without exp.
+        if payload.get("exp") is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token missing expiry claim",
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return TokenData(sub=sub, scopes=payload.get("scopes", []))
