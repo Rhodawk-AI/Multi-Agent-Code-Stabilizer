@@ -98,9 +98,19 @@ def _enforce_production_security() -> None:
         # os._exit(1) terminates the process immediately with a non-zero code,
         # which docker-compose / k8s surface as an exit-code failure — visible
         # in `docker ps` and container logs — rather than an infinite restart loop.
-        # The log.critical above ensures the reason is in the container logs
-        # before the process exits.
+        #
+        # SEC-05 FIX (part 2): call logging.shutdown() BEFORE os._exit(1).
+        # os._exit() bypasses Python's atexit handlers and therefore bypasses
+        # the implicit logging.shutdown() that Python normally calls on clean
+        # exit.  If the log handler buffers writes (e.g. TimedRotatingFileHandler,
+        # a remote log shipper, or any handler with a non-zero buffer size) the
+        # log.critical() message above may be lost before the process dies.
+        # logging.shutdown() flushes and closes all handlers synchronously,
+        # guaranteeing that the diagnostic message reaches the log sink before
+        # the hard exit.
+        import logging as _logging
         import os as _os
+        _logging.shutdown()
         _os._exit(1)
 
     # Check 2: webhook secret should be configured in production.
