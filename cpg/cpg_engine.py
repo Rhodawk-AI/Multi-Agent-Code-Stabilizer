@@ -72,6 +72,14 @@ from typing import Any
 
 from cpg.joern_client import JoernClient, JoernCallChain
 
+# ARCH-1 FIX: import prometheus helper to track CPG context fallback rate.
+# Lazy import keeps cpg_engine importable even if prometheus_client is absent.
+try:
+    from metrics.prometheus_exporter import record_cpg_context as _record_cpg_context
+except Exception:  # pragma: no cover
+    def _record_cpg_context(source_type: str) -> None:  # type: ignore[misc]
+        pass
+
 log = logging.getLogger(__name__)
 
 _CACHE_TTL = 3600
@@ -538,7 +546,8 @@ class CPGEngine:
         else:
             result.source = "vector_fallback"
 
-        # ── Aggregate files in slice ────────────────────────────────────────
+        # ARCH-1 FIX: emit Prometheus counter so dashboards track fallback rate.
+        _record_cpg_context(result.source) ────────────────────────────────────────
         all_files: set[str] = {issue_file}
         for item in (
             result.causal_functions + result.callers
@@ -950,6 +959,8 @@ class CPGEngine:
                 f"function count is ESTIMATED ({blast.affected_file_count} files × 10 = "
                 f"{_estimated_fn_count}). Start Joern for exact CPG results."
             )
+            # ARCH-1 FIX: count blast-radius fallbacks in Prometheus.
+            _record_cpg_context("graph_fallback")
 
         blast.test_files_affected = [
             f for f in blast.affected_files if "test" in f.lower() or "spec" in f.lower()
