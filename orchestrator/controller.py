@@ -558,6 +558,33 @@ class StabilizerController:
         except Exception as exc:
             self.log.debug(f"vLLM LiteLLM config: {exc}")
 
+        # MISSING-1 FIX: assert_family_independence() must run unconditionally,
+        # regardless of gap5_enabled.  Previously it only ran inside _init_gap5()
+        # which is skipped when gap5_enabled=False.  A deployment with a wrong
+        # model assignment (critic and fixer sharing a family) would produce
+        # correlated results with no warning when gap5 was disabled.
+        #
+        # This call is NON-FATAL: if gap5_enabled=False the router may not have
+        # all four roles configured, so we catch RuntimeError and log rather than
+        # raising — the goal is operator visibility, not a hard startup block when
+        # running in reduced-capability mode.
+        try:
+            from models.router import get_router as _get_router_fi
+            _get_router_fi().assert_family_independence()
+            self.log.info("[family-check] Model family independence: OK")
+        except RuntimeError as exc:
+            self.log.error(
+                "[family-check] FAMILY INDEPENDENCE VIOLATION detected at startup "
+                "(gap5_enabled=%s): %s  "
+                "Fix: ensure VLLM_CRITIC_MODEL, VLLM_SYNTHESIS_MODEL, "
+                "VLLM_PRIMARY_MODEL, and VLLM_SECONDARY_MODEL are all from "
+                "different model families.",
+                self.config.gap5_enabled,
+                exc,
+            )
+        except Exception as exc:
+            self.log.debug("[family-check] Family independence check skipped: %s", exc)
+
         # 5. Gap 1: CPG engine (Joern Code Property Graph)
         await self._init_cpg()
 

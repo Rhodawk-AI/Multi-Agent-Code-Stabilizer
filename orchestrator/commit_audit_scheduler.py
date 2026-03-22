@@ -672,3 +672,176 @@ class CommitAuditScheduler:
             commit_message=commit_message,
         )
 
+    # ── MISSING-2 FIX: startup catch-up for missed commits ───────────────────
+
+    async def replay_missed_commits(
+        self,
+        branch: str = "",
+        max_commits: int = 50,
+    ) -> list[CommitAuditRecord]:
+        """
+        MISSING-2 FIX: Replay any commits that landed while the API was down,
+        the webhook timed out, or the repo does not support webhooks.
+
+        Algorithm
+        ---------
+        1. Find the most recently DONE CommitAuditRecord stored for this run.
+           That commit hash is the last point we know was audited.
+        2. Run ``git log {last_hash}..HEAD --format=%H`` to enumerate all
+           commits that arrived after that point (up to ``max_commits``).
+        3. For each unprocessed SHA, call ``schedule_commit_audit()`` which
+           already handles idempotency — SHAs already in DONE state are
+           skipped immediately.
+        4. Return all records created/replayed during this call.
+
+        Called from ``api/app.py`` lifespan on startup so every service
+        restart automatically catches up on the gap window.
+
+        Parameters
+        ----------
+        branch:
+            Branch name to pass through to each CommitAuditRecord. Uses the
+            current HEAD branch when empty.
+        max_commits:
+            Safety cap on the number of commits processed in one replay run.
+            Prevents a cold-start from triggering thousands of audits if the
+            service was down for a long time.  Default: 50.
+
+        Returns
+        -------
+        list[CommitAuditRecord]
+            Records created or returned (already-DONE) for each replayed SHA.
+        """
+        if not self._repo_root:
+            log.debug("[CommitAudit] replay_missed_commits: no repo_root — skipping")
+            return []
+
+        # ── Step 1: find anchor — most recent DONE record ────────────────────
+        anchor_hash: str = ""
+        try:
+            done_records = await self._storage.list_commit_audit_records(
+                run_id=self._run_id,
+                status=CommitAuditStatus.DONE,
+                limit=1,
+            )
+            if done_records:
+                anchor_hash = done_records[0].commit_hash
+                log.info(
+                    "[CommitAudit] replay: anchor commit = %s",
+                    anchor_hash[:12] if anchor_hash else "(none)",
+                )
+        except Exception as exc:
+            log.warning("[CommitAudit] replay: could not load anchor record: %s", exc)
+
+        # ── Step 2: enumerate commits since anchor ───────────────────────────
+        missed_shas = await self._git_commits_since(anchor_hash, max_commits)
+        if not missed_shas:
+            log.info("[CommitAudit] replay: no missed commits found")
+            return []
+
+        log.info(
+            "[CommitAudit] replay: %d commit(s) to process since anchor %s",
+            len(missed_shas),
+            anchor_hash[:12] if anchor_hash else "beginning",
+        )
+
+        # ── Step 3: determine current branch if not supplied ─────────────────
+        if not branch:
+            branch = await self._git_current_branch()
+
+        # ── Step 4: schedule each missed commit (idempotent) ─────────────────
+        records: list[CommitAuditRecord] = []
+        for sha in missed_shas:
+            try:
+                record = await self.schedule_commit_audit(
+                    commit_hash=sha,
+                    branch=branch,
+                    author="replay",
+                    commit_message="(replayed on startup)",
+                )
+                records.append(record)
+                log.info(
+                    "[CommitAudit] replay: %s → status=%s",
+                    sha[:12],
+                    record.status.value,
+                )
+            except Exception as exc:
+                log.error("[CommitAudit] replay: failed for %s: %s", sha[:12], exc)
+
+        log.info(
+            "[CommitAudit] replay complete: %d processed, %d done, %d failed",
+            len(records),
+            sum(1 for r in records if r.status == CommitAuditStatus.DONE),
+            sum(1 for r in records if r.status == CommitAuditStatus.FAILED),
+        )
+        return records
+
+    async def _git_commits_since(
+        self, anchor_hash: str, max_commits: int
+    ) -> list[str]:
+        """
+        Return SHAs of commits reachable from HEAD that are not ancestors
+        of anchor_hash (i.e. arrived after that commit), oldest first.
+        Limited to max_commits entries.
+        """
+        if not self._repo_root:
+            return []
+
+        loop = asyncio.get_event_loop()
+
+        def _run() -> list[str]:
+            try:
+                rev_range = (
+                    f"{anchor_hash}..HEAD" if anchor_hash else f"HEAD~{max_commits}..HEAD"
+                )
+                result = subprocess.run(
+                    ["git", "log", rev_range, "--format=%H", "--reverse",
+                     f"--max-count={max_commits}"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(self._repo_root),
+                    timeout=15,
+                )
+                if result.returncode != 0:
+                    # anchor may not be in history (shallow clone, force-push, etc.)
+                    # Fall back to listing the last N commits only.
+                    log.debug(
+                        "[CommitAudit] replay: git log %s failed (rc=%d), "
+                        "falling back to last %d commits",
+                        rev_range, result.returncode, max_commits,
+                    )
+                    fallback = subprocess.run(
+                        ["git", "log", f"--max-count={max_commits}",
+                         "--format=%H", "--reverse"],
+                        capture_output=True, text=True,
+                        cwd=str(self._repo_root), timeout=15,
+                    )
+                    if fallback.returncode != 0:
+                        return []
+                    return [s.strip() for s in fallback.stdout.splitlines() if s.strip()]
+                return [s.strip() for s in result.stdout.splitlines() if s.strip()]
+            except Exception as exc:
+                log.debug("[CommitAudit] replay: git log error: %s", exc)
+                return []
+
+        return await loop.run_in_executor(None, _run)
+
+    async def _git_current_branch(self) -> str:
+        """Return the name of the current git branch, or empty string on error."""
+        if not self._repo_root:
+            return ""
+        loop = asyncio.get_event_loop()
+
+        def _run() -> str:
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True, text=True,
+                    cwd=str(self._repo_root), timeout=5,
+                )
+                return result.stdout.strip() if result.returncode == 0 else ""
+            except Exception:
+                return ""
+
+        return await loop.run_in_executor(None, _run)
+
