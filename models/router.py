@@ -539,12 +539,69 @@ class TieredModelRouter:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    # Per-tier cloud fallback models that respect family independence.
+    # Each tier degrades to a cloud model from a DIFFERENT family than the
+    # adversarial critic (Meta/Llama) to prevent the BUG-6 collision where
+    # all degraded tiers routed to CLOUD_OSS (Llama-4-Scout, Meta family).
+    _TIER_CLOUD_FALLBACK: dict = {
+        # Fixer A (Alibaba) → DeepSeek on OpenRouter (different family)
+        ModelTier.VLLM_PRIMARY:   "openrouter/deepseek/deepseek-coder-v2-0724",
+        # Fixer B (DeepSeek) → Qwen on OpenRouter via Alibaba (different family)
+        ModelTier.VLLM_SECONDARY: "openrouter/qwen/qwen-2.5-coder-32b-instruct",
+        # Light judge → cheapest available cross-family model
+        ModelTier.VLLM_LIGHT:     "openrouter/deepseek/deepseek-coder-v2-0724",
+        # Critic (Meta) → Devstral/Mistral (different family)
+        ModelTier.VLLM_CRITIC:    "openrouter/mistralai/devstral-small",
+        # Synthesis (Mistral) → DeepSeek (different family)
+        ModelTier.VLLM_SYNTHESIS: "openrouter/deepseek/deepseek-coder-v2-0724",
+    }
+
     def _select_model(self, tier: ModelTier, models: list[str]) -> str:
+        """
+        BUG-6 FIX: When a local vLLM tier degrades (3 consecutive failures),
+        route to a per-tier cloud fallback that respects family independence.
+
+        Previously ALL degraded tiers fell back to CLOUD_OSS[0] which is
+        Llama-4-Scout (Meta family). This silently violated the four-family
+        independence constraint whenever any vLLM node went down, because the
+        adversarial critic (Llama-3.3-70B) is also Meta family.
+
+        Each tier now has a dedicated cloud fallback from a different family,
+        stored in _TIER_CLOUD_FALLBACK. The critic tier (Meta) falls back to
+        Devstral/Mistral; fixer tiers fall back to DeepSeek or Qwen.
+
+        ADD-3 FIX: The previous catch-all fallback was the hardcoded string
+        "claude-sonnet-4-6". In a local-only deployment with no Anthropic key
+        this produced an unroutable model causing every LLM call to fail with
+        an authentication error rather than a clear routing error.
+        Replaced with RuntimeError.
+        """
+        if not models:
+            raise RuntimeError(
+                f"No models configured for tier {tier.value}. "
+                "Check vLLM base URL and model environment variables. "
+                "Ensure at least one of VLLM_BASE_URL / VLLM_SECONDARY_BASE_URL / "
+                "VLLM_CRITIC_BASE_URL / OPENROUTER_API_KEY is set."
+            )
+
         if self._force_cloud or self._is_degraded(tier):
-            cloud = _TIER_MODELS.get(ModelTier.CLOUD_OSS, [])
-            if cloud and self._is_cloud_configured():
-                return cloud[0]
-        return models[0] if models else "claude-sonnet-4-6"
+            # Use the per-tier family-independent cloud fallback, not CLOUD_OSS.
+            tier_fallback = self._TIER_CLOUD_FALLBACK.get(tier)
+            if tier_fallback and self._is_cloud_configured():
+                log.warning(
+                    "[router] Tier %s degraded — routing to family-safe cloud fallback %s",
+                    tier.value, tier_fallback,
+                )
+                return tier_fallback
+            # If cloud is not configured either, raise rather than silently failing.
+            if self._is_degraded(tier):
+                raise RuntimeError(
+                    f"Tier {tier.value} is degraded after {self._max_local_fails} failures "
+                    "and no cloud fallback is configured. "
+                    "Set OPENROUTER_API_KEY or reduce load on the local vLLM endpoint."
+                )
+
+        return models[0]
 
     def _is_degraded(self, tier: ModelTier) -> bool:
         return (
