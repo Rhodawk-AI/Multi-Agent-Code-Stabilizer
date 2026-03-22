@@ -571,8 +571,15 @@ class TieredModelRouter:
     _TIER_CLOUD_FALLBACK: dict = {
         # Fixer A (Alibaba) → DeepSeek on OpenRouter (different family)
         ModelTier.VLLM_PRIMARY:   "openrouter/deepseek/deepseek-coder-v2-0724",
-        # Fixer B (DeepSeek) → Qwen on OpenRouter via Alibaba (different family)
-        ModelTier.VLLM_SECONDARY: "openrouter/qwen/qwen-2.5-coder-32b-instruct",
+        # BUG-06 FIX: Fixer B (DeepSeek) degradation must NOT route to Qwen/Alibaba
+        # (same family as Fixer A). Previously this was
+        # "openrouter/qwen/qwen-2.5-coder-32b-instruct" — Alibaba family — which
+        # meant two correlated Alibaba models ran as "Fixer A" and "Fixer B" under
+        # load, defeating the BoBN independence guarantee entirely without any warning
+        # (the BUG-6 runtime guard only checked against the critic's family).
+        # Fix: Fixer B falls back to Mistral/Devstral (fourth family, independent
+        # of Alibaba, DeepSeek-primary, and Meta-critic).
+        ModelTier.VLLM_SECONDARY: "openrouter/mistralai/devstral-small",
         # Light judge → cheapest available cross-family model
         ModelTier.VLLM_LIGHT:     "openrouter/deepseek/deepseek-coder-v2-0724",
         # Critic (Meta) → Devstral/Mistral (different family)
@@ -659,6 +666,23 @@ class TieredModelRouter:
                         "Fix: update _TIER_CLOUD_FALLBACK so every non-critic tier "
                         "maps to a model from a family distinct from the adversarial critic."
                     )
+                # BUG-06 FIX: also check Fixer B does not collide with Fixer A.
+                # The original guard only checked against the critic. When Fixer B
+                # degrades to the same family as Fixer A the two produce correlated
+                # patches with no adversarial benefit — silently defeating BoBN.
+                if tier == ModelTier.VLLM_SECONDARY:
+                    primary_family = extract_model_family(
+                        _TIER_MODELS[ModelTier.VLLM_PRIMARY][0]
+                    )
+                    if chosen_family == primary_family:
+                        raise RuntimeError(
+                            f"BUG-06: Fixer B degradation family collision — "
+                            f"tier '{tier.value}' selected '{chosen}' "
+                            f"(family '{chosen_family}') matches Fixer A family "
+                            f"'{primary_family}'. BoBN independence is void. "
+                            "Fix: ensure VLLM_SECONDARY fallback uses a different "
+                            "family from VLLM_PRIMARY (e.g. Mistral, not Alibaba)."
+                        )
             except RuntimeError:
                 raise
             except Exception as exc:
