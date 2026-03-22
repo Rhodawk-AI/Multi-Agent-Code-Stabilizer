@@ -39,6 +39,57 @@ from startup.feature_matrix import is_available
 
 log = logging.getLogger(__name__)
 
+# ── MISSING-03 FIX: Prometheus counters for formal gate skip rate ──────────────
+# The audit identified that FormalVerificationStatus.SKIPPED / NOT_APPLICABLE is
+# set in multiple places but no metric tracks the skip rate. Without a metric,
+# operators cannot see "80% of fixes skip formal verification" in dashboards.
+#
+# Three counters expose coverage at a glance:
+#   rhodawk_formal_gate_files_total      — every file that enters _verify_file()
+#   rhodawk_formal_gate_skipped_total    — files that exit as NOT_APPLICABLE
+#                                          (quick_applicability_check returned False)
+#   rhodawk_formal_gate_verified_total   — files that proceeded to Z3/CBMC/pattern
+#
+# The skip_rate gauge is derived: skipped_total / files_total.
+# Prometheus can compute it with:
+#   rate(rhodawk_formal_gate_skipped_total[5m]) /
+#   rate(rhodawk_formal_gate_files_total[5m])
+try:
+    from prometheus_client import Counter, Gauge  # type: ignore[import]
+
+    _FORMAL_FILES_TOTAL = Counter(
+        "rhodawk_formal_gate_files_total",
+        "Total files entering the formal verification gate",
+    )
+    _FORMAL_SKIPPED_TOTAL = Counter(
+        "rhodawk_formal_gate_skipped_total",
+        "Files skipped by the quick_applicability_check (async/IO/ORM/virtual-dispatch)",
+    )
+    _FORMAL_VERIFIED_TOTAL = Counter(
+        "rhodawk_formal_gate_verified_total",
+        "Files that proceeded to Z3 / CBMC / pattern formal verification",
+    )
+    _FORMAL_COUNTEREXAMPLE_TOTAL = Counter(
+        "rhodawk_formal_gate_counterexample_total",
+        "Files where at least one COUNTEREXAMPLE was found by the formal gate",
+    )
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+    _FORMAL_FILES_TOTAL        = None  # type: ignore[assignment]
+    _FORMAL_SKIPPED_TOTAL      = None  # type: ignore[assignment]
+    _FORMAL_VERIFIED_TOTAL     = None  # type: ignore[assignment]
+    _FORMAL_COUNTEREXAMPLE_TOTAL = None  # type: ignore[assignment]
+
+
+def _inc(counter) -> None:
+    """Increment a Prometheus counter if available; no-op otherwise."""
+    try:
+        if counter is not None:
+            counter.inc()
+    except Exception:
+        pass
+
 # Military domain properties to verify
 _MILITARY_PROPERTIES: list[dict[str, str]] = [
     {
@@ -236,6 +287,42 @@ class FormalVerifierAgent(BaseAgent):
                 results.extend(item)
         fix.formal_proofs = [r.id for r in results]
         await self.storage.upsert_fix(fix)
+
+        # MISSING-03 FIX: log a per-fix coverage summary so operators can see
+        # what fraction of files were skipped by the quick_applicability_check
+        # without having to parse Prometheus. This surfaces in every run log.
+        total_files   = len([ff for ff in fix.fixed_files if ff.content or ff.patch])
+        skipped_files = sum(
+            1 for r in results
+            if r.status == FormalVerificationStatus.NOT_APPLICABLE
+            and r.property_name == "quick_applicability_check"
+        )
+        verified_files = total_files - skipped_files
+        counterexamples = sum(
+            1 for r in results
+            if r.status == FormalVerificationStatus.COUNTEREXAMPLE
+        )
+        if total_files > 0:
+            skip_pct = 100.0 * skipped_files / total_files
+            log.info(
+                "[formal] fix=%s files=%d verified=%d skipped=%d(%.0f%%) counterexamples=%d — "
+                "%s",
+                fix.id[:8],
+                total_files,
+                verified_files,
+                skipped_files,
+                skip_pct,
+                counterexamples,
+                (
+                    "WARN: formal gate inactive for all files (all async/IO/ORM — "
+                    "no Z3/CBMC coverage this fix)"
+                    if verified_files == 0
+                    else "formal gate active"
+                ),
+            )
+            if counterexamples > 0:
+                _inc(_FORMAL_COUNTEREXAMPLE_TOTAL)
+
         return results
 
     async def any_counterexample(
@@ -340,11 +427,16 @@ class FormalVerifierAgent(BaseAgent):
         is_c_family  = ext in {".c", ".h", ".cpp", ".cc", ".hpp"}
         is_python    = ext in {".py", ".pyw"}
 
+        # MISSING-03 FIX: count every file that enters the gate so the skip
+        # rate is visible in Prometheus dashboards and the run-end log summary.
+        _inc(_FORMAL_FILES_TOTAL)
+
         # MISSING-3 FIX: static pre-filter before any LLM call or CBMC spawn.
         # Files that contain async, network, ORM, subprocess, or virtual
         # dispatch cannot be modelled by Z3/CBMC — skip immediately to avoid
         # spending tokens on a guaranteed NOT_APPLICABLE outcome.
         if not self._quick_applicability_check(file_path, content):
+            _inc(_FORMAL_SKIPPED_TOTAL)
             not_applicable = FormalVerificationResult(
                 fix_attempt_id=fix_id,
                 file_path=file_path,
@@ -363,6 +455,9 @@ class FormalVerifierAgent(BaseAgent):
             except Exception:
                 pass
             return [not_applicable]
+
+        # File is verifiable — count it and proceed.
+        _inc(_FORMAL_VERIFIED_TOTAL)
 
         results: list[FormalVerificationResult] = []
 
