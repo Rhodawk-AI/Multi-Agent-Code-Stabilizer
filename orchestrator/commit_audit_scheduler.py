@@ -845,3 +845,139 @@ class CommitAuditScheduler:
 
         return await loop.run_in_executor(None, _run)
 
+    # ── MISSING-2 FIX: continuous background git-polling loop ────────────────
+
+    def start_background_poll(
+        self,
+        poll_interval_s: float = 60.0,
+        max_commits_per_poll: int = 20,
+        branch: str = "",
+    ) -> asyncio.Task:
+        """
+        MISSING-2 FIX: Start a background asyncio Task that polls the watched
+        git branch on a fixed interval and calls replay_missed_commits() for
+        any commits that arrived since the last audit.
+
+        This closes the gap left by the startup-only catch-up in api/app.py:
+        that replay runs once at restart but cannot catch commits that arrive
+        mid-session through a broken or missing webhook.
+
+        This polling loop is the autonomous trigger that makes continuous
+        operation work for:
+          - Repositories that do not support webhooks (local mirrors, Gitea
+            instances without outbound network, corporate proxies)
+          - Webhook delivery failures (timeout, 500, network partition)
+          - Commits that land while the API is restarting (the startup replay
+            catches these, but a race exists between the task starting and the
+            first webhook arriving)
+
+        The loop is idempotent with the webhook path: schedule_commit_audit()
+        inside replay_missed_commits() checks the CommitAuditRecord for each
+        SHA and returns immediately if it is already in DONE state.  A commit
+        processed by both the webhook and the poll loop is audited exactly once.
+
+        Parameters
+        ----------
+        poll_interval_s:
+            Seconds between polls.  Default 60.  Increase to reduce git
+            subprocess overhead on busy repositories.
+        max_commits_per_poll:
+            Maximum commits replayed per poll cycle.  Prevents a polling
+            restart from triggering thousands of audits if the repo has a
+            long commit history since the anchor.  Default 20.
+        branch:
+            Branch name to attach to replayed CommitAuditRecords.  When empty,
+            the current HEAD branch is resolved via git inside replay.
+
+        Returns
+        -------
+        asyncio.Task
+            The background task.  Store the reference and call task.cancel()
+            to stop the loop cleanly during shutdown.
+        """
+        if hasattr(self, "_poll_task") and self._poll_task and not self._poll_task.done():
+            log.warning(
+                "[CommitAudit] start_background_poll called but a poll task is "
+                "already running — ignoring duplicate call"
+            )
+            return self._poll_task
+
+        self._poll_interval_s       = poll_interval_s
+        self._poll_max_commits      = max_commits_per_poll
+        self._poll_branch           = branch
+        self._poll_task: asyncio.Task = asyncio.create_task(
+            self._poll_loop(),
+            name="commit_audit_poll",
+        )
+        log.info(
+            "[CommitAudit] Background git-poll loop started — interval=%ss "
+            "max_per_poll=%d",
+            poll_interval_s,
+            max_commits_per_poll,
+        )
+        return self._poll_task
+
+    def stop_background_poll(self) -> None:
+        """
+        Cancel the background polling task started by start_background_poll().
+
+        Safe to call when no task is running.  Should be called from the
+        FastAPI lifespan shutdown hook to prevent asyncio from logging a
+        "Task was destroyed but it is pending" warning.
+        """
+        task: asyncio.Task | None = getattr(self, "_poll_task", None)
+        if task and not task.done():
+            task.cancel()
+            log.info("[CommitAudit] Background git-poll loop cancelled")
+
+    async def _poll_loop(self) -> None:
+        """
+        Internal coroutine for the background polling loop.
+
+        Sleeps for _poll_interval_s seconds, then calls replay_missed_commits()
+        to process any commits that arrived since the last audit anchor.
+        Exceptions inside a single poll cycle are caught and logged — the loop
+        continues so a transient git error or storage hiccup does not
+        permanently stop autonomous operation.
+
+        The loop exits cleanly when cancelled (CancelledError propagates out).
+        """
+        log.info("[CommitAudit] Poll loop entering wait cycle (interval=%ss)",
+                 self._poll_interval_s)
+        while True:
+            # Sleep first — the startup replay already handled any backlog.
+            # Sleeping at the top prevents a double-audit of commits processed
+            # by the startup catch-up just before this task was scheduled.
+            try:
+                await asyncio.sleep(self._poll_interval_s)
+            except asyncio.CancelledError:
+                log.info("[CommitAudit] Poll loop cancelled during sleep — exiting")
+                return
+
+            try:
+                log.debug("[CommitAudit] Poll cycle: calling replay_missed_commits …")
+                records = await self.replay_missed_commits(
+                    branch=self._poll_branch,
+                    max_commits=self._poll_max_commits,
+                )
+                if records:
+                    log.info(
+                        "[CommitAudit] Poll cycle: %d commit(s) processed "
+                        "(%d done, %d failed)",
+                        len(records),
+                        sum(1 for r in records if r.status == CommitAuditStatus.DONE),
+                        sum(1 for r in records if r.status == CommitAuditStatus.FAILED),
+                    )
+                else:
+                    log.debug("[CommitAudit] Poll cycle: no new commits")
+            except asyncio.CancelledError:
+                log.info("[CommitAudit] Poll loop cancelled during replay — exiting")
+                return
+            except Exception as exc:
+                # Non-fatal: log and continue.  A broken poll cycle must not
+                # terminate autonomous operation.
+                log.error(
+                    "[CommitAudit] Poll cycle error (will retry in %ss): %s",
+                    self._poll_interval_s, exc,
+                )
+
