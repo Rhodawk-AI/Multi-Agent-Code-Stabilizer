@@ -11,9 +11,14 @@ Security fixes applied
   failed to install had completely open authentication with no visible error.
 • Algorithm confusion: RHODAWK_JWT_ALGORITHM is constrained to HS256/RS256/ES256.
   The "none" algorithm is explicitly rejected to prevent alg:none JWT attacks.
+• SEC-04 FIX: Default algorithm changed from HS256 to RS256.  HS256 with a
+  human-memorable symmetric secret is brute-forceable offline; RS256 with a
+  2048-bit RSA key pair is not.  The audit identified that leaving HS256 as the
+  default guaranteed most operators deployed with a weaker algorithm regardless
+  of the entropy warnings added in the previous pass.
 • B2: API and WebSocket had zero authentication. This module enforces
   Bearer-token JWT auth on every protected endpoint.
-• B3: JWT secret loaded from environment — fails fast at startup if missing,
+• B3: JWT secret/key loaded from environment — fails fast at startup if missing,
   never falls back to a hard-coded default.
 • Tokens are short-lived (default 60 min); refresh tokens are separate and
   longer-lived (default 7 days).
@@ -23,8 +28,26 @@ Security fixes applied
 
 Environment variables
 ──────────────────────
-    RHODAWK_JWT_SECRET     REQUIRED — minimum 32 chars, base64-encoded secret
-    RHODAWK_JWT_ALGORITHM  Optional — default HS256 (allowed: HS256, RS256, ES256)
+RS256 (default — recommended for production):
+    RHODAWK_JWT_PRIVATE_KEY   REQUIRED — PEM-encoded RSA private key (signing)
+    RHODAWK_JWT_PUBLIC_KEY    REQUIRED — PEM-encoded RSA public key (verification)
+
+    Generate with:
+        openssl genrsa -out rhodawk_private.pem 2048
+        openssl rsa -in rhodawk_private.pem -pubout -out rhodawk_public.pem
+    Then set:
+        RHODAWK_JWT_PRIVATE_KEY=$(cat rhodawk_private.pem)
+        RHODAWK_JWT_PUBLIC_KEY=$(cat rhodawk_public.pem)
+
+HS256 (opt-in — development / single-node only):
+    RHODAWK_JWT_ALGORITHM=HS256
+    RHODAWK_JWT_SECRET         REQUIRED — minimum 64 chars of random hex
+
+    Generate with:
+        python -c "import secrets; print(secrets.token_hex(32))"
+
+Common:
+    RHODAWK_JWT_ALGORITHM  Optional — default RS256 (allowed: HS256, RS256, ES256)
     RHODAWK_JWT_TTL_MIN    Optional — access token TTL in minutes (default 60)
 """
 from __future__ import annotations
@@ -67,22 +90,31 @@ def _require_env(key: str, min_len: int = 1) -> str:
     return val
 
 
-_SECRET_KEY:  str | None = None
-_ALGORITHM:   str        = "HS256"
+# ── Key material globals ───────────────────────────────────────────────────────
+# _SIGNING_KEY: used by create_access_token() — private key (RS256/ES256)
+#               or shared secret (HS256).
+# _VERIFY_KEY:  used by verify_token()         — public key (RS256/ES256)
+#               or shared secret (HS256).
+# For HS* both point to the same secret string.
+# For RS*/ES* they hold PEM-encoded key strings loaded from env vars.
+_SIGNING_KEY: str | None = None
+_VERIFY_KEY:  str | None = None
+_ALGORITHM:   str        = "RS256"   # SEC-04 FIX: default is now RS256, not HS256
 _TTL_MINUTES: int        = 60
+_INIT_DONE:   bool       = False
 
 
-def _init_config() -> None:
-    global _SECRET_KEY, _ALGORITHM, _TTL_MINUTES
-    if _SECRET_KEY is not None:
+def _init_config() -> None:  # noqa: C901
+    global _SIGNING_KEY, _VERIFY_KEY, _ALGORITHM, _TTL_MINUTES, _INIT_DONE
+    if _INIT_DONE:
         return
-    _SECRET_KEY  = _require_env("RHODAWK_JWT_SECRET", min_len=32)
-    raw_alg      = os.environ.get("RHODAWK_JWT_ALGORITHM", "HS256").strip().upper()
+
+    # SEC-04 FIX: default is RS256, not HS256.  Operators who don't set
+    # RHODAWK_JWT_ALGORITHM explicitly now get the stronger asymmetric algorithm.
+    raw_alg = os.environ.get("RHODAWK_JWT_ALGORITHM", "RS256").strip().upper()
 
     # BUG-7 FIX: Reject the "none" algorithm and any algorithm not in the
-    # explicitly allowed set. python-jose will raise JWTError for "none" tokens
-    # when algorithms=[_ALGORITHM] is passed, but explicitly blocking it at
-    # config time makes the policy intent unambiguous.
+    # explicitly allowed set.
     if raw_alg not in _ALLOWED_ALGORITHMS:
         raise RuntimeError(
             f"FATAL: RHODAWK_JWT_ALGORITHM='{raw_alg}' is not allowed. "
@@ -90,43 +122,88 @@ def _init_config() -> None:
             "The 'none' algorithm is explicitly prohibited."
         )
 
-    # SEC-04 FIX: HS256 with a weak secret is brute-forceable. Enforce minimum
-    # entropy for HS256 deployments and recommend RS256 for production.
-    # RS256 with a 2048-bit key is not guessable regardless of secret quality.
-    if raw_alg in ("HS256", "HS384", "HS512"):
-        # Require minimum secret length — 64 chars (~256 bits of entropy
-        # if the secret is random hex). A 32-char dictionary word padded to
-        # 32 chars has far less actual entropy.
-        if len(_SECRET_KEY) < 64:
-            _is_production = os.environ.get("RHODAWK_ENV", "production").lower() != "development"
+    _is_production = os.environ.get("RHODAWK_ENV", "production").lower() != "development"
+
+    if raw_alg in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512"):
+        # ── Asymmetric key loading ────────────────────────────────────────────
+        # Signing: private key PEM (used in create_access_token)
+        # Verification: public key PEM (used in verify_token)
+        private_key = os.environ.get("RHODAWK_JWT_PRIVATE_KEY", "").strip()
+        public_key  = os.environ.get("RHODAWK_JWT_PUBLIC_KEY",  "").strip()
+
+        if not private_key or not public_key:
+            raise RuntimeError(
+                f"FATAL: RHODAWK_JWT_ALGORITHM={raw_alg} requires both "
+                "RHODAWK_JWT_PRIVATE_KEY and RHODAWK_JWT_PUBLIC_KEY to be set. "
+                "Generate a key pair with:\n"
+                "  openssl genrsa -out rhodawk_private.pem 2048\n"
+                "  openssl rsa -in rhodawk_private.pem -pubout -out rhodawk_public.pem\n"
+                "Then export:\n"
+                "  RHODAWK_JWT_PRIVATE_KEY=$(cat rhodawk_private.pem)\n"
+                "  RHODAWK_JWT_PUBLIC_KEY=$(cat rhodawk_public.pem)\n"
+                "Alternatively, switch to HS256 for single-node development by setting "
+                "RHODAWK_JWT_ALGORITHM=HS256 and RHODAWK_JWT_SECRET (≥64 chars)."
+            )
+
+        # Validate PEM headers as a basic sanity check — does not fully parse keys.
+        if "PRIVATE" not in private_key:
+            raise RuntimeError(
+                "FATAL: RHODAWK_JWT_PRIVATE_KEY does not look like a PEM private key "
+                "(expected '-----BEGIN ... PRIVATE KEY-----' header). "
+                "Generate with: openssl genrsa -out rhodawk_private.pem 2048"
+            )
+        if "PUBLIC" not in public_key:
+            raise RuntimeError(
+                "FATAL: RHODAWK_JWT_PUBLIC_KEY does not look like a PEM public key "
+                "(expected '-----BEGIN PUBLIC KEY-----' header). "
+                "Generate with: openssl rsa -in rhodawk_private.pem -pubout -out rhodawk_public.pem"
+            )
+
+        _SIGNING_KEY = private_key
+        _VERIFY_KEY  = public_key
+        log.info("JWT configured: algorithm=%s (asymmetric RSA/EC), ttl=%dmin", raw_alg, int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60")))
+
+    else:
+        # ── Symmetric secret loading (HS256 / HS384 / HS512) ─────────────────
+        # HS256 is opt-in; it requires RHODAWK_JWT_ALGORITHM=HS256 explicitly.
+        # SEC-04 FIX: because the default is now RS256, reaching this branch
+        # means the operator consciously chose HS*.  We still enforce entropy
+        # requirements and warn loudly in production.
+        secret = _require_env("RHODAWK_JWT_SECRET", min_len=32)
+
+        if len(secret) < 64:
             if _is_production:
                 raise RuntimeError(
-                    f"FATAL: RHODAWK_JWT_SECRET is {len(_SECRET_KEY)} chars when "
-                    "using HS256. Production deployments require ≥64 chars for "
-                    "adequate entropy. Generate with: "
+                    f"FATAL: RHODAWK_JWT_SECRET is {len(secret)} chars when "
+                    f"using {raw_alg}. Production deployments require ≥64 chars "
+                    "for adequate entropy. Generate with: "
                     "python -c \"import secrets; print(secrets.token_hex(32))\" "
                     "(produces 64 hex chars = 256-bit key). "
-                    "Alternatively, switch to RS256 by setting "
-                    "RHODAWK_JWT_ALGORITHM=RS256 and providing "
-                    "RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY."
+                    "For stronger security use RS256: set RHODAWK_JWT_ALGORITHM=RS256 "
+                    "and provide RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY."
                 )
             else:
                 log.warning(
                     "JWT: RHODAWK_JWT_SECRET is %d chars — acceptable for "
                     "development but use ≥64 chars in production.",
-                    len(_SECRET_KEY),
+                    len(secret),
                 )
+
         log.warning(
-            "JWT: using symmetric %s algorithm. For production deployments "
-            "consider RS256 (asymmetric) which is not vulnerable to secret "
-            "guessing attacks. Set RHODAWK_JWT_ALGORITHM=RS256 and provide "
-            "RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY env vars.",
+            "JWT: using symmetric %s algorithm. This is acceptable for "
+            "single-node development but not recommended for production — "
+            "a guessable 32-char secret is brute-forceable offline. "
+            "Switch to RS256 by setting RHODAWK_JWT_ALGORITHM=RS256 and "
+            "providing RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY.",
             raw_alg,
         )
+        _SIGNING_KEY = secret
+        _VERIFY_KEY  = secret
+        log.info("JWT configured: algorithm=%s (symmetric), ttl=%dmin", raw_alg, int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60")))
 
     _ALGORITHM   = raw_alg
     _TTL_MINUTES = int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60"))
-    log.info(f"JWT configured: algorithm={_ALGORITHM}, ttl={_TTL_MINUTES}min")
+    _INIT_DONE   = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,7 +261,7 @@ def create_access_token(
         "iat":    datetime.now(tz=timezone.utc),
         "scopes": scopes or [],
     }
-    return _jwt.encode(payload, _SECRET_KEY, algorithm=_ALGORITHM)  # type: ignore[arg-type]
+    return _jwt.encode(payload, _SIGNING_KEY, algorithm=_ALGORITHM)  # type: ignore[arg-type]
 
 
 def create_refresh_token(sub: str) -> str:
@@ -231,7 +308,7 @@ def verify_token(token: str) -> TokenData:
         # Passing algorithms=[_ALGORITHM] (singular, from config) prevents the
         # algorithm confusion attack: if the token header declares a different
         # algorithm, jose raises JWTError("The specified alg value is not allowed").
-        payload = _jwt.decode(token, _SECRET_KEY, algorithms=[_ALGORITHM])  # type: ignore[arg-type]
+        payload = _jwt.decode(token, _VERIFY_KEY, algorithms=[_ALGORITHM])  # type: ignore[arg-type]
         sub: str | None = payload.get("sub")
         if sub is None:
             raise HTTPException(
