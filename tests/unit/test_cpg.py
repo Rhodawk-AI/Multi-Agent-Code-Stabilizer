@@ -1397,3 +1397,495 @@ class TestTypeFlowGraph:
         # Default must be an empty list (not None, not missing)
         s = CPGContextSlice()
         assert s.type_flow_violations == []
+
+
+# ── ARCH-02: Blast-radius smoke tests ─────────────────────────────────────────
+#
+# The audit (ARCH-02) identified that _get_forward_impact_context() in
+# fixer.py extracted bare symbol names (e.g. "handle_request") and passed
+# them directly to compute_blast_radius().  Joern stores methods under
+# language-specific FQNs such as:
+#
+#   Python : services.payment_service.PaymentService.process_payment
+#   C/C++  : payment::PaymentService::process_payment
+#   Java   : com.payment.PaymentService.process_payment:()V
+#
+# A bare name never matches a CPG node, so Joern returned 0 affected
+# functions, blast_radius_score=0, and requires_human_review=False — silently
+# making the blast-radius gate a no-op for every fix.
+#
+# The fix added two layers:
+#   1. _get_forward_impact_context() now passes BOTH the bare name AND a
+#      dotted-path FQN (module.function) to compute_blast_radius().
+#   2. compute_blast_radius() calls resolve_function_names() which in turn
+#      calls JoernClient.resolve_method_fqn() to obtain the real CPG FQN
+#      via a live cpg.method.name(...).fullName query.
+#
+# The tests below verify:
+#   A. resolve_function_names() routes through resolve_method_fqn() and
+#      returns the CPG FQN when Joern is available.
+#   B. compute_blast_radius() returns blast_radius_score > 0 when Joern
+#      reports at least one caller — i.e. the gate is NOT silently a no-op.
+#   C. When Joern is unavailable the function degrades gracefully and returns
+#      the input bare names unchanged (no crash, no empty result).
+#   D. The fixer correctly submits both bare and module-qualified names so
+#      resolve_function_names() has enough surface area to match CPG nodes.
+
+class TestBlastRadiusSmoke:
+    """
+    ARCH-02 smoke tests — blast-radius gate must not be silently a no-op.
+
+    All tests run without a live Joern server; JoernClient paths are mocked.
+    """
+
+    @pytest.fixture
+    def cpg_engine_with_joern(self):
+        """CPGEngine whose JoernClient is mocked to return known FQNs."""
+        from cpg.cpg_engine import CPGEngine
+        engine = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        # Mock JoernClient that returns a realistic FQN for any bare name
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+
+        # resolve_method_fqn: bare "process_payment" → CPG FQN
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=[
+                "services.payment_service.PaymentService.process_payment"
+            ]
+        )
+
+        # compute_impact_set: one downstream caller in auth_middleware.py
+        mock_client.compute_impact_set = AsyncMock(
+            return_value=[
+                {
+                    "function_name": "validate_payment_session",
+                    "file_path":     "auth_middleware.py",
+                    "line_number":   42,
+                    "relationship":  "direct_caller",
+                }
+            ]
+        )
+
+        # get_importing_files: one file imports the changed module
+        mock_client.get_importing_files = AsyncMock(
+            return_value=["api/routes/checkout.py"]
+        )
+
+        engine._client = mock_client
+        return engine
+
+    @pytest.fixture
+    def cpg_engine_joern_unavailable(self):
+        """CPGEngine with no Joern — tests graceful degradation."""
+        from cpg.cpg_engine import CPGEngine
+        engine = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready  = False
+        engine._client = None
+        return engine
+
+    # ── Test A: FQN resolution routes through Joern ───────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_returns_joern_fqn(
+        self, cpg_engine_with_joern
+    ):
+        """
+        ARCH-02: resolve_function_names() must call resolve_method_fqn() and
+        append the CPG FQN to its output.
+
+        This verifies that bare names are *enriched* with Joern FQNs before
+        compute_blast_radius() queries the call graph — the core ARCH-02 fix.
+        """
+        engine = cpg_engine_with_joern
+        bare   = ["process_payment"]
+
+        resolved = await engine.resolve_function_names(
+            bare_names=bare,
+            file_paths=["services/payment_service.py"],
+        )
+
+        # The CPG FQN must appear in the output
+        assert any(
+            "PaymentService.process_payment" in r or
+            "payment_service" in r
+            for r in resolved
+        ), (
+            f"ARCH-02: resolved list {resolved!r} does not contain the CPG "
+            f"FQN returned by resolve_method_fqn(). Bare names are not being "
+            f"enriched — blast-radius queries will find zero callers."
+        )
+
+        # resolve_method_fqn must have been called with the bare name
+        engine._client.resolve_method_fqn.assert_called()
+        call_args = engine._client.resolve_method_fqn.call_args_list
+        called_bare_names = [str(c.args[0]) for c in call_args]
+        assert "process_payment" in called_bare_names, (
+            f"ARCH-02: resolve_method_fqn was not called with 'process_payment'. "
+            f"Actual calls: {called_bare_names}"
+        )
+
+    # ── Test B: blast_radius_score > 0 for a known cross-file dependency ──────
+
+    @pytest.mark.asyncio
+    async def test_blast_radius_score_nonzero_for_known_cross_file_dep(
+        self, cpg_engine_with_joern
+    ):
+        """
+        ARCH-02 core smoke test: blast_radius_score MUST be > 0 when Joern
+        reports at least one downstream caller.
+
+        This is the exact invariant the audit demanded:
+          "Add a smoke test that verifies blast_radius_score > 0 for a known
+           cross-file dependency."
+
+        A score of 0 here means the blast-radius gate is a no-op — high-impact
+        fixes bypass human review silently.
+        """
+        engine = cpg_engine_with_joern
+
+        blast = await engine.compute_blast_radius(
+            function_names=["process_payment",
+                            "services.payment_service.process_payment"],
+            file_paths=["services/payment_service.py"],
+            depth=3,
+        )
+
+        assert blast.blast_radius_score > 0.0, (
+            f"ARCH-02 SMOKE TEST FAILED: blast_radius_score={blast.blast_radius_score} "
+            f"but Joern reported 1 downstream caller. A score of 0 means the "
+            f"blast-radius gate is silently a no-op — fixes with global impact "
+            f"bypass human review. This indicates bare names are not reaching "
+            f"the Joern call-graph query. Check resolve_function_names() → "
+            f"resolve_method_fqn() wiring."
+        )
+
+        assert blast.affected_function_count >= 1, (
+            f"ARCH-02: affected_function_count={blast.affected_function_count} "
+            f"but Joern returned 1 caller entry. FQN resolution is not reaching "
+            f"compute_impact_set()."
+        )
+
+    # ── Test B2: requires_human_review triggers at correct threshold ──────────
+
+    @pytest.mark.asyncio
+    async def test_blast_radius_human_review_triggers_above_threshold(
+        self, cpg_engine_with_joern
+    ):
+        """
+        requires_human_review must be True when affected_function_count exceeds
+        blast_radius_threshold.  Verifies the gate actually fires rather than
+        silently passing.
+        """
+        from cpg.cpg_engine import CPGEngine
+        engine = CPGEngine(
+            joern_url="http://localhost:8080",
+            blast_radius_threshold=1,   # threshold=1 so 1 caller triggers review
+        )
+        engine._ready  = True
+        engine._client = cpg_engine_with_joern._client
+
+        blast = await engine.compute_blast_radius(
+            function_names=["process_payment"],
+            file_paths=["services/payment_service.py"],
+            depth=3,
+        )
+
+        # With threshold=1 and 1 caller the gate must fire
+        assert blast.requires_human_review is True, (
+            f"ARCH-02: requires_human_review={blast.requires_human_review} with "
+            f"affected_function_count={blast.affected_function_count} and "
+            f"threshold=1. The human-review gate is not triggering — high-blast "
+            f"fixes will be autonomously committed without escalation."
+        )
+
+    # ── Test C: graceful degradation when Joern unavailable ───────────────────
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_degrades_gracefully_no_joern(
+        self, cpg_engine_joern_unavailable
+    ):
+        """
+        When Joern is not available, resolve_function_names() must return the
+        input bare names unchanged (not an empty list, not a crash).
+        """
+        engine   = cpg_engine_joern_unavailable
+        bare     = ["handle_request", "validate_user"]
+
+        resolved = await engine.resolve_function_names(bare_names=bare)
+
+        # Must return at least the original bare names — not empty
+        assert len(resolved) >= len(bare), (
+            f"ARCH-02 degradation: resolve_function_names returned {resolved!r} "
+            f"(len={len(resolved)}) which is shorter than input bare names "
+            f"{bare!r} (len={len(bare)}). Callers that depend on the result "
+            f"for compute_blast_radius queries will receive an empty list and "
+            f"blast_radius_score will always be 0."
+        )
+        for name in bare:
+            assert name in resolved, (
+                f"ARCH-02 degradation: input bare name {name!r} is missing from "
+                f"resolve_function_names output {resolved!r}. Bare names must "
+                f"be preserved in the output when Joern is unavailable."
+            )
+
+    @pytest.mark.asyncio
+    async def test_compute_blast_radius_returns_zero_score_gracefully_no_joern(
+        self, cpg_engine_joern_unavailable
+    ):
+        """
+        Without Joern, compute_blast_radius must complete without raising and
+        must return a CPGBlastRadius with blast_radius_score=0 (not None, not
+        a crash).  The pipeline must handle degradation cleanly.
+        """
+        engine = cpg_engine_joern_unavailable
+
+        blast = await engine.compute_blast_radius(
+            function_names=["handle_request"],
+            file_paths=["api/handler.py"],
+            depth=3,
+        )
+
+        # Must return a valid dataclass — not raise
+        assert blast is not None, (
+            "compute_blast_radius raised or returned None without Joern. "
+            "The pipeline will crash on every fix attempt without CPG."
+        )
+        assert isinstance(blast.blast_radius_score, float), (
+            f"blast_radius_score={blast.blast_radius_score!r} is not a float."
+        )
+        # Score is 0 without Joern — that is expected; the test ensures no crash
+        assert blast.blast_radius_score >= 0.0
+
+    # ── Test D: fixer passes both bare and module-qualified names ─────────────
+
+    @pytest.mark.asyncio
+    async def test_fixer_submits_both_bare_and_module_qualified_names(
+        self, tmp_path
+    ):
+        """
+        ARCH-02: _get_forward_impact_context() in FixerAgent must submit BOTH
+        bare names (e.g. "process_payment") AND dotted module-qualified names
+        (e.g. "services.payment_service.process_payment") to compute_blast_radius().
+
+        This gives resolve_function_names() two shots at matching a CPG node:
+          - The bare name matches cpg.method.name("process_payment")
+          - The dotted name catches cases where the CPG stores methods as
+            "<module>.<class>.<method>" which partially overlaps with the
+            dotted format
+
+        Without both forms, a CPG that stores FQNs as class-qualified
+        (PaymentService.process_payment) gets no match on just "process_payment"
+        and no match on "services.payment_service" alone.
+        """
+        from unittest.mock import AsyncMock as AM, MagicMock as MM, patch
+        from agents.fixer import FixerAgent
+        from agents.base import AgentConfig
+
+        # Write a tiny Python file with one function
+        src_file = tmp_path / "services" / "payment_service.py"
+        src_file.parent.mkdir(parents=True)
+        src_file.write_text(
+            "def process_payment(user, amount):\n"
+            "    return charge(user.account_id, amount)\n"
+        )
+
+        # Mock CPGEngine — capture what function_names it receives
+        captured: dict = {}
+        mock_cpg = MM()
+        mock_cpg.is_available = True
+
+        async def _mock_blast(function_names, file_paths, depth=3):
+            captured["function_names"] = list(function_names)
+            from cpg.cpg_engine import CPGBlastRadius
+            return CPGBlastRadius(
+                changed_functions=function_names,
+                blast_radius_score=0.0,
+                requires_human_review=False,
+            )
+
+        mock_cpg.compute_blast_radius = _mock_blast
+
+        # Mock storage with minimal interface
+        mock_storage = MM()
+        mock_storage.list_issues = AM(return_value=[])
+        mock_storage.log_llm_session = AM(return_value=None)
+        mock_storage.get_total_cost = AM(return_value=0.0)
+
+        agent = FixerAgent(
+            storage=mock_storage,
+            run_id="test-arch02",
+            config=AgentConfig(model="claude-sonnet-4-6"),
+            repo_root=tmp_path,
+            cpg_engine=mock_cpg,
+        )
+
+        # Trigger _get_forward_impact_context directly
+        _ctx, _blast = await agent._get_forward_impact_context(
+            file_paths=["services/payment_service.py"],
+            issues=[],
+        )
+
+        assert "function_names" in captured, (
+            "ARCH-02: compute_blast_radius was never called. "
+            "_get_forward_impact_context must call it when CPG is available."
+        )
+
+        fn_names = captured["function_names"]
+        has_bare = any(
+            n == "process_payment" or n.endswith(".process_payment")
+            for n in fn_names
+        )
+        has_qualified = any("." in n and "process_payment" in n for n in fn_names)
+
+        assert has_bare, (
+            f"ARCH-02: bare name 'process_payment' not in function_names={fn_names!r}. "
+            f"The bare name is needed for cpg.method.name(\"process_payment\") "
+            f"queries inside resolve_method_fqn()."
+        )
+        assert has_qualified, (
+            f"ARCH-02: no module-qualified name containing 'process_payment' "
+            f"in function_names={fn_names!r}. A dotted-path qualified name "
+            f"(e.g. services.payment_service.process_payment) must also be "
+            f"submitted so resolve_function_names() can match CPG nodes that "
+            f"store FQNs in module.class.method format."
+        )
+
+
+# ── ARCH-02: FQN resolution unit tests ────────────────────────────────────────
+
+class TestFQNResolution:
+    """
+    Unit tests for JoernClient.resolve_method_fqn() and
+    CPGEngine.resolve_function_names() — the two methods that implement
+    bare-name → CPG-FQN translation (ARCH-02 fix).
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_returns_cpg_fqn(self):
+        """
+        resolve_method_fqn() must call the Joern query
+        ``cpg.method.name(name).fullName.dedup.l`` and return the result.
+
+        Verifies the query shape so a refactor that breaks the Joern Scala
+        DSL is caught immediately.
+        """
+        from cpg.joern_client import JoernClient
+
+        client       = JoernClient(base_url="http://localhost:8080")
+        client._ready = True
+
+        expected_fqn = "com.example.PaymentService.processPayment"
+
+        async def _mock_query(q: str):
+            # The query must reference the bare method name
+            assert "processPayment" in q, (
+                f"ARCH-02: JoernClient query {q!r} does not contain the bare "
+                f"method name 'processPayment'. The Joern Scala query shape "
+                f"has been broken — FQN resolution will always return []."
+            )
+            assert "fullName" in q, (
+                f"ARCH-02: JoernClient query {q!r} does not request 'fullName'. "
+                f"The query will not return FQNs."
+            )
+            return [expected_fqn]
+
+        client._query = _mock_query
+
+        result = await client.resolve_method_fqn("processPayment")
+
+        assert result == [expected_fqn], (
+            f"ARCH-02: resolve_method_fqn returned {result!r}, expected "
+            f"[{expected_fqn!r}]. FQN resolution is not passing Joern results "
+            f"back to the caller."
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_filters_by_filename_when_provided(self):
+        """
+        When file_path is given, the Joern query must include a filename
+        filter so common names like __init__ or run don't match across the
+        entire codebase.
+        """
+        from cpg.joern_client import JoernClient
+
+        client        = JoernClient(base_url="http://localhost:8080")
+        client._ready = True
+
+        captured_query: list[str] = []
+
+        async def _mock_query(q: str):
+            captured_query.append(q)
+            return ["services.payment.PaymentService.run"]
+
+        client._query = _mock_query
+
+        await client.resolve_method_fqn(
+            bare_name="run",
+            file_path="services/payment.py",
+        )
+
+        assert captured_query, "ARCH-02: _query was never called."
+        q = captured_query[0]
+        assert "payment.py" in q or "endsWith" in q, (
+            f"ARCH-02: query {q!r} does not filter by filename 'payment.py'. "
+            f"Without a filename filter, a bare name like 'run' or '__init__' "
+            f"will match thousands of CPG nodes and produce a useless FQN list."
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_method_fqn_returns_empty_when_not_ready(self):
+        """
+        resolve_method_fqn must return [] (not raise) when Joern is not ready.
+        """
+        from cpg.joern_client import JoernClient
+
+        client        = JoernClient(base_url="http://localhost:8080")
+        client._ready = False
+
+        result = await client.resolve_method_fqn("any_function")
+
+        assert result == [], (
+            f"ARCH-02: resolve_method_fqn returned {result!r} when not ready. "
+            f"Expected [] — the caller must not crash on graceful degradation."
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_function_names_augments_not_replaces(self):
+        """
+        resolve_function_names() must AUGMENT the input list with FQNs, not
+        replace it.  The bare name must still be present in the output so
+        fallback queries that use bare names continue to work.
+        """
+        from cpg.cpg_engine import CPGEngine
+
+        engine        = CPGEngine(joern_url="http://localhost:8080")
+        engine._ready = True
+
+        mock_client = MagicMock()
+        mock_client.is_ready = True
+        mock_client.resolve_method_fqn = AsyncMock(
+            return_value=["services.auth.AuthService.validate_token"]
+        )
+        engine._client = mock_client
+
+        bare_input = ["validate_token"]
+        result     = await engine.resolve_function_names(
+            bare_names=bare_input,
+            file_paths=["services/auth.py"],
+        )
+
+        # Original bare name must be in output
+        assert "validate_token" in result, (
+            f"ARCH-02: bare name 'validate_token' was removed from output "
+            f"{result!r}. resolve_function_names must augment, not replace — "
+            f"fallback queries that use bare names will break if originals are "
+            f"dropped."
+        )
+
+        # CPG FQN must also be added
+        assert any("validate_token" in r and "." in r for r in result), (
+            f"ARCH-02: no FQN containing 'validate_token' in output {result!r}. "
+            f"Joern FQNs are not being appended to the result."
+        )
