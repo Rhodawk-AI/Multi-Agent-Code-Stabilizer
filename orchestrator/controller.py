@@ -1169,6 +1169,15 @@ class StabilizerController:
                 compound_enabled=self.config.synthesis_compound_enabled,
                 max_compound_findings=self.config.synthesis_max_compound,
             )
+            # MISSING-04 FIX: wire CPG engine into synthesis agent so that
+            # _verify_compound_paths() can confirm a runtime path exists between
+            # the contributing issue files before accepting a compound finding.
+            # Previously _cpg_engine was always None inside SynthesisAgent because
+            # the field is set to None in __init__ and never assigned by the
+            # controller — compound findings were accepted based purely on LLM
+            # reasoning without any structural path validation.
+            if self._cpg_engine is not None:
+                synthesis_agent._cpg_engine = self._cpg_engine
             _synthesis_start = datetime.now(tz=timezone.utc)
             try:
                 deduped_issues, compound_findings = await synthesis_agent.run(
@@ -1567,13 +1576,20 @@ class StabilizerController:
             _base_commit = str(getattr(issue, "base_commit",  None) or "")
 
             if not _fail_tests:
-                # Issue was created without test IDs (e.g. from static analysis
-                # rather than a regression).  Log at debug so operators can
-                # populate fail_tests when a reproducible test case is known.
-                self.log.debug(
-                    f"[gap5] issue {issue.id[:8]} has no fail_tests — "
-                    "execution loop will score on patch quality only "
-                    "(composite reduces to robustness + minimality terms)"
+                # ARCH-03 FIX: upgrade from debug to WARNING.
+                # When fail_tests is empty the composite scoring formula collapses
+                # from 0.6×test + 0.3×robust + 0.1×minimal to only
+                # 0.3×robust + 0.1×minimal (40% of signal). The BoBN independence
+                # guarantee (99.4% P(≥1 success) at N=10) only holds when the
+                # test signal is present. This silent degradation was previously
+                # invisible at debug level. Operators need visibility so they can
+                # supply fail_tests for static-analysis-sourced issues.
+                self.log.warning(
+                    "[gap5] issue %s has no fail_tests — BoBN composite scoring "
+                    "collapses to robustness+minimality only (40%% of signal). "
+                    "Provide fail_tests on the Issue record for full BoBN effectiveness. "
+                    "This affects all issues sourced from static analysis (not regressions).",
+                    issue.id[:8],
                 )
 
             try:
@@ -2020,11 +2036,65 @@ class StabilizerController:
             self.log.info(
                 f"[gap5_commit] VCS commit complete for issue {issue.id[:8]}"
             )
+            # MISSING-02 FIX: store fix memory after successful BoBN commit.
+            # Previously _gap5_commit had NO call to fix memory at all — every fix
+            # produced by the Gap 5 adversarial path left zero trace in fix memory.
+            # Algorithm Distillation (the compounding advantage) never fired for
+            # the production fix path. Now store_success is called with the actual
+            # winner metadata so future BoBN runs benefit from accumulated patterns.
+            if self._fix_memory is not None:
+                try:
+                    for f in committable:
+                        if f.fixed_files:
+                            # Use issue description as type; winner model as context
+                            raw_type     = issue.description[:80] if hasattr(issue, "description") else "gap5_fix"
+                            issue_type   = raw_type.lower().strip()[:80]
+                            file_context = ", ".join(ff.path for ff in f.fixed_files[:3])
+                            fix_approach = (
+                                f"bobn_winner candidate={winner.candidate_id} "
+                                f"model={winner.model.split('/')[-1]} "
+                                f"composite={winner.composite_score:.2f} "
+                                + "; ".join(
+                                    ff.diff_summary[:60]
+                                    for ff in f.fixed_files[:2] if ff.diff_summary
+                                )
+                            )
+                            self._fix_memory.store_success(
+                                issue_type   = issue_type,
+                                file_context = file_context,
+                                fix_approach = fix_approach,
+                                test_result  = (
+                                    f"gap5_gate_passed composite={winner.composite_score:.2f} "
+                                    f"test_score={winner.test_score:.2f}"
+                                ),
+                                run_id       = self.run.id,
+                            )
+                except Exception as _fm_exc:
+                    self.log.warning(
+                        "[gap5_commit] Fix memory store_success failed (non-fatal): %s",
+                        _fm_exc,
+                    )
         except Exception as exc:
             self.log.error(
                 f"[gap5_commit] VCS commit failed for issue {issue.id[:8]}: {exc} "
                 "— fix recorded in brain but not committed to VCS"
             )
+            # On VCS failure, record as a failure in fix memory so this approach
+            # is not repeated as a positive example on next cycle.
+            if self._fix_memory is not None:
+                try:
+                    for f in committable:
+                        if f.fixed_files:
+                            raw_type     = issue.description[:80] if hasattr(issue, "description") else "gap5_fix"
+                            self._fix_memory.store_failure(
+                                issue_type     = raw_type.lower().strip()[:80],
+                                file_context   = ", ".join(ff.path for ff in f.fixed_files[:3]),
+                                fix_approach   = f"bobn_winner candidate={winner.candidate_id}",
+                                failure_reason = f"VCS commit failed: {str(exc)[:200]}",
+                                run_id         = self.run.id,
+                            )
+                except Exception:
+                    pass
 
     async def _phase_fix(self, issues: list[Issue]) -> None:
         assert self.run and self.storage
@@ -2369,6 +2439,71 @@ class StabilizerController:
             fix.gate_reason = gate_reason
             await self.storage.upsert_fix(fix)
 
+            # MISSING-01 FIX: write fix memory AFTER the gate result is known,
+            # not at fix-generation time (BUG-02 removed the premature call from
+            # fixer._fix_group). This is the correct point in the pipeline —
+            # gate_passed is now definitively True or False and the pattern
+            # recorded in fix memory and the federated store reflects the actual
+            # verified outcome rather than a premature guess.
+            if self._fix_memory is not None:
+                try:
+                    issues_for_fix = [
+                        i for i in await self.storage.list_issues(run_id=self.run.id)
+                        if i.id in set(fix.issue_ids)
+                    ]
+                    if fix.fixed_files:
+                        if gate_passed:
+                            raw_type     = issues_for_fix[0].description[:80] if issues_for_fix else "unknown"
+                            issue_type   = raw_type.lower().strip()[:80]
+                            file_context = ", ".join(ff.path for ff in fix.fixed_files[:3])
+                            fix_approach = "; ".join(
+                                ff.diff_summary[:60] for ff in fix.fixed_files[:3] if ff.diff_summary
+                            ) or "patch applied"
+                            self._fix_memory.store_success(
+                                issue_type   = issue_type,
+                                file_context = file_context,
+                                fix_approach = fix_approach,
+                                test_result  = "gate_passed=True",
+                                run_id       = self.run.id,
+                            )
+                            # Propagate federated usage outcome
+                            if hasattr(self._fix_memory, "record_federated_usage"):
+                                _fq = " ".join(i.description[:100] for i in issues_for_fix[:3])
+                                if hasattr(self._fix_memory, "retrieve_async"):
+                                    _entries = await self._fix_memory.retrieve_async(_fq, n=10, max_age_days=180)
+                                else:
+                                    _entries = self._fix_memory.retrieve(_fq, n=10, max_age_days=180)
+                                for _e in _entries:
+                                    if _e.fix_approach.startswith("[FEDERATED]") and len(_e.id) == 64:
+                                        self._fix_memory.record_federated_usage(fingerprint=_e.id, success=True)
+                        else:
+                            raw_type     = issues_for_fix[0].description[:80] if issues_for_fix else "unknown"
+                            issue_type   = raw_type.lower().strip()[:80]
+                            file_context = ", ".join(ff.path for ff in fix.fixed_files[:3])
+                            fix_approach = "; ".join(
+                                ff.diff_summary[:60] for ff in fix.fixed_files[:3] if ff.diff_summary
+                            ) or "patch applied"
+                            self._fix_memory.store_failure(
+                                issue_type     = issue_type,
+                                file_context   = file_context,
+                                fix_approach   = fix_approach,
+                                failure_reason = gate_reason or "gate failed",
+                                run_id         = self.run.id,
+                            )
+                            if hasattr(self._fix_memory, "record_federated_usage"):
+                                _fq = " ".join(i.description[:100] for i in issues_for_fix[:3])
+                                if hasattr(self._fix_memory, "retrieve_async"):
+                                    _entries = await self._fix_memory.retrieve_async(_fq, n=10, max_age_days=180)
+                                else:
+                                    _entries = self._fix_memory.retrieve(_fq, n=10, max_age_days=180)
+                                for _e in _entries:
+                                    if _e.fix_approach.startswith("[FEDERATED]") and len(_e.id) == 64:
+                                        self._fix_memory.record_federated_usage(fingerprint=_e.id, success=False)
+                except Exception as _fm_exc:
+                    self.log.warning(
+                        "[gate] Fix memory update failed (non-fatal): %s", _fm_exc
+                    )
+
             if not gate_passed:
                 for iid in fix.issue_ids:
                     await self.storage.update_issue_status(
@@ -2539,6 +2674,7 @@ class StabilizerController:
                 self.log.warning(f"[commit] jj new failed ({exc}), falling back to direct write")
 
         for fix in fixes:
+            fix_write_ok = True  # ADD-02 FIX: track whether all files wrote successfully
             for ff in fix.fixed_files:
                 try:
                     from sandbox.executor import validate_path_within_root
@@ -2562,17 +2698,32 @@ class StabilizerController:
 
                 except Exception as exc:
                     self.log.error(f"Write failed {ff.path}: {exc}")
+                    fix_write_ok = False
                     continue
 
-            fix.committed_at = datetime.now(tz=timezone.utc)
-            await self.storage.upsert_fix(fix)
-            for iid in fix.issue_ids:
-                await self.storage.update_issue_status(iid, IssueStatus.CLOSED.value)
-            await self._trail(
-                "FIX_COMMITTED", fix.id, "fix",
-                after=str([ff.path for ff in fix.fixed_files]),
-                artifact_type=ArtifactType.FIX,
-            )
+            # ADD-02 FIX: only mark committed_at and CLOSED if at least one file
+            # was successfully written to disk. Previously these were set
+            # unconditionally inside the loop, which could mark a fix as committed
+            # even when every file write failed — leaving the brain permanently
+            # out of sync with the repository (fix shows as CLOSED, no VCS commit).
+            # The VCS commit step (git/jj) below will only run if combined is
+            # non-empty, so this guard ensures consistency between brain state
+            # and repository state.
+            if fix_write_ok and any(ff.path in [c[0] for c in combined] for ff in fix.fixed_files):
+                fix.committed_at = datetime.now(tz=timezone.utc)
+                await self.storage.upsert_fix(fix)
+                for iid in fix.issue_ids:
+                    await self.storage.update_issue_status(iid, IssueStatus.CLOSED.value)
+                await self._trail(
+                    "FIX_COMMITTED", fix.id, "fix",
+                    after=str([ff.path for ff in fix.fixed_files]),
+                    artifact_type=ArtifactType.FIX,
+                )
+            elif not fix_write_ok:
+                self.log.error(
+                    f"[commit] Fix {fix.id[:12]} had file write failures — "\
+                    "NOT marking as committed. Issues remain open for retry."
+                )
 
             # Run tests after each fix commit
             if self.config.run_tests_after_fix:
@@ -2626,17 +2777,38 @@ class StabilizerController:
             try:
                 import subprocess as _sp
                 paths_to_stage = [ff.path for ff in [f for fix in fixes for ff in fix.fixed_files]]
-                _sp.run(
+                add_result = _sp.run(
                     ["git", "add", "--"] + paths_to_stage,
                     cwd=str(self.config.repo_root),
                     capture_output=True, timeout=30,
                 )
-                _sp.run(
+                # BUG-04 FIX: check git add returncode.
+                # subprocess.run() never raises for non-zero exit codes.
+                # A failed git add (e.g. untracked file outside worktree, index
+                # locked by another process) was previously silently ignored and
+                # the commit would then stage nothing or fail for a different reason.
+                if add_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git add failed rc={add_result.returncode}: "
+                        f"{add_result.stderr.decode(errors='replace')[:300]}"
+                    )
+                commit_result = _sp.run(
                     ["git", "commit", "--message", commit_msg,
                      "--author", "Rhodawk AI <ai@rhodawk.local>"],
                     cwd=str(self.config.repo_root),
                     capture_output=True, timeout=30,
                 )
+                # BUG-04 FIX: check git commit returncode.
+                # Previously the log.info("git commit: msg") fired unconditionally
+                # regardless of the exit code, meaning silent commit failures would
+                # leave issues marked CLOSED with no actual VCS commit. Now a
+                # non-zero rc raises RuntimeError which is caught by the outer
+                # try/except, logged as a warning, and surfaces to the operator.
+                if commit_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git commit failed rc={commit_result.returncode}: "
+                        f"{commit_result.stderr.decode(errors='replace')[:300]}"
+                    )
                 self.log.info(f"[commit] git commit: {commit_msg}")
             except Exception as exc:
                 self.log.warning(f"[commit] git commit failed: {exc}")
@@ -2685,7 +2857,14 @@ class StabilizerController:
             raise ValueError(f"Empty patch supplied for {abs_path}")
 
         result = subprocess.run(
-            ["patch", "--backup", "--forward", "-p0", str(abs_path)],
+            # ADD-01 FIX: use -p1 (strip one path component) instead of -p0.
+            # Standard unified diffs produced by git diff and Python's difflib
+            # use "--- a/path/to/file" / "+++ b/path/to/file" headers. With -p0,
+            # patch looks for a file literally named "a/path/to/file" — correct
+            # only for diffs with no leading path component. With -p1 the "a/"
+            # and "b/" prefixes are stripped, matching the standard format.
+            # Behavior is consistent across GNU patch and BSD patch.
+            ["patch", "--backup", "--forward", "-p1", str(abs_path)],
             input=patch,
             capture_output=True,
             text=True,
@@ -2705,6 +2884,22 @@ class StabilizerController:
             if backup_orig.exists():
                 backup.write_text(backup_orig.read_text(encoding="utf-8"), encoding="utf-8")
                 self.log.info(f"Reverted {ff.path} from .orig backup")
+                # ADD-03 FIX: delete the .orig file after a successful revert.
+                # If .orig is left in place, the next fix cycle for the same file
+                # will call _detect_changed_functions() which compares the current
+                # file against .orig to find changed functions. After revert, .orig
+                # still contains the (now-reverted) patched content — the diff
+                # shows zero changes, so stale function marks are never emitted and
+                # the scheduler audits the wrong scope on the next cycle.
+                # Deleting .orig ensures the next write creates a fresh backup
+                # from the post-revert file state.
+                try:
+                    backup_orig.unlink()
+                    self.log.debug(f"[revert] Deleted .orig backup for {ff.path}")
+                except Exception as exc:
+                    self.log.warning(
+                        f"[revert] Could not delete .orig backup for {ff.path}: {exc}"
+                    )
         fix.committed_at = None
         fix.gate_passed  = False
         fix.gate_reason  = "Reverted: test regression detected post-commit"
