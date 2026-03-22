@@ -90,6 +90,40 @@ def _init_config() -> None:
             "The 'none' algorithm is explicitly prohibited."
         )
 
+    # SEC-04 FIX: HS256 with a weak secret is brute-forceable. Enforce minimum
+    # entropy for HS256 deployments and recommend RS256 for production.
+    # RS256 with a 2048-bit key is not guessable regardless of secret quality.
+    if raw_alg in ("HS256", "HS384", "HS512"):
+        # Require minimum secret length — 64 chars (~256 bits of entropy
+        # if the secret is random hex). A 32-char dictionary word padded to
+        # 32 chars has far less actual entropy.
+        if len(_SECRET_KEY) < 64:
+            _is_production = os.environ.get("RHODAWK_ENV", "production").lower() != "development"
+            if _is_production:
+                raise RuntimeError(
+                    f"FATAL: RHODAWK_JWT_SECRET is {len(_SECRET_KEY)} chars when "
+                    "using HS256. Production deployments require ≥64 chars for "
+                    "adequate entropy. Generate with: "
+                    "python -c \"import secrets; print(secrets.token_hex(32))\" "
+                    "(produces 64 hex chars = 256-bit key). "
+                    "Alternatively, switch to RS256 by setting "
+                    "RHODAWK_JWT_ALGORITHM=RS256 and providing "
+                    "RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY."
+                )
+            else:
+                log.warning(
+                    "JWT: RHODAWK_JWT_SECRET is %d chars — acceptable for "
+                    "development but use ≥64 chars in production.",
+                    len(_SECRET_KEY),
+                )
+        log.warning(
+            "JWT: using symmetric %s algorithm. For production deployments "
+            "consider RS256 (asymmetric) which is not vulnerable to secret "
+            "guessing attacks. Set RHODAWK_JWT_ALGORITHM=RS256 and provide "
+            "RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY env vars.",
+            raw_alg,
+        )
+
     _ALGORITHM   = raw_alg
     _TTL_MINUTES = int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60"))
     log.info(f"JWT configured: algorithm={_ALGORITHM}, ttl={_TTL_MINUTES}min")
