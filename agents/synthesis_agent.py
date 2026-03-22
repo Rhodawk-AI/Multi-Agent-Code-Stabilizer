@@ -188,6 +188,11 @@ class SynthesisAgent(BaseAgent):
         # When set, _verify_compound_paths() queries the CPG to confirm that
         # a runtime path exists between the files of contributing issues.
         self._cpg_engine: Any = None   # set by controller after construction
+        # ARCH-03 FIX: expose the heuristic test-match count so the controller
+        # can include it in the persisted SynthesisReport without duplicating
+        # the computation.  Initialised to 0; updated by run() after the
+        # heuristic pass completes.
+        self._last_heuristic_matched: int = 0
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -290,6 +295,9 @@ class SynthesisAgent(BaseAgent):
                 )
         except Exception as _ht_exc:
             self.log.debug(f"[synthesis] Heuristic fail_tests population failed (non-fatal): {_ht_exc}")
+
+        # Expose the count so the controller can persist it in SynthesisReport.
+        self._last_heuristic_matched = heuristic_matched
 
         # ── Step 5: Audit trail ───────────────────────────────────────────────
         # ARCH-03 FIX: compute BoBN-inactive stats and include in the audit trail
