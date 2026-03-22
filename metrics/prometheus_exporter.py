@@ -1,4 +1,15 @@
-"""metrics/prometheus_exporter.py — Prometheus metrics for Rhodawk AI."""
+"""metrics/prometheus_exporter.py — Prometheus metrics for Rhodawk AI.
+
+ARCH-1 FIX: Added CPG_CONTEXT_TOTAL counter so dashboards can track how often
+the CPG engine falls back to graph_fallback or vector_fallback context.
+
+Previously operators had no Prometheus signal that Joern was unavailable —
+the system silently degraded to import-graph context with no metrics visibility.
+
+Dashboard alert suggestion:
+    rate(rhodawk_cpg_context_total{source_type!="cpg"}[5m]) > 0
+    → "CPG fallback active: Joern may be unavailable"
+"""
 from __future__ import annotations
 import logging
 log = logging.getLogger(__name__)
@@ -25,28 +36,38 @@ def _noop(*a, **kw):
 
 
 if _PROM_AVAILABLE:
-    ACTIVE_RUNS    = Gauge("rhodawk_active_runs", "Active stabilization runs")
-    ISSUES_TOTAL   = Counter("rhodawk_issues_total", "Total issues found",
-                             ["severity", "domain"])
-    FIXES_TOTAL    = Counter("rhodawk_fixes_total", "Total fix attempts",
-                             ["status"])
-    GATE_RESULTS   = Counter("rhodawk_gate_results_total", "Gate pass/fail",
-                             ["result"])
-    TEST_RUNS      = Counter("rhodawk_test_runs_total", "Test run outcomes",
-                             ["status"])
-    CYCLE_DURATION = Histogram("rhodawk_cycle_duration_seconds",
-                               "Seconds per stabilization cycle",
-                               buckets=[10,30,60,120,300,600,1200,3600])
-    COST_PCT       = Gauge("rhodawk_cost_ceiling_pct",
-                           "Current cost as percentage of ceiling")
+    ACTIVE_RUNS       = Gauge("rhodawk_active_runs", "Active stabilization runs")
+    ISSUES_TOTAL      = Counter("rhodawk_issues_total", "Total issues found",
+                                ["severity", "domain"])
+    FIXES_TOTAL       = Counter("rhodawk_fixes_total", "Total fix attempts",
+                                ["status"])
+    GATE_RESULTS      = Counter("rhodawk_gate_results_total", "Gate pass/fail",
+                                ["result"])
+    TEST_RUNS         = Counter("rhodawk_test_runs_total", "Test run outcomes",
+                                ["status"])
+    CYCLE_DURATION    = Histogram("rhodawk_cycle_duration_seconds",
+                                  "Seconds per stabilization cycle",
+                                  buckets=[10, 30, 60, 120, 300, 600, 1200, 3600])
+    COST_PCT          = Gauge("rhodawk_cost_ceiling_pct",
+                              "Current cost as percentage of ceiling")
+    # ARCH-1 FIX: Track CPG context source so operators can see fallback rate.
+    # source_type: "cpg" | "graph_fallback" | "vector_fallback"
+    # Dashboard query to alert on degraded mode:
+    #   rate(rhodawk_cpg_context_total{source_type!="cpg"}[5m]) > 0
+    CPG_CONTEXT_TOTAL = Counter(
+        "rhodawk_cpg_context_total",
+        "CPG context slice requests by source type (cpg / graph_fallback / vector_fallback)",
+        ["source_type"],
+    )
 else:
-    ACTIVE_RUNS    = _noop()
-    ISSUES_TOTAL   = _noop()
-    FIXES_TOTAL    = _noop()
-    GATE_RESULTS   = _noop()
-    TEST_RUNS      = _noop()
-    CYCLE_DURATION = _noop()
-    COST_PCT       = _noop()
+    ACTIVE_RUNS       = _noop()
+    ISSUES_TOTAL      = _noop()
+    FIXES_TOTAL       = _noop()
+    GATE_RESULTS      = _noop()
+    TEST_RUNS         = _noop()
+    CYCLE_DURATION    = _noop()
+    COST_PCT          = _noop()
+    CPG_CONTEXT_TOTAL = _noop()
 
 
 def record_issue(severity: str, domain: str = "GENERAL") -> None:
@@ -69,6 +90,22 @@ def update_cost_pct(cost: float, ceiling: float) -> None:
     try:
         if ceiling > 0:
             COST_PCT.set(cost / ceiling * 100)
+    except Exception: pass
+
+def record_cpg_context(source_type: str) -> None:
+    """
+    ARCH-1 FIX: Increment the CPG context counter for the given source type.
+
+    Call this every time CPGEngine.get_context_slice() resolves a source:
+        "cpg"            — Joern CPG is available and was used
+        "graph_fallback" — Joern unavailable; networkx import graph used
+        "vector_fallback"— Neither Joern nor networkx graph available
+
+    Usage in cpg/cpg_engine.py:
+        from metrics.prometheus_exporter import record_cpg_context
+        record_cpg_context(result.source)
+    """
+    try: CPG_CONTEXT_TOTAL.labels(source_type=source_type).inc()
     except Exception: pass
 
 class time_cycle:
