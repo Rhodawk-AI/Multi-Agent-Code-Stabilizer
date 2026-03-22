@@ -91,10 +91,17 @@ def _enforce_production_security() -> None:
             "This variable must NEVER be set in production."
         )
         log.critical(msg)
-        # Raise SystemExit so the container process exits with code 1 and the
-        # orchestrator (Docker / k8s) marks the service as unhealthy rather than
-        # silently serving traffic with open authentication.
-        sys.exit(msg)
+        # SEC-05 FIX: use os._exit(1) instead of sys.exit(msg).
+        # sys.exit() raises SystemExit which is caught by uvicorn/asyncio and
+        # causes the container to restart (restart: unless-stopped in compose).
+        # The container then crash-loops indefinitely with no visible diagnostic.
+        # os._exit(1) terminates the process immediately with a non-zero code,
+        # which docker-compose / k8s surface as an exit-code failure — visible
+        # in `docker ps` and container logs — rather than an infinite restart loop.
+        # The log.critical above ensures the reason is in the container logs
+        # before the process exits.
+        import os as _os
+        _os._exit(1)
 
     # Check 2: webhook secret should be configured in production.
     if not os.environ.get("RHODAWK_WEBHOOK_SECRET"):
