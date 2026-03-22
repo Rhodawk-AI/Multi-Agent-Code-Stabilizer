@@ -11,6 +11,15 @@ log = logging.getLogger(__name__)
 _MAX_LINES_PER_FILE = 300
 _MAX_TOTAL_LINES    = 3000
 
+# ARCH-01 FIX: import prometheus counter for CPG context source tracking.
+# This enables operators to build dashboards/alerts on fallback rate.
+try:
+    from metrics.prometheus_exporter import CPG_CONTEXT_TOTAL as _CPG_CTR
+    _PROM_OK = True
+except Exception:
+    _CPG_CTR = None
+    _PROM_OK = False
+
 
 @dataclass
 class ContextSlice:
@@ -60,9 +69,40 @@ class CPGContextSelector:
                 variable_name, issue_description, max_lines,
             )
         elif self._hybrid or self._vector:
+            # ARCH-01 FIX: warn loudly that causal context is unavailable.
+            # Previously this fallback was silent — operators had no visibility
+            # that Joern was down and fixes were being generated with semantically
+            # similar context rather than causally related context.
+            log.warning(
+                "CPGContextSelector: Joern CPG unavailable — falling back to "
+                "vector/hybrid similarity for context selection. Cross-file causal "
+                "relationships WILL be missed. Start Joern to restore full CPG "
+                "context: docker-compose up joern (requires JOERN_REPO_PATH in .env)"
+            )
             ctx = await self._build_vector_fallback_context(ctx, issue_description, max_lines)
         else:
+            log.warning(
+                "CPGContextSelector: neither CPG nor vector retriever available — "
+                "fixer will run with empty context. This will significantly degrade "
+                "fix quality for cross-file bugs."
+            )
             ctx.source = "empty"
+
+        # ARCH-01 FIX: emit prometheus counter so dashboards can track fallback rate.
+        # Dashboard alert: rate(rhodawk_cpg_context_total{source_type!="cpg"}[5m]) > 0
+        if _PROM_OK and _CPG_CTR is not None:
+            try:
+                src = ctx.source if ctx.source else "empty"
+                # Normalize to the three dashboard-meaningful buckets
+                if src == "cpg":
+                    bucket = "cpg"
+                elif src in ("vector_fallback", "error", "empty"):
+                    bucket = "vector_fallback"
+                else:
+                    bucket = "graph_fallback"
+                _CPG_CTR.labels(source_type=bucket).inc()
+            except Exception:
+                pass
 
         return ctx
 
