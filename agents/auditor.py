@@ -30,7 +30,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agents.base import AgentConfig, BaseAgent, wrap_content
+from agents.base import AgentConfig, BaseAgent, wrap_content, wrap_source_file
 from brain.schemas import (
     ComplianceStandard, ComplianceViolation, DomainMode,
     ExecutorType, Issue, IssueStatus, MilStd882eCategory,
@@ -336,10 +336,19 @@ class AuditorAgent(BaseAgent):
             )
             compliance_tags = self._build_compliance_tag_instructions()
 
+            # SEC-5 FIX: use wrap_source_file() instead of wrap_content() so
+            # repository source code is enclosed in <source_code file="..."> tags.
+            # The structural delimiter prevents the LLM from treating comment-
+            # embedded adversarial instructions (e.g. "# SYSTEM OVERRIDE: …")
+            # as prompt instructions rather than code content to be audited.
+            # sanitize_content() inside wrap_source_file also strips the known
+            # injection trigger phrases defined in agents/base.py.
+            wrapped_code = wrap_source_file(content, file_path)
+
             prompt = (
                 f"## Master Audit Specification\n{self._master_prompt}\n\n"
                 f"## File\n`{file_path}` (language: {language})\n\n"
-                f"## Code Chunk (lines {line_start}+)\n{wrap_content(content)}\n\n"
+                f"## Code Chunk (lines {line_start}+)\n{wrapped_code}\n\n"
                 + (f"## Domain Requirements\n{domain_instructions}\n\n"
                    if domain_instructions else "")
                 + (f"## Compliance Tagging\n{compliance_tags}\n\n"

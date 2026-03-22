@@ -53,6 +53,12 @@ class ReaderAgent(BaseAgent):
         repo_map:          Any | None         = None,
         # ── Gap 1: CPG engine ────────────────────────────────────────────────
         cpg_engine:        Any | None         = None,
+        # ── SEC-5 FIX: AegisEDR input scanner ───────────────────────────────
+        # When provided, every source file is scanned for injection patterns
+        # (pipe-to-shell, credential leaks, exfiltration patterns) as it is
+        # read off disk — BEFORE it reaches any LLM context window.
+        # Warnings are logged; scanning is non-blocking and never raises.
+        aegis:             Any | None         = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root         = Path(repo_root)
@@ -63,6 +69,7 @@ class ReaderAgent(BaseAgent):
         self.hybrid_retriever  = hybrid_retriever
         self.repo_map          = repo_map
         self.cpg_engine        = cpg_engine
+        self.aegis             = aegis  # SEC-5
 
     async def run(
         self, force_reread: set[str] | None = None, **kwargs: Any
@@ -127,6 +134,34 @@ class ReaderAgent(BaseAgent):
             content = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: path.read_text(encoding="utf-8", errors="replace")
             )
+
+            # SEC-5 FIX: scan source file content for injection patterns and
+            # known malicious constructs BEFORE it reaches any LLM context
+            # window.  AegisEDR.scan_fix_content() is synchronous and fast
+            # (<1 ms for typical files).  We only log — never raise — so a
+            # suspicious file is flagged but the read phase continues.
+            # The sanitize_content() call in wrap_source_file() will strip
+            # the actual trigger phrases at prompt-assembly time; this scan
+            # provides an early-warning log entry and audit trail.
+            if self.aegis is not None:
+                try:
+                    threats = self.aegis.scan_fix_content(rel_path, content)
+                    if threats:
+                        self.log.warning(
+                            "[reader] SEC-5: %d injection/threat pattern(s) detected "
+                            "in source file %s — first: %s (severity=%s). "
+                            "Content will be sanitized before LLM context assembly.",
+                            len(threats),
+                            rel_path,
+                            getattr(threats[0], "label", "unknown"),
+                            getattr(threats[0], "severity", "unknown"),
+                        )
+                except Exception as _aegis_exc:
+                    self.log.debug(
+                        "[reader] AegisEDR scan failed for %s (non-fatal): %s",
+                        rel_path, _aegis_exc,
+                    )
+
             file_hash = hashlib.sha256(content.encode()).hexdigest()
 
             existing = await self.storage.get_file(rel_path)

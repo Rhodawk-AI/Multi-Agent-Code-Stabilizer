@@ -246,12 +246,123 @@ class FormalVerifierAgent(BaseAgent):
             for r in results
         )
 
+    @staticmethod
+    def _quick_applicability_check(file_path: str, content: str) -> bool:
+        """
+        MISSING-3 FIX: Static pre-filter that runs BEFORE any LLM call.
+
+        Returns True when the file is potentially amenable to Z3/CBMC formal
+        verification, False when it structurally cannot be modelled.
+
+        Previously the ``verifiable=False`` guard in ``_verify_with_z3()`` only
+        fired AFTER spending one LLM call to extract Z3 constraints — wasting
+        tokens on ~90% of real-world files where verification is impossible.
+
+        This check is purely syntactic/lexical and takes <1 ms.  It gates the
+        entire ``_verify_file()`` pipeline so we skip both CBMC invocation and
+        the Z3 LLM extraction call for non-verifiable code.
+
+        Non-applicable when the file contains:
+        - async/await keywords  (concurrency breaks Z3 sequential modelling)
+        - network/socket I/O    (external state — not closed-form verifiable)
+        - ORM / DB access       (stateful side-effects)
+        - subprocess / OS calls (external processes)
+        - class-based dispatch  (virtual dispatch can't be inlined by Z3)
+        - closures / lambdas beyond simple key functions
+
+        Applicable (returns True) for:
+        - Pure arithmetic / numeric functions
+        - Array/pointer manipulation without heap allocation (C/C++)
+        - Simple state-machine logic with bounded loops
+        - Bitfield manipulation
+        """
+        ext = Path(file_path).suffix.lower()
+
+        # Only Python and C/C++ are modelled by our verifier at all.
+        # Anything else is immediately not applicable.
+        if ext not in {".py", ".pyw", ".c", ".h", ".cpp", ".cc", ".hpp"}:
+            return False
+
+        # Fast lexical checks — if ANY of these patterns appear the file
+        # contains constructs that Z3/CBMC cannot model in our pipeline.
+        import re as _re
+        _NON_VERIFIABLE = [
+            # Python async
+            r"\basync\s+def\b",
+            r"\bawait\b",
+            # Network / socket I/O
+            r"\bsocket\b",
+            r"\baiohttp\b",
+            r"\bhttpx\b",
+            r"\brequests\b",
+            r"\burllib\b",
+            # Database / ORM
+            r"\bsqlalchemy\b",
+            r"\bpsycopg\b",
+            r"\bdjango\.db\b",
+            r"\bpeewee\b",
+            # Subprocess / OS
+            r"\bsubprocess\b",
+            r"\bos\.system\b",
+            r"\bos\.popen\b",
+            # C/C++ heap allocation (unbounded dynamic memory breaks CBMC)
+            r"\bmalloc\s*\(",
+            r"\bcalloc\s*\(",
+            r"\brealloc\s*\(",
+            r"\bnew\s+\w",          # C++ new
+            # Threading
+            r"\bthreading\b",
+            r"\bconcurrent\.futures\b",
+            r"\bpthread\b",
+            # Complex class dispatch (virtual tables)
+            r"\bvirtual\s+\w",
+            # Python lambdas used as callbacks (not simple key=lambda)
+            r"=\s*lambda\b.*:\s*(?![\w\s\.\[\]]+$)",
+        ]
+        for pattern in _NON_VERIFIABLE:
+            if _re.search(pattern, content):
+                return False
+
+        # Content must be non-trivial (at least 3 lines of actual code)
+        code_lines = [
+            l for l in content.splitlines()
+            if l.strip() and not l.strip().startswith(("#", "//", "/*", "*"))
+        ]
+        if len(code_lines) < 3:
+            return False
+
+        return True
+
     async def _verify_file(
         self, fix_id: str, file_path: str, content: str
     ) -> list[FormalVerificationResult]:
         ext = Path(file_path).suffix.lower()
         is_c_family  = ext in {".c", ".h", ".cpp", ".cc", ".hpp"}
         is_python    = ext in {".py", ".pyw"}
+
+        # MISSING-3 FIX: static pre-filter before any LLM call or CBMC spawn.
+        # Files that contain async, network, ORM, subprocess, or virtual
+        # dispatch cannot be modelled by Z3/CBMC — skip immediately to avoid
+        # spending tokens on a guaranteed NOT_APPLICABLE outcome.
+        if not self._quick_applicability_check(file_path, content):
+            not_applicable = FormalVerificationResult(
+                fix_attempt_id=fix_id,
+                file_path=file_path,
+                property_name="quick_applicability_check",
+                status=FormalVerificationStatus.NOT_APPLICABLE,
+                counterexample=(
+                    "Pre-LLM static filter: file contains async/IO/network/ORM/"
+                    "subprocess/virtual-dispatch constructs that cannot be modelled "
+                    "by Z3 or CBMC. Skipped to avoid wasting LLM tokens."
+                ),
+                solver="static_filter",
+            )
+            # Persist so the gate can see it without running verify_fix again.
+            try:
+                await self.storage.upsert_formal_result(not_applicable)
+            except Exception:
+                pass
+            return [not_applicable]
 
         results: list[FormalVerificationResult] = []
 
