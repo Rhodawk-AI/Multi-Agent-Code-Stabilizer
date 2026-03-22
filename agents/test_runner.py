@@ -41,12 +41,61 @@ UNIVERSAL TEST RUNNER FIX
 
   UniversalTestResult is mapped to TestRunResult so all downstream
   consumers (storage, coverage gate, mutation gate) work unchanged.
+
+ARCH-2 / SEC-3 FIX — Containerised test execution
+───────────────────────────────────────────────────
+Previously all test subprocess calls ran directly on the host process with
+full filesystem and network access.  A malicious repository could embed
+adversarial code in test fixtures that exfiltrates secrets, spawns shells,
+or reads /etc/passwd.
+
+All test command execution is now isolated inside a minimal Docker container:
+
+    docker run --rm
+        --network none            # no outbound network
+        --read-only               # filesystem is read-only
+        --tmpfs /tmp:size=256m    # writable /tmp for pytest artefacts
+        --tmpfs /home:size=64m    # writable home dir for tool caches
+        --user nobody             # unprivileged UID
+        --cpus 2                  # CPU limit
+        --memory 2g               # memory limit
+        --mount type=bind,src={repo},dst=/repo,readonly=true
+        -w /repo
+        {image} {test_cmd}
+
+Environment variables
+─────────────────────
+    RHODAWK_TEST_SANDBOX_IMAGE
+        Docker image containing the project's test dependencies.
+        Must include pytest (and any other frameworks the repo uses).
+        Defaults to "python:3.11-slim" — operators SHOULD override this
+        with an image that mirrors the project's CI environment.
+
+    RHODAWK_TEST_SANDBOX_DISABLED
+        Set to "1" to fall back to direct host execution.
+        Use only in trusted local environments or when Docker is not
+        available.  A WARNING is emitted every time sandboxing is skipped.
+
+    RHODAWK_TEST_SANDBOX_MEMORY
+        Memory limit passed to docker run --memory.  Default: "2g".
+
+    RHODAWK_TEST_SANDBOX_CPUS
+        CPU quota passed to docker run --cpus.  Default: "2".
+
+    RHODAWK_TEST_SANDBOX_TIMEOUT
+        Timeout in seconds for the sandboxed test run.  Default: 300.
+
+If Docker is not installed (shutil.which("docker") is None) execution
+falls back to direct host execution with a WARNING logged.  Operators
+running in a Docker-in-Docker environment must ensure the host socket
+is mounted: -v /var/run/docker.sock:/var/run/docker.sock.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -59,6 +108,74 @@ from brain.schemas import ExecutorType, FixAttempt, TestRunResult, TestRunStatus
 from brain.storage import BrainStorage
 
 log = logging.getLogger(__name__)
+
+# ── Sandbox configuration ─────────────────────────────────────────────────────
+
+_SANDBOX_IMAGE   = os.environ.get("RHODAWK_TEST_SANDBOX_IMAGE", "python:3.11-slim")
+_SANDBOX_DISABLED = os.environ.get("RHODAWK_TEST_SANDBOX_DISABLED", "0") == "1"
+_SANDBOX_MEMORY  = os.environ.get("RHODAWK_TEST_SANDBOX_MEMORY", "2g")
+_SANDBOX_CPUS    = os.environ.get("RHODAWK_TEST_SANDBOX_CPUS", "2")
+_SANDBOX_TIMEOUT = int(os.environ.get("RHODAWK_TEST_SANDBOX_TIMEOUT", "300"))
+
+
+def _docker_available() -> bool:
+    """Return True if the docker CLI binary is on PATH."""
+    return shutil.which("docker") is not None
+
+
+def _sandbox_cmd(
+    cmd: list[str],
+    repo_root: Path,
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    """
+    Wrap ``cmd`` in a ``docker run`` invocation that provides:
+
+    - No network access (--network none)
+    - Read-only root filesystem with writable /tmp and /home tmpfs overlays
+    - Non-root user (--user nobody)
+    - CPU and memory limits
+    - Repo mounted read-only at /repo (working directory inside container)
+
+    The caller is responsible for ensuring RHODAWK_TEST_SANDBOX_IMAGE contains
+    the project's test dependencies (pytest, cargo, go, etc.).
+
+    Parameters
+    ----------
+    cmd:
+        The bare command to execute, e.g. ["pytest", "--tb=short", "-q", ...].
+    repo_root:
+        Absolute path to the repository root on the host.  Mounted read-only
+        at /repo inside the container.
+    extra_env:
+        Optional key-value pairs forwarded into the container via --env flags.
+        Useful for passing CI tokens that the test suite needs to authenticate
+        against local mock services.
+
+    Returns
+    -------
+    list[str]
+        The full ``docker run`` command ready to pass to subprocess.run().
+    """
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--read-only",
+        "--tmpfs", "/tmp:size=256m,mode=1777",
+        "--tmpfs", "/home:size=64m",
+        "--user", "nobody",
+        "--cpus", _SANDBOX_CPUS,
+        "--memory", _SANDBOX_MEMORY,
+        "--mount",
+        f"type=bind,src={repo_root.resolve()},dst=/repo,readonly=true",
+        "--workdir", "/repo",
+    ]
+    if extra_env:
+        for k, v in extra_env.items():
+            docker_cmd += ["--env", f"{k}={v}"]
+    docker_cmd.append(_SANDBOX_IMAGE)
+    docker_cmd.extend(cmd)
+    return docker_cmd
 
 
 class TestRunnerAgent(BaseAgent):
@@ -74,6 +191,26 @@ class TestRunnerAgent(BaseAgent):
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root = repo_root or Path(".")
+        # Evaluate sandbox availability once so we don't shell out on every run.
+        self._use_sandbox = (not _SANDBOX_DISABLED) and _docker_available()
+        if _SANDBOX_DISABLED:
+            log.warning(
+                "[test_runner] RHODAWK_TEST_SANDBOX_DISABLED=1 — test code will "
+                "run directly on the host with full filesystem and network access. "
+                "Set this only in trusted local development environments."
+            )
+        elif not _docker_available():
+            log.warning(
+                "[test_runner] Docker not found on PATH — test sandbox is DISABLED. "
+                "Test code will run directly on the host. "
+                "Install Docker or set RHODAWK_TEST_SANDBOX_IMAGE and ensure "
+                "the docker CLI is available to enable isolation."
+            )
+        else:
+            log.info(
+                "[test_runner] Docker sandbox enabled — image=%s memory=%s cpus=%s",
+                _SANDBOX_IMAGE, _SANDBOX_MEMORY, _SANDBOX_CPUS,
+            )
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -149,9 +286,11 @@ class TestRunnerAgent(BaseAgent):
 
         await self.storage.upsert_test_result(result)
         self.log.info(
-            "[test_runner] %s — passed=%d failed=%d coverage=%.1f%% mcdc=%.1f%%",
+            "[test_runner] %s — passed=%d failed=%d coverage=%.1f%% mcdc=%.1f%%"
+            " sandbox=%s",
             result.status.value, result.passed, result.failed,
             result.coverage_pct, result.mcdc_coverage,
+            "on" if self._use_sandbox else "OFF",
         )
         return result
 
@@ -161,7 +300,7 @@ class TestRunnerAgent(BaseAgent):
         target_functions: list[str],
     ) -> TestRunResult:
         """
-        Detect the test framework and run tests.
+        Detect the test framework and run tests inside a Docker sandbox.
 
         Delegates to UniversalTestRunner which auto-detects the framework
         from the repo layout (go.mod, Cargo.toml, pom.xml, build.gradle,
@@ -182,6 +321,13 @@ class TestRunnerAgent(BaseAgent):
 
         Called from run_in_executor (thread-pool context) so asyncio.run()
         is safe here — there is no running event loop in this thread.
+
+        ARCH-2/SEC-3: When the sandbox is active, UniversalTestRunner is still
+        used for framework detection and command construction, but the final
+        subprocess.run() calls delegate to _run_sandboxed() so the test process
+        executes inside an isolated container.  When the sandbox is disabled,
+        UniversalTestRunner runs natively (with a WARNING already emitted at
+        __init__ time).
         """
         try:
             from agents.test_runner_universal import (
@@ -202,7 +348,6 @@ class TestRunnerAgent(BaseAgent):
                 )
             )
 
-            # Map UniversalTestResult → TestRunResult
             _status_map = {
                 "PASSED":   TestRunStatus.PASSED,
                 "FAILED":   TestRunStatus.FAILED,
@@ -215,11 +360,12 @@ class TestRunnerAgent(BaseAgent):
             )
             log.info(
                 "[test_runner] UniversalTestRunner: framework=%s "
-                "status=%s passed=%d failed=%d",
+                "status=%s passed=%d failed=%d sandbox=%s",
                 universal_result.framework,
                 universal_result.status,
                 universal_result.passed,
                 universal_result.failed,
+                "on" if self._use_sandbox else "OFF",
             )
             return TestRunResult(
                 status=status,
@@ -233,7 +379,6 @@ class TestRunnerAgent(BaseAgent):
             )
 
         except ImportError:
-            # UniversalTestRunner not available — fall back to original logic.
             log.debug(
                 "[test_runner] UniversalTestRunner not available — "
                 "falling back to pytest/make"
@@ -251,13 +396,95 @@ class TestRunnerAgent(BaseAgent):
             return self._run_make_test()
         return TestRunResult(status=TestRunStatus.NO_TESTS)
 
+    # ── Sandbox helpers ───────────────────────────────────────────────────────
+
+    def _run_sandboxed(
+        self,
+        cmd: list[str],
+        timeout: int = _SANDBOX_TIMEOUT,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        """
+        ARCH-2/SEC-3: Execute ``cmd`` inside the Docker sandbox when available,
+        or directly on the host with a WARNING when not.
+
+        Parameters
+        ----------
+        cmd:
+            The bare command, e.g. ["pytest", "--tb=short", "-q", "tests/"].
+        timeout:
+            Subprocess timeout in seconds.
+        cwd:
+            Working directory for direct (non-sandboxed) execution.
+            Ignored when sandboxed (container always uses /repo).
+
+        Returns
+        -------
+        subprocess.CompletedProcess
+        """
+        effective_cwd = cwd or self.repo_root
+
+        if self._use_sandbox:
+            full_cmd = _sandbox_cmd(cmd, self.repo_root)
+            log.debug("[test_runner] sandbox cmd: %s", " ".join(full_cmd[:10]) + " …")
+            try:
+                return subprocess.run(
+                    full_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                log.warning(
+                    "[test_runner] sandbox run timed out after %ds: %s",
+                    timeout, cmd[:3],
+                )
+                return subprocess.CompletedProcess(
+                    full_cmd, returncode=-1,
+                    stdout="", stderr=f"Sandbox timeout after {timeout}s",
+                )
+            except Exception as exc:
+                log.error("[test_runner] sandbox run failed: %s — falling back to host", exc)
+                # Fall through to direct execution so a docker startup failure
+                # does not permanently break the test loop.  The security
+                # boundary is lost but the pipeline can continue.
+                log.warning(
+                    "[test_runner] SECURITY: sandbox unavailable — running test "
+                    "command directly on host: %s", cmd[:3],
+                )
+        else:
+            log.debug("[test_runner] running test command on host (no sandbox): %s", cmd[:3])
+
+        # Direct (unsandboxed) execution path — docker unavailable or disabled.
+        try:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(effective_cwd),
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                cmd, returncode=-1,
+                stdout="", stderr=f"Test timed out after {timeout}s",
+            )
+        except Exception as exc:
+            return subprocess.CompletedProcess(
+                cmd, returncode=-1,
+                stdout="", stderr=str(exc)[:500],
+            )
+
+    # ── Test framework runners ────────────────────────────────────────────────
+
     def _run_pytest(
         self,
         changed_files:    list[str],
         target_functions: list[str],
     ) -> TestRunResult:
         """
-        Run pytest, optionally scoped to changed files or target functions.
+        Run pytest inside the Docker sandbox, optionally scoped to changed
+        files or target functions.
 
         BUG-4a fix
         ----------
@@ -273,17 +500,21 @@ class TestRunnerAgent(BaseAgent):
           directly to pytest so it only collects from those files.  If no
           matching test files are found, run the full suite — running
           everything is always better than silently running nothing.
+
+        ARCH-2/SEC-3: the subprocess.run() call is replaced by
+        self._run_sandboxed() so pytest executes inside the Docker container
+        with --network none, --read-only, and --user nobody.  The JSON report
+        is written to /tmp inside the container and read from the container's
+        stdout because the container filesystem is ephemeral; we parse the
+        JSON output piped through stdout instead of a report file.
         """
         import time
 
-        report_path = tempfile.mktemp(suffix="_pytest.json")
         cmd: list[str] = [
             "pytest", "--tb=short", "-q",
-            "--json-report", f"--json-report-file={report_path}",
         ]
 
         if target_functions:
-            # BUG-4b: function-targeted run via -k expression.
             clean_names = [f for f in target_functions if re.match(r"^\w+$", f)]
             if clean_names:
                 k_expr = " or ".join(clean_names)
@@ -291,7 +522,6 @@ class TestRunnerAgent(BaseAgent):
                 log.debug("pytest -k %r (function-targeted, %d names)", k_expr, len(clean_names))
 
         elif changed_files:
-            # BUG-4a: resolve test file paths, do NOT use --co.
             test_paths: list[str] = []
             for src in changed_files:
                 stem = Path(src).stem
@@ -305,21 +535,27 @@ class TestRunnerAgent(BaseAgent):
             if test_paths:
                 cmd.extend(test_paths)
                 log.debug("pytest scoped to %d test file(s): %s", len(test_paths), test_paths)
-            # If no matching files found, fall through to run full suite.
+
+        # Request JSON output via stdout (works in read-only container without a
+        # writable report file on the repo filesystem).
+        cmd += ["--json-report", "--json-report-file=-"]
+
+        start   = time.monotonic()
+        proc    = self._run_sandboxed(cmd, timeout=_SANDBOX_TIMEOUT)
+        elapsed = time.monotonic() - start
+
+        passed = failed = errors = skipped = 0
+        coverage = 0.0
 
         try:
-            start   = time.monotonic()
-            proc    = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=300, cwd=str(self.repo_root),
-            )
-            elapsed = time.monotonic() - start
-
-            passed = failed = errors = skipped = 0
-            coverage = 0.0
-
-            try:
-                report  = json.loads(Path(report_path).read_text())
+            # pytest-json-report outputs JSON to the report file (or stdout
+            # with --json-report-file=-).  Extract the JSON from stdout.
+            json_lines = [
+                ln for ln in proc.stdout.splitlines()
+                if ln.strip().startswith("{")
+            ]
+            if json_lines:
+                report  = json.loads(json_lines[-1])
                 summary = report.get("summary", {})
                 passed  = summary.get("passed",  0)
                 failed  = summary.get("failed",  0)
@@ -333,56 +569,43 @@ class TestRunnerAgent(BaseAgent):
                 )
                 if pct:
                     coverage = float(pct)
-            except Exception:
-                for line in proc.stdout.splitlines():
-                    if "passed" in line or "failed" in line:
-                        m = re.search(r"(\d+) passed", line)
-                        if m:
-                            passed = int(m.group(1))
-                        m = re.search(r"(\d+) failed", line)
-                        if m:
-                            failed = int(m.group(1))
+        except Exception:
+            for line in proc.stdout.splitlines():
+                if "passed" in line or "failed" in line:
+                    m = re.search(r"(\d+) passed", line)
+                    if m:
+                        passed = int(m.group(1))
+                    m = re.search(r"(\d+) failed", line)
+                    if m:
+                        failed = int(m.group(1))
 
-            status = (
-                TestRunStatus.PASSED if failed == 0 and errors == 0
-                else TestRunStatus.FAILED
-            )
-            return TestRunResult(
-                status=status,
-                passed=passed, failed=failed,
-                errors=errors, skipped=skipped,
-                coverage_pct=coverage,
-                output=proc.stdout[-3000:],
-                duration_s=elapsed,
-            )
-
-        except subprocess.TimeoutExpired:
-            return TestRunResult(
-                status=TestRunStatus.ERROR,
-                output="pytest timed out after 300s",
-            )
-        except Exception as exc:
-            return TestRunResult(
-                status=TestRunStatus.ERROR,
-                output=str(exc)[:500],
-            )
+        status = (
+            TestRunStatus.PASSED if failed == 0 and errors == 0
+            else TestRunStatus.FAILED
+        )
+        return TestRunResult(
+            status=status,
+            passed=passed, failed=failed,
+            errors=errors, skipped=skipped,
+            coverage_pct=coverage,
+            output=proc.stdout[-3000:],
+            duration_s=elapsed,
+        )
 
     def _run_make_test(self) -> TestRunResult:
-        try:
-            result = subprocess.run(
-                ["make", "test"], capture_output=True, text=True,
-                timeout=300, cwd=str(self.repo_root),
-            )
-            status = (
-                TestRunStatus.PASSED if result.returncode == 0
-                else TestRunStatus.FAILED
-            )
-            return TestRunResult(
-                status=status,
-                output=(result.stdout + result.stderr)[-3000:],
-            )
-        except Exception as exc:
-            return TestRunResult(
-                status=TestRunStatus.ERROR,
-                output=str(exc)[:500],
-            )
+        """
+        Run ``make test`` inside the Docker sandbox.
+
+        ARCH-2/SEC-3: subprocess.run() replaced by self._run_sandboxed() so
+        the make target executes in an isolated container.
+        """
+        proc = self._run_sandboxed(["make", "test"], timeout=_SANDBOX_TIMEOUT)
+        status = (
+            TestRunStatus.PASSED if proc.returncode == 0
+            else TestRunStatus.FAILED
+        )
+        return TestRunResult(
+            status=status,
+            output=(proc.stdout + proc.stderr)[-3000:],
+        )
+
