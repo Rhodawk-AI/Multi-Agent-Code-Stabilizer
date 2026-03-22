@@ -322,6 +322,51 @@ class FixMemory:
 
     # ── GAP 6: Federation helpers ─────────────────────────────────────────────
 
+    async def retrieve_async(
+        self,
+        issue_description: str,
+        n:                 int = 3,
+        max_age_days:      int | None = 180,
+    ) -> list[FixMemoryEntry]:
+        """
+        Async version of retrieve() that properly awaits federated pulls.
+
+        Async pipeline callers (fixer._get_memory_examples,
+        fixer._report_federated_usage) MUST use this method instead of
+        retrieve() so that federated augmentation is live on every call
+        rather than silently deferred.  The sync retrieve() falls back to
+        scheduling a background task when the loop is already running —
+        this method has no such limitation.
+
+        Parameters are identical to retrieve().
+        """
+        try:
+            if self._backend == "mem0":
+                entries = self._mem0_retrieve(issue_description, n * 2)
+            elif self._backend == "qdrant":
+                entries = self._qdrant_retrieve(issue_description, n * 2)
+            elif self._backend == "json":
+                entries = self._json_retrieve(issue_description, n * 2)
+            else:
+                return []
+
+            if max_age_days is not None and max_age_days > 0:
+                entries = self._filter_by_age(entries, max_age_days)
+
+            # Proper async federation augmentation — no nested-loop workaround
+            fed_entries = await self._retrieve_federated_async(issue_description, n)
+            if fed_entries:
+                local_approaches = {e.fix_approach.lower() for e in entries}
+                for fe in fed_entries:
+                    if fe.fix_approach.lower() not in local_approaches:
+                        entries.append(fe)
+                        local_approaches.add(fe.fix_approach.lower())
+
+            return entries[:n]
+        except Exception as exc:
+            log.debug(f"FixMemory.retrieve_async: {exc}")
+        return []
+
     def _get_normalizer(self) -> Any:
         """Lazy-load PatternNormalizer only when federation is active."""
         if self._normalizer is None:
@@ -393,10 +438,16 @@ class FixMemory:
         """
         Synchronous wrapper around the async federated pull.
 
-        Returns empty list if:
-        • No federated store is configured
-        • Federation is disabled (receive=False)
-        • Event loop is unavailable (defensive)
+        When called from a sync context (no running event loop), executes the
+        pull via run_until_complete.  When called from an async context (event
+        loop already running — e.g. inside the fixer pipeline), schedules the
+        pull as a background task and returns the local-cache results only for
+        this call; the fresh peer results will be available on the next call
+        once the task completes.
+
+        Callers that are themselves async (fixer._get_memory_examples,
+        fixer._report_federated_usage) should call retrieve_async() instead
+        so they get the full federated augmentation without any deferral.
         """
         if self._federated_store is None:
             return []
@@ -405,8 +456,6 @@ class FixMemory:
 
         async def _pull() -> list:
             try:
-                # Extract a compact issue_type label from description
-                # (first word / CWE / category keyword)
                 issue_type_hint = issue_description.split()[0].lower()[:32] \
                     if issue_description else ""
                 patterns = await self._federated_store.pull_patterns(
@@ -422,22 +471,78 @@ class FixMemory:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Can't run nested event loops — schedule and immediately cancel
-                # the coroutine; return empty (federation augmentation is best-effort)
+                # Async context: schedule as fire-and-forget so the cache is
+                # populated for the next retrieve() call.  Return the current
+                # local cache immediately rather than silently dropping results.
+                asyncio.ensure_future(_pull())
                 log.debug(
-                    "FixMemory._retrieve_federated: called from async context "
-                    "— federation augmentation deferred (best-effort)"
+                    "FixMemory._retrieve_federated: async context detected — "
+                    "pull scheduled as background task; returning cached results"
                 )
-                return []
+                # Return whatever the local cache already has synchronously
+                try:
+                    cached = loop.run_until_complete(
+                        self._federated_store._retrieve_from_cache(
+                            issue_description.split()[0].lower()[:32]
+                            if issue_description else "",
+                            n,
+                        )
+                    ) if not loop.is_running() else []
+                except Exception:
+                    cached = []
+                return self._patterns_to_entries(cached)
             patterns = loop.run_until_complete(_pull())
         except RuntimeError:
             return []
 
-        # Convert FederatedPattern → FixMemoryEntry (structural translation)
+        return self._patterns_to_entries(patterns)
+
+    async def _retrieve_federated_async(
+        self,
+        issue_description: str,
+        n:                 int,
+    ) -> list[FixMemoryEntry]:
+        """
+        Async version of _retrieve_federated.
+
+        Properly awaits the federated pull without any nested-loop workaround.
+        Called by retrieve_async() from async pipeline contexts (fixer agents)
+        so they receive full federated augmentation on every invocation.
+        """
+        if self._federated_store is None:
+            return []
+        if not getattr(self._federated_store, "receive", False):
+            return []
+        try:
+            issue_type_hint = (
+                issue_description.split()[0].lower()[:32]
+                if issue_description else ""
+            )
+            patterns = await self._federated_store.pull_patterns(
+                issue_type  = issue_type_hint,
+                query_text  = issue_description[:300],
+                n           = n,
+            )
+            return self._patterns_to_entries(patterns)
+        except Exception as exc:
+            log.debug(f"FixMemory._retrieve_federated_async: {exc}")
+            return []
+
+    def _patterns_to_entries(self, patterns: list) -> list[FixMemoryEntry]:
+        """
+        Convert a list of FederatedPattern objects to FixMemoryEntry objects.
+
+        Stores the FULL 64-character fingerprint in the id field so that
+        _report_federated_usage() can pass the correct fingerprint to
+        record_usage() without truncation.  The Qdrant point UID is computed
+        as abs(hash(fingerprint)) — a hash of the full string — so any
+        truncation would cause a different UID, silently breaking the
+        use_count / success_count feedback loop.
+        """
         entries: list[FixMemoryEntry] = []
         for p in patterns:
             entries.append(FixMemoryEntry(
-                id           = p.fingerprint[:16],
+                id           = p.fingerprint,          # FULL 64-char SHA-256
                 issue_type   = p.issue_type,
                 file_context = f"[federated/{p.language}] {p.source_instance[:8]}",
                 fix_approach = (

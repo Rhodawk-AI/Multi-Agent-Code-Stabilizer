@@ -110,6 +110,85 @@ _C_TYPE_KEYWORDS: frozenset[str] = frozenset({
     "NULL_CHECK", "ASSERT", "REQUIRE",
 })
 
+# Java keywords and common types — preserving these ensures two deployments
+# that fix the same Java null-check pattern produce identical fingerprints
+# regardless of variable name ordering in the source file.
+_JAVA_TYPE_KEYWORDS: frozenset[str] = frozenset({
+    # Primitives and boxed types
+    "int", "long", "short", "byte", "char", "float", "double", "boolean", "void",
+    "Integer", "Long", "Short", "Byte", "Character", "Float", "Double", "Boolean",
+    # Control flow
+    "if", "else", "for", "while", "do", "switch", "case", "break",
+    "continue", "return", "default", "goto",
+    # OOP keywords
+    "class", "interface", "enum", "extends", "implements", "abstract",
+    "final", "static", "native", "synchronized", "transient", "volatile",
+    "public", "protected", "private",
+    # Exception handling
+    "try", "catch", "finally", "throw", "throws",
+    # Type system
+    "new", "instanceof", "this", "super", "null", "true", "false",
+    "import", "package",
+    # Common standard types (structural, not domain-specific)
+    "String", "Object", "List", "Map", "Set", "Collection", "Iterator",
+    "Optional", "Stream", "Comparable", "Iterable",
+    "NullPointerException", "IllegalArgumentException", "IllegalStateException",
+    "RuntimeException", "Exception", "Throwable", "Error",
+    "System", "Math", "Arrays", "Collections", "Objects",
+})
+
+# Go keywords and builtin identifiers — critical for cross-deployment
+# fingerprint stability because Go lacks type annotations on most variables,
+# so the allowlist is the only anchor keeping structural patterns stable.
+_GO_TYPE_KEYWORDS: frozenset[str] = frozenset({
+    # Control flow
+    "if", "else", "for", "switch", "case", "default", "break",
+    "continue", "return", "goto", "fallthrough", "select",
+    # Declarations
+    "func", "var", "const", "type", "struct", "interface", "map",
+    "chan", "go", "defer",
+    # Packages
+    "import", "package",
+    # Literals and zero values
+    "nil", "true", "false", "iota",
+    # Builtin functions (structural — not domain identifiers)
+    "make", "new", "len", "cap", "append", "copy", "delete", "close",
+    "panic", "recover", "print", "println",
+    # Builtin types
+    "bool", "byte", "rune", "string", "error",
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+    "float32", "float64", "complex64", "complex128",
+    # Common standard library types used structurally
+    "error", "Error",
+    "fmt", "errors", "log", "os", "io", "context",
+})
+
+# JavaScript / TypeScript keywords and common builtins.
+_JS_TYPE_KEYWORDS: frozenset[str] = frozenset({
+    # Control flow
+    "if", "else", "for", "while", "do", "switch", "case", "default",
+    "break", "continue", "return", "throw", "try", "catch", "finally",
+    # Declarations
+    "var", "let", "const", "function", "class", "new", "delete",
+    "typeof", "instanceof", "in", "of", "void",
+    # OOP / modules
+    "this", "super", "extends", "import", "export", "from", "as",
+    "static", "get", "set", "async", "await", "yield",
+    # Literals and special values
+    "null", "undefined", "true", "false", "NaN", "Infinity",
+    # Builtin globals (structural, not domain-specific)
+    "console", "Promise", "Array", "Object", "String", "Number",
+    "Boolean", "Symbol", "Map", "Set", "WeakMap", "WeakSet",
+    "Error", "TypeError", "ReferenceError", "SyntaxError",
+    "JSON", "Math", "Date", "RegExp",
+    # TypeScript primitives
+    "any", "unknown", "never", "void", "string", "number", "boolean",
+    "object", "symbol", "bigint",
+    "interface", "type", "enum", "namespace", "declare",
+    "readonly", "abstract", "implements",
+})
+
 
 @dataclass
 class NormalizedPattern:
@@ -301,7 +380,21 @@ class PatternNormalizer:
         text = re.sub(r"\b\d+[uUlLfF]?\b", "<num_literal>", text)
 
         # 5. Identifier replacement
-        allowlist = _C_TYPE_KEYWORDS if language in ("c", "cpp", "rust") else set()
+        # Each language gets a dedicated allowlist so structural keywords are
+        # preserved verbatim.  Without per-language allowlists, two deployments
+        # normalizing the same Go/Java/JS pattern produce different fingerprints
+        # because positional id_N counters depend on first-appearance order of
+        # domain identifiers — breaking cross-deployment dedup for those languages.
+        _LANG_ALLOWLIST: dict[str, frozenset] = {
+            "c":          _C_TYPE_KEYWORDS,
+            "cpp":        _C_TYPE_KEYWORDS,
+            "rust":       _C_TYPE_KEYWORDS,
+            "java":       _JAVA_TYPE_KEYWORDS,
+            "go":         _GO_TYPE_KEYWORDS,
+            "javascript": _JS_TYPE_KEYWORDS,
+            "typescript": _JS_TYPE_KEYWORDS,
+        }
+        allowlist = _LANG_ALLOWLIST.get(language, frozenset())
         id_count  = 0
         id_map: dict[str, str] = {}
 

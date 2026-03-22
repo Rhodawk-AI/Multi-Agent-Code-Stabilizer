@@ -400,6 +400,43 @@ class FederatedPatternStore:
             return self._record_usage_json(fingerprint, success)
         return False
 
+    async def fingerprint_exists(self, fingerprint: str) -> bool:
+        """
+        O(1) check whether a fingerprint is already in the local cache.
+
+        Uses a direct Qdrant point lookup by UID (computed identically to
+        _cache_pattern) rather than scanning all stored patterns.  This
+        replaces the O(N) _retrieve_from_cache("", n=10_000) scan that
+        receive_pattern previously used for deduplication — critical at
+        scale where thousands of patterns may be stored.
+
+        Falls back to a linear JSON scan when Qdrant is unavailable.
+        Always returns False on any error rather than propagating exceptions,
+        so the caller can treat any error as a cache miss and proceed.
+        """
+        if self._backend == "qdrant" and self._qdrant_client:
+            try:
+                uid = abs(hash(fingerprint)) % (10 ** 9)
+                results = self._qdrant_client.retrieve(
+                    collection_name=_FED_COLLECTION,
+                    ids=[uid],
+                    with_payload=True,
+                )
+                if not results:
+                    return False
+                # Verify payload fingerprint to guard against hash collisions
+                stored_fp = (results[0].payload or {}).get("fingerprint", "")
+                return stored_fp == fingerprint
+            except Exception as exc:
+                log.debug(f"FederatedStore.fingerprint_exists (qdrant): {exc}")
+                return False
+
+        if self._backend == "json":
+            records = self._json_load_patterns()
+            return any(r.get("fingerprint") == fingerprint for r in records)
+
+        return False
+
     async def _record_usage_qdrant(self, fingerprint: str, success: bool) -> bool:
         """Update use_count / success_count for a pattern stored in Qdrant."""
         try:
@@ -645,6 +682,20 @@ class FederatedPatternStore:
                         use_count        = int(item.get("use_count", 0)),
                         success_count    = int(item.get("success_count", 0)),
                     ))
+
+                # Update pattern_count on the matching peer so list_peers()
+                # returns a meaningful number rather than the permanent 0 it
+                # had before (the field was declared but never incremented).
+                registry_info = data.get("registry", {})
+                total_reported = int(registry_info.get("total_patterns", 0))
+                if total_reported > 0:
+                    normalised_base = base_url.rstrip("/")
+                    for peer in self._peers:
+                        if peer.url.rstrip("/") == normalised_base:
+                            peer.pattern_count = total_reported
+                            peer.last_seen = datetime.now(timezone.utc).isoformat()
+                            break
+
                 return patterns
         except asyncio.TimeoutError:
             log.debug(f"FederatedStore: pull timeout from {url}")
