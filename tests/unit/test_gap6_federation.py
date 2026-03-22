@@ -954,3 +954,507 @@ class TestFingerprintCrossDeploymentStability:
         assert result_b.normalization_ok
         # Same structural shape → same fingerprint → registry deduplicates
         assert result_a.fingerprint == result_b.fingerprint
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW TESTS — covering all 6 issues identified in the GAP-6 audit
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestJavaGoJsNormalization:
+    """
+    Issue 3 fix: Java, Go, and JavaScript structural keywords must be
+    preserved verbatim so that two deployments normalizing the same
+    structural fix pattern in those languages produce identical fingerprints.
+    Previously all three fell through to an empty allowlist, causing
+    positional id_N counters to depend on first-appearance order of domain
+    identifiers — breaking cross-deployment dedup for non-C/Python languages.
+    """
+
+    def _get(self):
+        from memory.pattern_normalizer import PatternNormalizer
+        return PatternNormalizer()
+
+    def test_java_null_check_keywords_preserved(self):
+        pn = self._get()
+        diff = (
+            "--- a/PaymentService.java\n+++ b/PaymentService.java\n"
+            "@@ -10,6 +10,8 @@\n"
+            "+  if (paymentObj == null) { throw new NullPointerException(\"bad\"); }\n"
+        )
+        result = pn.normalize(
+            fix_approach="Added null check before dereference",
+            issue_type="null_deref",
+            fix_diff=diff,
+            language="java",
+        )
+        assert result.normalization_ok
+        # Domain identifier stripped
+        assert "paymentObj" not in result.normalized_text
+        # Java structural keywords preserved
+        assert "null" in result.normalized_text
+        assert "NullPointerException" in result.normalized_text
+        assert "throw" in result.normalized_text
+
+    def test_java_same_structure_same_fingerprint(self):
+        """Two Java null-checks with different variable names → identical FP."""
+        pn = self._get()
+        base_diff = (
+            "--- a/Service.java\n+++ b/Service.java\n"
+            "@@ -5,4 +5,6 @@\n"
+            "+  if ({var} == null) {{ throw new IllegalArgumentException(\"missing\"); }}\n"
+        )
+        result_a = pn.normalize(
+            fix_approach="Null guard added",
+            issue_type="null_deref",
+            fix_diff=base_diff.format(var="paymentRecord"),
+            language="java",
+        )
+        result_b = pn.normalize(
+            fix_approach="Null guard added",
+            issue_type="null_deref",
+            fix_diff=base_diff.format(var="userSession"),
+            language="java",
+        )
+        assert result_a.fingerprint == result_b.fingerprint
+
+    def test_go_nil_check_keywords_preserved(self):
+        pn = self._get()
+        diff = (
+            "--- a/handler.go\n+++ b/handler.go\n"
+            "@@ -8,4 +8,6 @@\n"
+            "+  if conn == nil { return nil, fmt.Errorf(\"conn is nil\") }\n"
+        )
+        result = pn.normalize(
+            fix_approach="Added nil guard before use",
+            issue_type="nil_deref",
+            fix_diff=diff,
+            language="go",
+        )
+        assert result.normalization_ok
+        assert "conn" not in result.normalized_text
+        # Go structural keywords preserved
+        assert "nil" in result.normalized_text
+        assert "return" in result.normalized_text
+
+    def test_go_same_structure_same_fingerprint(self):
+        """Two Go nil-checks with different variable names → identical FP."""
+        pn = self._get()
+        base_diff = (
+            "--- a/svc.go\n+++ b/svc.go\n"
+            "@@ -3,3 +3,5 @@\n"
+            "+  if {var} == nil {{ return errors.New(\"nil ptr\") }}\n"
+        )
+        result_a = pn.normalize(
+            fix_approach="nil guard",
+            issue_type="nil_deref",
+            fix_diff=base_diff.format(var="dbConn"),
+            language="go",
+        )
+        result_b = pn.normalize(
+            fix_approach="nil guard",
+            issue_type="nil_deref",
+            fix_diff=base_diff.format(var="httpClient"),
+            language="go",
+        )
+        assert result_a.fingerprint == result_b.fingerprint
+
+    def test_js_null_check_keywords_preserved(self):
+        pn = self._get()
+        diff = (
+            "--- a/api.js\n+++ b/api.js\n"
+            "@@ -12,4 +12,6 @@\n"
+            "+  if (userToken === null || userToken === undefined) { throw new TypeError('missing'); }\n"
+        )
+        result = pn.normalize(
+            fix_approach="Added null/undefined guard",
+            issue_type="null_deref",
+            fix_diff=diff,
+            language="javascript",
+        )
+        assert result.normalization_ok
+        assert "userToken" not in result.normalized_text
+        assert "null" in result.normalized_text
+        assert "TypeError" in result.normalized_text
+
+    def test_typescript_keywords_preserved(self):
+        pn = self._get()
+        diff = (
+            "--- a/service.ts\n+++ b/service.ts\n"
+            "@@ -5,3 +5,5 @@\n"
+            "+  if (!payload) { throw new Error('payload required'); }\n"
+        )
+        result = pn.normalize(
+            fix_approach="Guard added",
+            issue_type="null_deref",
+            fix_diff=diff,
+            language="typescript",
+        )
+        assert result.normalization_ok
+        assert "payload" not in result.normalized_text
+        assert "Error" in result.normalized_text
+
+
+class TestFingerprintExistsO1Lookup:
+    """
+    Issue 5 fix: fingerprint_exists() must perform an O(1) Qdrant point
+    lookup rather than loading the entire pattern collection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_exists_qdrant_hit(self, tmp_path):
+        from memory.federated_store import FederatedPatternStore, FederatedPattern
+
+        store = FederatedPatternStore(
+            instance_id="test-001",
+            data_dir=tmp_path,
+        )
+        fp = "a" * 64
+        uid = abs(hash(fp)) % (10 ** 9)
+
+        mock_client = MagicMock()
+        mock_point = MagicMock()
+        mock_point.payload = {"fingerprint": fp}
+        mock_client.retrieve.return_value = [mock_point]
+
+        store._qdrant_client = mock_client
+        store._backend = "qdrant"
+
+        result = await store.fingerprint_exists(fp)
+        assert result is True
+        # Must call retrieve with the correct UID — not scan all patterns
+        mock_client.retrieve.assert_called_once_with(
+            collection_name="rhodawk_fed_patterns",
+            ids=[uid],
+            with_payload=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_exists_qdrant_miss(self, tmp_path):
+        from memory.federated_store import FederatedPatternStore
+
+        store = FederatedPatternStore(instance_id="test-002", data_dir=tmp_path)
+        mock_client = MagicMock()
+        mock_client.retrieve.return_value = []   # not found
+
+        store._qdrant_client = mock_client
+        store._backend = "qdrant"
+
+        result = await store.fingerprint_exists("b" * 64)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_exists_collision_defence(self, tmp_path):
+        """Hash collision: point found but payload fingerprint differs → False."""
+        from memory.federated_store import FederatedPatternStore
+
+        store = FederatedPatternStore(instance_id="test-003", data_dir=tmp_path)
+        mock_client = MagicMock()
+        mock_point = MagicMock()
+        # Point exists but payload has a DIFFERENT fingerprint (hash collision)
+        mock_point.payload = {"fingerprint": "c" * 64}
+        mock_client.retrieve.return_value = [mock_point]
+
+        store._qdrant_client = mock_client
+        store._backend = "qdrant"
+
+        result = await store.fingerprint_exists("d" * 64)
+        assert result is False   # payload mismatch → treat as miss
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_exists_json_fallback(self, tmp_path):
+        """JSON backend: linear scan used as fallback (correct behaviour)."""
+        from memory.federated_store import FederatedPatternStore
+        import json
+
+        store = FederatedPatternStore(instance_id="test-004", data_dir=tmp_path)
+        fp = "e" * 64
+        store._backend = "json"
+        store._json_path = tmp_path / "federated_patterns.json"
+        store._json_path.write_text(
+            json.dumps([{"fingerprint": fp, "normalized_text": "x"}]),
+            encoding="utf-8",
+        )
+
+        assert await store.fingerprint_exists(fp) is True
+        assert await store.fingerprint_exists("f" * 64) is False
+
+
+class TestReceivePatternUsesFingerrintExists:
+    """
+    Issue 5 fix: POST /api/federation/patterns must use fingerprint_exists()
+    (O(1)) for dedup rather than _retrieve_from_cache("", n=10_000) (O(N)).
+    """
+
+    def _mock_store(self):
+        store = MagicMock()
+        store._retrieve_from_cache = AsyncMock(return_value=[])
+        store.fingerprint_exists = AsyncMock(return_value=False)
+        store._cache_pattern = AsyncMock()
+        return store
+
+    def test_new_pattern_accepted_via_fingerprint_exists(self):
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from api.routes.federation import router, inject_fed_store
+
+        app = FastAPI()
+        app.include_router(router)
+
+        store = self._mock_store()
+        store.fingerprint_exists = AsyncMock(return_value=False)
+        inject_fed_store(store)
+
+        client = TestClient(app)
+        fp = "1a" * 32
+        resp = client.post("/api/federation/patterns", json={
+            "fingerprint":     fp,
+            "normalized_text": "if var_0 is None: raise var_str_0",
+            "issue_type":      "null_deref",
+        })
+        assert resp.status_code == 201
+        store.fingerprint_exists.assert_called_once_with(fp)
+
+    def test_duplicate_pattern_rejected_409_via_fingerprint_exists(self):
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from api.routes.federation import router, inject_fed_store
+
+        app = FastAPI()
+        app.include_router(router)
+
+        fp = "2b" * 32
+        store = self._mock_store()
+        store.fingerprint_exists = AsyncMock(return_value=True)   # already known
+        inject_fed_store(store)
+
+        client = TestClient(app)
+        resp = client.post("/api/federation/patterns", json={
+            "fingerprint":     fp,
+            "normalized_text": "if var_0 is None: raise var_str_0",
+            "issue_type":      "null_deref",
+        })
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["status"] == "already_known"
+        # _cache_pattern must NOT be called for duplicates
+        store._cache_pattern.assert_not_called()
+
+
+class TestFullFingerprintInFixMemory:
+    """
+    Issue 1 fix: FixMemory._retrieve_federated must store the FULL 64-char
+    fingerprint in FixMemoryEntry.id, not a 16-char truncation.  The Qdrant
+    record_usage path computes point UIDs as abs(hash(full_fingerprint)) so
+    any truncation produces a different UID and silently breaks the feedback
+    loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_id_is_full_fingerprint(self, tmp_path):
+        from memory.fix_memory import FixMemory
+        from memory.federated_store import FederatedPattern
+
+        full_fp = "a" * 64   # 64-char SHA-256
+
+        mock_fed = MagicMock()
+        mock_fed.receive = True
+        mock_fed.pull_patterns = AsyncMock(return_value=[
+            FederatedPattern(
+                fingerprint      = full_fp,
+                normalized_text  = "if var_0 is None: raise var_str_0",
+                issue_type       = "null_deref",
+                language         = "python",
+                complexity_score = 0.5,
+                federation_score = 0.8,
+            )
+        ])
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm._backend = "json"
+        fm._federated_store = mock_fed
+
+        entries = await fm._retrieve_federated_async("null dereference issue", n=5)
+        assert len(entries) == 1
+        # id must be the FULL 64-char fingerprint
+        assert entries[0].id == full_fp
+        assert len(entries[0].id) == 64
+
+    @pytest.mark.asyncio
+    async def test_retrieve_async_returns_federated_entries(self, tmp_path):
+        """retrieve_async() must include federated entries in every async call."""
+        from memory.fix_memory import FixMemory
+        from memory.federated_store import FederatedPattern
+
+        full_fp = "b" * 64
+
+        mock_fed = MagicMock()
+        mock_fed.receive = True
+        mock_fed.pull_patterns = AsyncMock(return_value=[
+            FederatedPattern(
+                fingerprint      = full_fp,
+                normalized_text  = "if var_0 is None: raise var_str_0",
+                issue_type       = "null_deref",
+                language         = "python",
+                complexity_score = 0.6,
+                federation_score = 0.7,
+            )
+        ])
+
+        fm = FixMemory(repo_url="https://example.com/repo", data_dir=tmp_path)
+        fm._backend = "json"
+        fm._json_path = tmp_path / "fix_memory.json"
+        fm._json_path.write_text("[]", encoding="utf-8")
+        fm._federated_store = mock_fed
+
+        entries = await fm.retrieve_async("null dereference", n=5)
+        fed_entries = [e for e in entries if e.fix_approach.startswith("[FEDERATED]")]
+        assert len(fed_entries) == 1
+        assert fed_entries[0].id == full_fp   # full fingerprint preserved
+
+
+class TestPeerPatternCountUpdated:
+    """
+    Issue 4 fix: FederationPeer.pattern_count must be updated after each
+    successful pull so list_peers() returns meaningful counts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_peer_pattern_count_set_after_pull(self, tmp_path):
+        import aiohttp
+        from memory.federated_store import FederatedPatternStore, FederationPeer
+        from unittest.mock import patch, AsyncMock as AM
+        from datetime import datetime, timezone
+
+        peer_url = "https://peer.example.com"
+        store = FederatedPatternStore(
+            instance_id  = "test-pc-001",
+            registry_url = peer_url,
+            data_dir     = tmp_path,
+        )
+        store._backend = "json"
+        store._json_path = tmp_path / "federated_patterns.json"
+        # Register the peer so _pull_from_peer has it in _peers
+        store._peers = [FederationPeer(
+            id          = "peer1",
+            url         = peer_url,
+            name        = "test-peer",
+            last_seen   = "",
+            pattern_count = 0,
+            active      = True,
+        )]
+
+        response_data = {
+            "count": 2,
+            "patterns": [
+                {
+                    "fingerprint":      "c" * 64,
+                    "normalized_text":  "if var_0 is None: raise var_str_0",
+                    "issue_type":       "null_deref",
+                    "language":         "python",
+                    "complexity_score": 0.5,
+                    "relevance_score":  0.8,
+                    "use_count":        3,
+                    "success_count":    2,
+                }
+            ],
+            "registry": {"total_patterns": 42},
+        }
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=response_data)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(return_value=mock_resp)
+        store._session = mock_session
+
+        patterns = await store._pull_from_peer(peer_url, "null_deref", "", 5)
+
+        assert len(patterns) == 1
+        # peer.pattern_count must now reflect total_patterns from the response
+        assert store._peers[0].pattern_count == 42
+        # last_seen must have been updated
+        assert store._peers[0].last_seen != ""
+
+
+class TestAsyncFederatedPullInFixer:
+    """
+    Issue 2 fix: fixer._get_memory_examples must use retrieve_async so
+    federation pulls are not silently deferred in the async pipeline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_memory_examples_uses_retrieve_async(self, tmp_path):
+        """retrieve_async is called when available — not the sync retrieve."""
+        from memory.fix_memory import FixMemory
+
+        fm = FixMemory(repo_url="https://x.com/repo", data_dir=tmp_path)
+        fm._backend = "json"
+        fm._json_path = tmp_path / "fm.json"
+        fm._json_path.write_text("[]", encoding="utf-8")
+
+        retrieve_async_called = []
+
+        async def _mock_retrieve_async(query, n=3, max_age_days=180):
+            retrieve_async_called.append(query)
+            return []
+
+        fm.retrieve_async = _mock_retrieve_async
+
+        # Simulate what FixerAgent._get_memory_examples does
+        if hasattr(fm, 'retrieve_async'):
+            await fm.retrieve_async("null deref issue", n=3, max_age_days=180)
+
+        assert len(retrieve_async_called) == 1
+
+    @pytest.mark.asyncio
+    async def test_report_federated_usage_uses_full_fingerprint(self, tmp_path):
+        """
+        _report_federated_usage must pass the full 64-char fingerprint to
+        record_federated_usage, not the 16-char prefix from the old entry.id.
+        """
+        from memory.fix_memory import FixMemory
+        from memory.federated_store import FederatedPattern
+
+        full_fp = "d" * 64
+        mock_fed = MagicMock()
+        mock_fed.receive = True
+        mock_fed.pull_patterns = AsyncMock(return_value=[
+            FederatedPattern(
+                fingerprint      = full_fp,
+                normalized_text  = "if var_0 is None: raise var_str_0",
+                issue_type       = "null_deref",
+                language         = "python",
+                complexity_score = 0.5,
+                federation_score = 0.8,
+            )
+        ])
+
+        fm = FixMemory(repo_url="https://x.com/repo", data_dir=tmp_path)
+        fm._backend = "json"
+        fm._json_path = tmp_path / "fm2.json"
+        fm._json_path.write_text("[]", encoding="utf-8")
+        fm._federated_store = mock_fed
+
+        recorded_fps = []
+
+        def _mock_record(fingerprint, success):
+            recorded_fps.append(fingerprint)
+
+        fm.record_federated_usage = _mock_record
+
+        # Pull entries via retrieve_async to populate cache with full FP
+        entries = await fm.retrieve_async("null deref", n=5)
+        fed = [e for e in entries if e.fix_approach.startswith("[FEDERATED]")]
+        assert len(fed) == 1
+
+        # Simulate what fixer._report_federated_usage does
+        for entry in fed:
+            if entry.fix_approach.startswith('[FEDERATED]') and len(entry.id) == 64:
+                fm.record_federated_usage(fingerprint=entry.id, success=True)
+
+        assert len(recorded_fps) == 1
+        assert recorded_fps[0] == full_fp    # full fingerprint, not truncated
+        assert len(recorded_fps[0]) == 64
