@@ -55,18 +55,33 @@ services:
   # FIX: PostgreSQL was entirely absent from the previous compose file.
   # The controller defaults to PostgreSQL but there was no container,
   # causing a silent fallback to SQLite on every `docker-compose up`.
+  #
+  # ADD-05 FIX: credentials are no longer hardcoded. POSTGRES_USER,
+  # POSTGRES_PASSWORD, and POSTGRES_DB are read from the .env file
+  # (loaded via env_file: .env on the api/worker services, and via
+  # the ${VAR:-default} syntax here for the postgres service itself).
+  #
+  # Set these in .env before first run:
+  #   POSTGRES_USER=rhodawk
+  #   POSTGRES_PASSWORD=<generate: python -c "import secrets; print(secrets.token_hex(32))">
+  #   POSTGRES_DB=rhodawk
+  #   RHODAWK_PG_DSN=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  #
+  # The defaults below will cause a startup WARNING from the controller
+  # if left unchanged (RHODAWK_PG_DSN will not be set and the controller
+  # will log "RHODAWK_PG_DSN not set — falling back to SQLite").
   postgres:
     image: postgres:16-alpine
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER:     rhodawk
-      POSTGRES_PASSWORD: rhodawk
-      POSTGRES_DB:       rhodawk
+      POSTGRES_USER:     ${POSTGRES_USER:-rhodawk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env — see comment above}
+      POSTGRES_DB:       ${POSTGRES_DB:-rhodawk}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rhodawk -d rhodawk"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rhodawk} -d ${POSTGRES_DB:-rhodawk}"]
       interval: 10s
       timeout: 5s
       retries: 5
