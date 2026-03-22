@@ -241,61 +241,140 @@ async def evaluate_patch_docker(
     timeout:  int = 300,
 ) -> bool:
     """
-    BUG-4 FIX: The previous implementation fell back to a word-overlap
-    heuristic (_heuristic_eval) when the docker SDK was not installed or when
-    the Docker eval failed. That heuristic returned True whenever a patch
-    contained 2 or more words from the problem statement — trivially satisfied
-    by any patch that touched the relevant file. Any score produced against
-    that heuristic was fabricated and incomparable to published SWE-bench baselines.
+    BUG-05 FIX: Rewritten to use the official SWE-bench Verified evaluation
+    protocol. The previous implementation passed --patch /workspace/patch.diff
+    to swebench.harness.run_evaluation — that CLI flag does not exist. The
+    harness rejected the argument with an unrecognized argument error, and any
+    score produced was not from the official protocol and cannot be compared to
+    any published baseline.
 
-    Fix:
-    1. ImportError on docker raises RuntimeError immediately — forces the
-       operator to install docker before running benchmarks.
-    2. Docker execution failures log the full error and raise rather than
-       falling back to heuristic evaluation. A score is only reported when
-       the official harness actually ran.
-    3. _heuristic_eval is removed entirely to prevent accidental use.
+    Official protocol requires:
+      1. A predictions JSONL file:
+           {"instance_id": "...", "model_patch": "...", "model_name_or_path": "rhodawk"}
+      2. Per-instance Docker images managed by the harness internally.
+      3. Run: python -m swebench.harness.run_evaluation
+               --predictions_path <path>
+               --run_id <id>
+               --dataset_name princeton-nlp/SWE-bench_Verified
+      4. Parse the output results JSON to check if instance_id resolved.
+
+    References:
+      https://github.com/princeton-nlp/SWE-bench#-evaluating-on-swe-bench
+      https://github.com/princeton-nlp/SWE-bench/blob/main/swebench/harness/run_evaluation.py
     """
-    try:
-        import docker  # type: ignore[import]
-    except ImportError:
-        raise RuntimeError(
-            "docker SDK not installed — cannot run official SWE-bench evaluation. "
-            "Install with: pip install docker>=6.0  "
-            "The docker package must be present for benchmark scores to be valid and "
-            "comparable to published baselines."
+    import json as _json
+    import subprocess as _sp
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+
+        # Step 1: Write predictions JSONL
+        predictions_path = tmppath / "predictions.jsonl"
+        prediction = {
+            "instance_id":        instance.instance_id,
+            "model_patch":        patch,
+            "model_name_or_path": "rhodawk",
+        }
+        predictions_path.write_text(
+            _json.dumps(prediction) + "\n", encoding="utf-8"
         )
 
-    import tempfile
-    client = docker.from_env()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        patch_file = Path(tmpdir) / "patch.diff"
-        patch_file.write_text(patch, encoding="utf-8")
+        # Step 2: Run official harness via subprocess
+        # The harness spawns per-instance Docker containers internally using
+        # images tagged per instance_id. We do NOT use docker SDK directly —
+        # the harness handles image pulling, environment setup, patch
+        # application, and test execution per the official SWE-bench protocol.
+        run_id      = f"rhodawk_{instance.instance_id[:24].replace('/', '_')}"
+        results_dir = tmppath / "results"
+        results_dir.mkdir()
+
+        cmd = [
+            "python", "-m", "swebench.harness.run_evaluation",
+            "--predictions_path", str(predictions_path),
+            "--run_id",           run_id,
+            "--dataset_name",     _DATASET,
+            "--split",            _SPLIT,
+            "--instance_ids",     instance.instance_id,
+            "--max_workers",      "1",
+            "--cache_level",      "instance",
+        ]
+
+        log.info(
+            "evaluate_patch_docker: running official harness for %s",
+            instance.instance_id,
+        )
+
         try:
-            result = client.containers.run(
-                image="ghcr.io/princeton-nlp/swe-bench-eval:latest",
-                command=[
-                    "python", "-m", "swebench.harness.run_evaluation",
-                    "--instance_id", instance.instance_id,
-                    "--patch",       "/workspace/patch.diff",
-                ],
-                volumes={tmpdir: {"bind": "/workspace", "mode": "rw"}},
-                remove=True,
-                stdout=True,
-                stderr=True,
-                timeout=timeout,
+            proc = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _sp.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        cwd=str(tmpdir),
+                    ),
+                ),
+                timeout=timeout + 30,
             )
-            return "RESOLVED" in result.decode(errors="replace").upper()
-        except Exception as exc:
-            # Log the full error and raise — do NOT fall back to heuristics.
-            # A failed Docker eval means no result, not a fabricated result.
+        except (asyncio.TimeoutError, _sp.TimeoutExpired):
+            raise RuntimeError(
+                f"SWE-bench harness timed out after {timeout}s for "
+                f"{instance.instance_id}. Increase RHODAWK_BENCH_TIMEOUT or "
+                "check that Docker and the per-instance images are available."
+            )
+
+        if proc.returncode != 0:
             log.error(
-                f"Docker eval failed for {instance.instance_id}: {exc}. "
-                "Check that Docker is running, the eval image is pulled "
-                "(docker pull ghcr.io/princeton-nlp/swe-bench-eval:latest), "
-                "and the instance environment is correctly configured."
+                "SWE-bench harness rc=%d for %s:\nSTDOUT: %s\nSTDERR: %s",
+                proc.returncode,
+                instance.instance_id,
+                proc.stdout[-2000:],
+                proc.stderr[-2000:],
             )
-            raise
+            raise RuntimeError(
+                f"SWE-bench harness exited rc={proc.returncode} for "
+                f"{instance.instance_id}. Check harness installation: "
+                "pip install swebench  and ensure Docker daemon is running."
+            )
+
+        # Step 3: Parse results JSON
+        # The harness writes results to various locations depending on version;
+        # search all JSON files under tmpdir for the resolved list.
+        resolved = False
+        for result_file in list(tmppath.rglob("*.json")):
+            try:
+                data = _json.loads(result_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    # Format: {"resolved": ["instance_id", ...], ...}
+                    if instance.instance_id in data.get("resolved", []):
+                        resolved = True
+                        break
+                    # Format: {"instance_id": ..., "resolved": bool}
+                    if (data.get("instance_id") == instance.instance_id and
+                            data.get("resolved", False)):
+                        resolved = True
+                        break
+                elif isinstance(data, list):
+                    for entry in data:
+                        if (isinstance(entry, dict) and
+                                entry.get("instance_id") == instance.instance_id and
+                                entry.get("resolved", False)):
+                            resolved = True
+                            break
+            except Exception as parse_exc:
+                log.debug(
+                    "evaluate_patch_docker: could not parse %s: %s",
+                    result_file, parse_exc,
+                )
+
+        log.info(
+            "evaluate_patch_docker: %s → resolved=%s",
+            instance.instance_id, resolved,
+        )
+        return resolved
 
 
 # ──────────────────────────────────────────────────────────────────────────────
