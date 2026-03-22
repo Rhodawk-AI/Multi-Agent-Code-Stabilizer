@@ -16,6 +16,7 @@ FIXES vs prior audit
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -127,8 +128,57 @@ async def lifespan(app: FastAPI):
     # BUG-2 FIX: enforce production security at startup — raises SystemExit on
     # policy violations instead of continuing with degraded security.
     _enforce_production_security()
+
+    # MISSING-2 FIX: replay any commits that arrived while the API was down,
+    # the webhook timed out, or the repo does not support push webhooks.
+    # Runs as a fire-and-forget background task so it does not block startup
+    # from accepting traffic; the scheduler is idempotent so a concurrent
+    # webhook for the same SHA will be deduplicated automatically.
+    asyncio.create_task(_startup_commit_catchup(app))
+
     yield
     log.info("Rhodawk AI API shutting down")
+
+
+async def _startup_commit_catchup(app: FastAPI) -> None:
+    """
+    MISSING-2 FIX: On every API startup, ask the CommitAuditScheduler to
+    replay any commits that landed in the gap window (service downtime,
+    webhook timeout, no-webhook repos).
+
+    The scheduler is expected to be stored on ``app.state.scheduler`` by
+    StabilizerController after initialise() wires its subsystems into the
+    FastAPI app state.  When no scheduler is present (e.g. test environment
+    or API started without a controller) this is a no-op.
+
+    We wait up to 30 seconds for the scheduler to appear (controller
+    initialise() runs concurrently on first /api/runs/start) before giving up.
+    """
+    scheduler = None
+    for _ in range(30):
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is not None:
+            break
+        await asyncio.sleep(1.0)
+
+    if scheduler is None:
+        log.debug(
+            "[startup] No CommitAuditScheduler on app.state — "
+            "missed-commit replay skipped (normal for API-only deployments)"
+        )
+        return
+
+    try:
+        log.info("[startup] Running missed-commit replay via CommitAuditScheduler …")
+        records = await scheduler.replay_missed_commits(max_commits=50)
+        log.info(
+            "[startup] Missed-commit replay complete: %d commit(s) processed",
+            len(records),
+        )
+    except Exception as exc:
+        # Non-fatal: the API continues to serve traffic; the next webhook or
+        # manual trigger will catch any remaining gaps.
+        log.warning("[startup] Missed-commit replay failed (non-fatal): %s", exc)
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
