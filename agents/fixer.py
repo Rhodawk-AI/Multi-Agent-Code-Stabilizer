@@ -498,6 +498,29 @@ class FixerAgent(BaseAgent):
                 ]
 
             blast = await self.cpg_engine.compute_blast_radius(function_names=function_names, file_paths=file_paths, depth=3)
+
+            # ARCH-02 FIX: warn when Joern is live but returned zero impact.
+            # Zero score from a live CPG almost always means the CPG was built
+            # from a different commit or the import is incomplete.  Without this
+            # warning the blast-radius gate silently passes and high-impact changes
+            # bypass human review.
+            if (
+                getattr(blast, 'source', None) == 'cpg'
+                and blast.blast_radius_score == 0.0
+                and blast.affected_function_count == 0
+                and function_names
+            ):
+                self.log.warning(
+                    '[Fixer] ARCH-02: Joern CPG live (source=cpg) but returned '
+                    'blast_radius_score=0 and 0 affected functions for %d symbol(s) %s. '
+                    'CPG may be built from a different checkout or cpg import is '
+                    'incomplete. Blast-radius gate will PASS but may be incorrect — '
+                    'high-impact fixes may bypass human review. '
+                    'Verify JOERN_REPO_PATH and re-run cpg import against current commit.',
+                    len(function_names),
+                    function_names[:3],
+                )
+
             if not blast.affected_functions and not blast.importing_modules:
                 return ('', blast)
 
