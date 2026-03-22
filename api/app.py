@@ -25,7 +25,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 log = logging.getLogger(__name__)
 
@@ -268,6 +268,25 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # SEC-05 FIX: return 503 if RHODAWK_DEV_AUTH=1 is set outside a development
+        # environment.  os._exit(1) in _enforce_production_security() fires at process
+        # startup and stops the crash-loop, but there is a narrow race window where an
+        # orchestrator / load-balancer health-probe can reach this endpoint before the
+        # security check completes.  Returning 503 here closes that window: the
+        # orchestrator will see the service as unhealthy and withhold traffic until the
+        # misconfiguration is corrected and the container is restarted cleanly.
+        if os.environ.get("RHODAWK_DEV_AUTH") == "1" and not _IS_DEV:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "misconfigured",
+                    "reason": (
+                        "RHODAWK_DEV_AUTH=1 is set in a non-development environment. "
+                        "Authentication is completely bypassed. "
+                        "Fix: set RHODAWK_DEV_AUTH=0 (or remove it) and restart."
+                    ),
+                },
+            )
         return {"status": "ok", "version": "2.0.2", "env": os.environ.get("RHODAWK_ENV", "production")}
 
     @app.get("/api/capabilities")
