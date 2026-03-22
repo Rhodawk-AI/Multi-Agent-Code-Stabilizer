@@ -3,25 +3,34 @@ api/routes/commits.py
 =====================
 Gap 4: REST endpoints for commit-triggered incremental audits.
 
+FIXES APPLIED
+─────────────
+• ARCH-4: _run_inline() now resolves the CPGEngine singleton from
+  app.state.cpg_engine (set by StabilizerController during initialise()).
+  Previously it always constructed IncrementalCPGUpdater(cpg_engine=None),
+  which meant the webhook path silently ran at file granularity instead of
+  function granularity — writing no FunctionStalenessMark rows and defeating
+  the entire incremental audit claim for CI-triggered events.
+
+• ADD-4: RHODAWK_WEBHOOK_SECRET is now REQUIRED in production
+  (RHODAWK_ENV != 'development'). The previous code accepted any unauthenticated
+  webhook call whenever the secret was unset (it just logged a warning and
+  returned True from the verify functions). An unauthenticated POST to
+  /commits/webhook with any payload triggers a full audit — in production this
+  must require a valid HMAC signature.
+
 Two endpoints are provided:
 
 POST /commits/webhook
     HMAC-SHA256-verified endpoint called by GitHub/GitLab/Bitbucket push
-    webhooks.  Validates the signature, extracts the list of changed files
-    from the payload, and dispatches a ``commit_audit_task`` Celery task so
+    webhooks. Validates the signature, extracts the list of changed files
+    from the payload, and dispatches a commit_audit_task Celery task so
     the HTTP response is returned immediately (< 200 ms) while the CPG
-    query and function-level staleness marking happen asynchronously in the
-    worker pool.
-
-    Supported payload shapes:
-    • GitHub push event   — ``commits[].added + modified + removed``
-    • GitLab push event   — ``commits[].added + modified + removed``
-    • Generic payload     — ``changed_files: list[str]``
+    query and function-level staleness marking happen asynchronously.
 
 POST /commits/trigger
     JWT-authenticated manual trigger for CI systems that prefer polling
-    over webhooks.  Accepts the same parameters as the webhook but skips
-    HMAC verification and uses the caller's JWT for authorisation instead.
+    over webhooks.
 
 GET  /commits/{record_id}
     Returns the current CommitAuditRecord so CI jobs can poll for
@@ -29,7 +38,6 @@ GET  /commits/{record_id}
 
 GET  /commits
     Lists CommitAuditRecords filtered by run_id and/or status.
-    Used by the dashboard to show per-commit audit history.
 """
 from __future__ import annotations
 
@@ -49,8 +57,8 @@ log = logging.getLogger(__name__)
 router = APIRouter(tags=["commits"])
 
 # HMAC secret used to verify GitHub/GitLab webhook payloads.
-# Set via RHODAWK_WEBHOOK_SECRET environment variable.
 _WEBHOOK_SECRET = os.environ.get("RHODAWK_WEBHOOK_SECRET", "")
+_IS_DEV = os.environ.get("RHODAWK_ENV", "production").lower() == "development"
 
 
 # ── Request / response models ─────────────────────────────────────────────────
@@ -87,9 +95,6 @@ class CommitAuditListResponse(BaseModel):
 
 def _verify_github_signature(body: bytes, sig_header: str) -> bool:
     """Verify X-Hub-Signature-256 header from GitHub push webhooks."""
-    if not _WEBHOOK_SECRET:
-        log.warning("RHODAWK_WEBHOOK_SECRET not set — webhook signature skipped")
-        return True
     if not sig_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(
@@ -100,18 +105,42 @@ def _verify_github_signature(body: bytes, sig_header: str) -> bool:
 
 def _verify_gitlab_token(token_header: str) -> bool:
     """Verify X-Gitlab-Token header from GitLab push webhooks."""
-    if not _WEBHOOK_SECRET:
-        return True
     return hmac.compare_digest(_WEBHOOK_SECRET, token_header)
+
+
+def _check_webhook_secret_configured() -> None:
+    """
+    ADD-4 FIX: In production environments, RHODAWK_WEBHOOK_SECRET MUST be set.
+    Previously the verify functions silently returned True (accept all) when
+    the secret was unset — any unauthenticated caller could trigger full audits.
+
+    In development mode (RHODAWK_ENV=development) the secret is optional so
+    local testing without a secret works. In all other environments it is
+    required.
+    """
+    if not _WEBHOOK_SECRET:
+        if _IS_DEV:
+            log.warning(
+                "RHODAWK_WEBHOOK_SECRET not set — webhook signature verification "
+                "is DISABLED. This is only acceptable in local development. "
+                "Set RHODAWK_WEBHOOK_SECRET in production."
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Webhook endpoint is not configured: RHODAWK_WEBHOOK_SECRET "
+                    "is not set. Set it to a random secret and configure the same "
+                    "value in your GitHub/GitLab webhook settings. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+                ),
+            )
 
 
 # ── File extraction helpers ───────────────────────────────────────────────────
 
 def _extract_changed_files(payload: dict) -> list[str]:
-    """
-    Extract changed file paths from GitHub, GitLab, or generic push payloads.
-    Returns a deduplicated list of relative file paths.
-    """
+    """Extract changed file paths from GitHub, GitLab, or generic push payloads."""
     seen:  set[str]  = set()
     files: list[str] = []
 
@@ -126,7 +155,6 @@ def _extract_changed_files(payload: dict) -> list[str]:
             for f in commit.get(key, []):
                 _add(f)
 
-    # Generic fallback
     for f in payload.get("changed_files", []):
         _add(f)
 
@@ -154,13 +182,23 @@ def _extract_commit_meta(payload: dict) -> dict[str, str]:
 
 
 def _get_run_id_from_storage() -> str:
-    """
-    Resolve the active run_id.  In production this should be passed in the
-    webhook payload or looked up from storage.  This function provides a
-    best-effort resolution using the RHODAWK_ACTIVE_RUN_ID env var as a
-    fallback, which is set by the controller on startup.
-    """
+    """Resolve the active run_id from the RHODAWK_ACTIVE_RUN_ID env var."""
     return os.environ.get("RHODAWK_ACTIVE_RUN_ID", "")
+
+
+def _get_cpg_engine_from_app_state(request: Request) -> Any:
+    """
+    ARCH-4 FIX: Resolve the live CPGEngine singleton from app.state.
+    StabilizerController sets app.state.cpg_engine during _init_cpg().
+    Returns None if the engine is not yet initialised or Joern is unavailable.
+    """
+    try:
+        engine = getattr(request.app.state, "cpg_engine", None)
+        if engine is not None and getattr(engine, "is_available", False):
+            return engine
+    except Exception:
+        pass
+    return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -179,35 +217,30 @@ async def receive_webhook(
     """
     HMAC-verified endpoint for GitHub / GitLab push webhooks.
 
-    On receipt:
-    1. Verifies the payload signature.
-    2. Extracts changed files and commit metadata from the payload.
-    3. Dispatches ``commit_audit_task`` to the Celery ``commit`` queue.
-    4. Returns 202 Accepted immediately — the audit runs asynchronously.
-
-    Configure your CI provider with:
-    • GitHub:  Webhook URL = https://<host>/commits/webhook
-               Content-Type = application/json
-               Secret = value of RHODAWK_WEBHOOK_SECRET
-               Events = Push
-    • GitLab:  Webhook URL = https://<host>/commits/webhook
-               Secret Token = value of RHODAWK_WEBHOOK_SECRET
-               Trigger = Push events
+    ADD-4 FIX: RHODAWK_WEBHOOK_SECRET is now required in production.
+    ARCH-4 FIX: Inline fallback uses the live CPGEngine from app.state
+    instead of constructing IncrementalCPGUpdater(cpg_engine=None).
     """
+    # ADD-4: verify the secret is configured before accepting any payload.
+    _check_webhook_secret_configured()
+
     body = await request.body()
 
     # Signature verification
     if x_hub_signature_256:
-        if not _verify_github_signature(body, x_hub_signature_256):
+        if not _WEBHOOK_SECRET or not _verify_github_signature(body, x_hub_signature_256):
             raise HTTPException(status_code=403, detail="Invalid GitHub webhook signature")
     elif x_gitlab_token:
-        if not _verify_gitlab_token(x_gitlab_token):
+        if not _WEBHOOK_SECRET or not _verify_gitlab_token(x_gitlab_token):
             raise HTTPException(status_code=403, detail="Invalid GitLab webhook token")
     elif _WEBHOOK_SECRET:
+        # Secret is configured but no signature header received.
         raise HTTPException(
             status_code=401,
             detail="Webhook signature required but no signature header found",
         )
+    # If _WEBHOOK_SECRET is empty and we reach here, we are in dev mode
+    # (enforced by _check_webhook_secret_configured above).
 
     try:
         payload: dict[str, Any] = await request.json()
@@ -251,9 +284,8 @@ async def receive_webhook(
             ),
         )
     except Exception as exc:
-        # Celery not available — run synchronously in-process as fallback
         log.warning("Celery unavailable, running commit audit in-process: %s", exc)
-        return await _run_inline(run_id, meta, changed_files)
+        return await _run_inline(run_id, meta, changed_files, request)
 
 
 @router.post(
@@ -264,16 +296,11 @@ async def receive_webhook(
     summary="Manually trigger a commit-granularity incremental audit",
 )
 async def trigger_commit_audit(
-    req:  TriggerRequest,
-    user: TokenData = Depends(get_current_user),
+    req:     TriggerRequest,
+    request: Request,
+    user:    TokenData = Depends(get_current_user),
 ) -> TriggerResponse:
-    """
-    JWT-authenticated manual trigger.  Use when a CI system prefers to push
-    the list of changed files directly rather than rely on a webhook.
-
-    The caller must supply ``run_id`` — the active AuditRun id for which
-    staleness marks and CommitAuditRecord rows will be written.
-    """
+    """JWT-authenticated manual trigger."""
     try:
         from workers.tasks import commit_audit_task
         task = commit_audit_task.apply_async(
@@ -304,7 +331,7 @@ async def trigger_commit_audit(
             "author":         req.author or user.sub,
             "commit_message": req.commit_message,
         }
-        resp = await _run_inline(req.run_id, meta, req.changed_files)
+        resp = await _run_inline(req.run_id, meta, req.changed_files, request)
         return TriggerResponse(**resp.model_dump())
 
 
@@ -384,10 +411,21 @@ async def _run_inline(
     run_id:        str,
     meta:          dict[str, str],
     changed_files: list[str],
+    request:       Request | None = None,
 ) -> WebhookResponse:
     """
     Run the CommitAuditScheduler synchronously in the API process when Celery
-    is not available.  Used in development / single-process deployments.
+    is not available.
+
+    ARCH-4 FIX: Resolve the CPGEngine from app.state rather than always
+    constructing IncrementalCPGUpdater(cpg_engine=None). When cpg_engine=None
+    the updater can parse the diff but cannot:
+      - Query Joern for the transitive impact set (function-level dependents)
+      - Write FunctionStalenessMark rows scoped to the impact set
+      - Trigger Joern re-analysis of changed files
+
+    Without the engine the "50-200 functions per commit" claim does not hold.
+    With it, the webhook path is functionally equivalent to the controller path.
     """
     from pathlib import Path
     from cpg.incremental_updater import IncrementalCPGUpdater
@@ -399,18 +437,46 @@ async def _run_inline(
             accepted=False,
             message="Storage unavailable — cannot run inline audit",
         )
+
+    # ARCH-4 FIX: resolve the live CPGEngine from app.state.
+    cpg_engine = _get_cpg_engine_from_app_state(request) if request else None
+    if cpg_engine is None:
+        log.warning(
+            "[commits] CPGEngine not available from app.state — "
+            "inline audit will run at file granularity. "
+            "Start Joern with `docker-compose up joern` for function-level auditing."
+        )
+
     try:
         repo_root_str = os.environ.get("RHODAWK_REPO_ROOT", ".")
         repo_root     = Path(repo_root_str)
-        updater       = IncrementalCPGUpdater(
-            cpg_engine=None, repo_root=repo_root, storage=storage
+
+        # ARCH-4 FIX: pass the live cpg_engine instead of always None.
+        updater = IncrementalCPGUpdater(
+            cpg_engine=cpg_engine,
+            repo_root=repo_root,
+            storage=storage,
         )
+
+        # Wire a TestRunnerAgent so the scoped test re-run step actually fires.
+        test_runner = None
+        try:
+            from agents.test_runner import TestRunnerAgent
+            test_runner = TestRunnerAgent(
+                storage=storage,
+                run_id=run_id,
+                repo_root=repo_root,
+            )
+        except Exception as exc:
+            log.debug("Could not construct TestRunnerAgent for inline audit: %s", exc)
+
         scheduler = CommitAuditScheduler(
             storage=storage,
             incremental_updater=updater,
-            test_runner=None,
+            test_runner=test_runner,
             run_id=run_id,
             repo_root=repo_root,
+            cpg_engine=cpg_engine,
         )
         record = await scheduler.schedule_from_webhook(
             changed_files=changed_files,
@@ -419,11 +485,12 @@ async def _run_inline(
             author=meta.get("author", ""),
             commit_message=meta.get("commit_message", ""),
         )
+        cpg_note = " (CPG function-level)" if cpg_engine else " (file-level, no Joern)"
         return WebhookResponse(
             accepted=True,
             record_id=record.id,
             message=(
-                f"Inline audit {record.status.value}: "
+                f"Inline audit {record.status.value}{cpg_note}: "
                 f"{record.total_functions_to_audit} functions audited"
             ),
         )
@@ -434,7 +501,6 @@ async def _run_inline(
 async def _get_storage(run_id: str):
     """Return an initialised BrainStorage instance."""
     try:
-        import os
         from pathlib import Path
         from brain.sqlite_storage import SQLiteBrainStorage
         db_path = os.environ.get(
