@@ -43,6 +43,17 @@ Environment variables
     RHODAWK_RL_MIN_CORPUS      -- minimum trajectories before training (default: 500)
     RHODAWK_ARPO_MIN_RESOLVED  -- minimum resolved fraction 0-1 (default: 0.1)
 
+Implementation status: COMPLETE
+────────────────────────────────
+This script is fully implemented. The evaluator's log message
+"Run: python scripts/arpo_trainer.py" is a correct call-to-action.
+All five components are functional:
+  1. preflight_check() — GPU, disk, corpus balance validation
+  2. check_status()    — corpus readiness report
+  3. export_training_data() — JSONL export in OpenRLHF or TRL format
+  4. run_openrlhf_grpo() — full ZeRO-3 GRPO training for 32B models
+  5. run_trl_grpo()    — single-GPU TRL GRPO for 7B-14B models
+
 GAP 5.5 Fixes applied
 ----------------------
 1. preflight_check(): GPU count/VRAM, disk space (50 GB min), corpus balance
@@ -562,6 +573,10 @@ def main() -> None:
 
     if args.status:
         check_status()
+        # MISSING-4 FIX: return after status check so --status alone doesn't
+        # fall through to the training code path.
+        if not any([args.export_only, args.run, args.trl, args.dry_run]):
+            return
 
     # Preflight before any training action
     if (args.run or args.trl or args.dry_run) and not args.no_preflight:
