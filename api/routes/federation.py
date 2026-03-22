@@ -70,6 +70,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/federation", tags=["federation"])
 
+# Collection name constant — must match the value in memory/federated_store.py
+_FED_COLLECTION = "rhodawk_fed_patterns"
+
 # ── In-process pattern store ───────────────────────────────────────────────────
 _fed_store: Any = None   # FederatedPatternStore | None
 
@@ -205,19 +208,19 @@ async def receive_pattern(
 
     from memory.federated_store import FederatedPattern
 
-    # FIX (Defect 2): use empty issue_type so the dedup scan is global —
-    # no issue_type-based bypass is possible.
-    existing = await store._retrieve_from_cache("", n=10_000)
-    for ex in existing:
-        if ex.fingerprint == body.fingerprint:
-            # FIX (Defect 1): proper 409 Conflict, not a silent 200.
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "status":      "already_known",
-                    "fingerprint": body.fingerprint,
-                },
-            )
+    # O(1) dedup check via direct point lookup — replaces the previous O(N)
+    # _retrieve_from_cache("", n=10_000) scan that loaded every stored pattern
+    # on every inbound POST.  fingerprint_exists() uses abs(hash(fingerprint))
+    # as the Qdrant point UID (identical to how _cache_pattern stores it) so
+    # the lookup is a single indexed read regardless of collection size.
+    if await store.fingerprint_exists(body.fingerprint):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status":      "already_known",
+                "fingerprint": body.fingerprint,
+            },
+        )
 
     pattern = FederatedPattern(
         fingerprint      = body.fingerprint,
@@ -313,12 +316,25 @@ async def serve_patterns(
     patterns = patterns[:n]
 
     from dataclasses import asdict
+
+    # O(1) total_patterns count via Qdrant collection info rather than the
+    # previous _retrieve_from_cache("", 10_000) full-table scan that was
+    # called on every GET /api/federation/patterns request.
+    try:
+        if store._backend == "qdrant" and store._qdrant_client:
+            info = store._qdrant_client.get_collection(_FED_COLLECTION)
+            total = info.points_count or 0
+        else:
+            total = len(store._json_load_patterns()) if store._json_path else 0
+    except Exception:
+        total = len(patterns)  # safe fallback
+
     return {
         "count":    len(patterns),
         "patterns": [asdict(p) for p in patterns],
         "registry": {
-            "instance": "rhodawk-registry",
-            "total_patterns": len(await store._retrieve_from_cache("", 10_000)),
+            "instance":       "rhodawk-registry",
+            "total_patterns": total,
         },
     }
 
