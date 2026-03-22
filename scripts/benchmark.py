@@ -53,7 +53,38 @@ def run_benchmark(
     table.add_row("Target",     f"{report.target_rate:.1%}")
     table.add_row("Beats Target", "✅ YES" if report.beats_target else "❌ NO")
     table.add_row("Avg Cost",   f"${report.avg_cost_usd:.3f}/instance")
+
+    # ARCH-01 FIX: show CPG context availability so published scores are
+    # qualified by whether full causal context was active.  A score measured
+    # without Joern is expected to be 15-20pp lower than CPG-enabled performance
+    # (cross-file bugs receive vector-similarity fallback context only).
+    # Pulling cpg_available from the health endpoint keeps this live-accurate
+    # even when the evaluator is run against a running API instance.
+    cpg_state = "unknown"
+    try:
+        from api.app import _state as _app_state
+        if _app_state.cpg_available is True:
+            cpg_state = "✅ ACTIVE (Joern connected — causal context enabled)"
+        elif _app_state.cpg_available is False:
+            cpg_state = "❌ INACTIVE (Joern not running — vector-similarity fallback)"
+        else:
+            cpg_state = "⚠️  not reported (controller not initialised)"
+    except Exception:
+        pass
+    table.add_row("CPG Context", cpg_state)
+
     console.print(table)
+
+    # ARCH-01 FIX: emit a prominent warning when CPG was not active so the
+    # score is never silently published without the qualification.
+    if "INACTIVE" in cpg_state:
+        console.print(
+            "\n[bold yellow]⚠  WARNING: This benchmark was run WITHOUT Joern/CPG context.[/bold yellow]\n"
+            "  Cross-file bugs received vector-similarity fallback context only.\n"
+            "  Expected score penalty vs CPG-enabled: -15 to -20pp.\n"
+            "  To enable: set JOERN_REPO_PATH in .env and run: docker-compose up joern\n"
+            "  Do NOT publish this score as the system's maximum capability.\n"
+        )
     raise typer.Exit(0 if report.beats_target else 1)
 
 
