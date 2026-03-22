@@ -291,8 +291,17 @@ class FixerAgent(BaseAgent):
                 fixed_files.append(ff)
         fix = FixAttempt(run_id=self.run_id, issue_ids=[i.id for i in issues], fixed_files=fixed_files, fixer_model=model, fixer_model_family=extract_model_family(model), patch_mode=PatchMode.UNIFIED_DIFF if needs_patch else PatchMode.AST_REWRITE if needs_ast else PatchMode.FULL_FILE)
         await self.storage.upsert_fix(fix)
-        if fixed_files and self.fix_memory:
-            await self._store_fix_memory(issues, fixed_files, fix.id)
+        # BUG-02 FIX: _store_fix_memory is NOT called here anymore.
+        # Previously it was called immediately after FixAttempt construction with
+        # test_result='gate_passed=True' — but at this point gate_passed is None,
+        # the static gate, reviewer, and test runner have not run. Fixes that
+        # subsequently failed the gate were permanently recorded as successful
+        # patterns in fix memory and the federated store, poisoning future prompts.
+        #
+        # Fix memory writes are now triggered by StabilizerController._phase_gate():
+        #   gate_passed=True  → _store_fix_memory (store_success + record_federated_usage)
+        #   gate_passed=False → _store_failure_memory (store_failure + record_federated_usage)
+        # This ensures the outcome recorded matches the actual gate result.
         for issue in issues:
             issue.fix_attempts += 1
             issue.status = IssueStatus.FIX_GENERATED

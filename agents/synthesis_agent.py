@@ -149,14 +149,15 @@ class SynthesisAgent(BaseAgent):
 
     # Minimum number of issues from ≥2 different domains required before
     # attempting compound finding detection.
-    #
-    # BUG FIX: was 3, which silently skipped the canonical two-issue compound
-    # case — one SECURITY finding + one ARCHITECTURE finding — that the gap
-    # spec explicitly demonstrates (auth_bypass + async_handler race =
-    # privilege escalation).  Exactly 2 issues from 2 distinct domains is the
-    # minimum meaningful cross-domain signal; anything lower is impossible
-    # (the ``len(domains_present) < 2`` guard above already enforces ≥2 domains).
     _COMPOUND_MIN_CROSS_DOMAIN_ISSUES: int = 2
+
+    # ARCH-04 FIX: cap compound detection batch size so large codebases don't
+    # overflow the LLM context window silently.
+    # Previously _detect_compound_findings ran on the full deduplicated list
+    # with no limit. A codebase with 400 findings produced a single LLM call
+    # with ~80,000 chars, truncating silently on 32K-token models.
+    _COMPOUND_BATCH_SIZE: int    = 40
+    _COMPOUND_BATCH_OVERLAP: int = 10
 
     def __init__(
         self,
@@ -379,8 +380,115 @@ class SynthesisAgent(BaseAgent):
 
         return self._apply_dedup_response(issues, resp)
 
-    async def _dedup_semantic_batched(self, issues: list[Issue]) -> list[Issue]:\n        \"\"\"\n        For lists larger than _DEDUP_BATCH_SIZE, deduplicate in overlapping\n        windows to prevent cross-batch duplicate pairs from surviving.\n\n        CORRECTNESS FIX\n        ---------------\n        The original implementation processed non-overlapping sequential windows\n        (``result[offset:offset + batch_size]``) and incremented ``offset`` by\n        the deduped window length.  A duplicate pair whose two members straddle a\n        batch boundary — issue A in the last position of window N, issue B in the\n        first position of window N+1 — would never appear in the same LLM call\n        and would survive deduplication.  This is a silent correctness failure\n        that compounds on large codebases (thousands of findings across three\n        auditor domains).\n\n        Fix strategy\n        ------------\n        1. **Cross-batch structural pre-pass**: before any LLM call, remove\n           exact structural duplicates (same file + line range + description\n           prefix) regardless of batch position.  This catches the majority of\n           cross-batch duplicates cheaply without an LLM round-trip.\n\n        2. **Overlapping windows**: each window of size _DEDUP_BATCH_SIZE overlaps\n           the previous window by _DEDUP_BATCH_OVERLAP issues.  Every pair of\n           adjacent issues therefore appears in at least one shared window as long\n           as their index distance is ≤ _DEDUP_BATCH_SIZE - _DEDUP_BATCH_OVERLAP.\n           Indices removed in one window are excluded from all subsequent windows\n           so the overlap does not re-introduce already-removed issues.\n        \"\"\"\n        if len(issues) <= self._DEDUP_BATCH_SIZE:\n            return await self._dedup_semantic(issues)\n\n        # ── Step 1: Cross-batch structural pre-pass ───────────────────────────\n        # Catch duplicates that would straddle batch boundaries using a\n        # deterministic structural key: (file_path, line_start, description_64).\n        # This is cheaper than the LLM dedup pass and catches the common case\n        # where the same finding is emitted by two different auditors in the\n        # same file at the same location.\n        struct_seen: dict[str, int] = {}   # key → first occurrence index\n        struct_remove: set[int] = set()\n        for idx, issue in enumerate(issues):\n            struct_key = (\n                f\"{issue.file_path}:{issue.line_start}:{issue.line_end}:\"\n                f\"{issue.description[:64].lower().strip()}\"\n            )\n            if struct_key in struct_seen:\n                # Keep the higher-priority one between the two\n                existing_idx = struct_seen[struct_key]\n                if self._issue_priority(issue) > self._issue_priority(issues[existing_idx]):\n                    struct_remove.add(existing_idx)\n                    struct_seen[struct_key] = idx\n                else:\n                    struct_remove.add(idx)\n            else:\n                struct_seen[struct_key] = idx\n\n        pre_deduped = [i for j, i in enumerate(issues) if j not in struct_remove]\n        if len(struct_remove) > 0:\n            self.log.info(\n                f\"[synthesis] Cross-batch structural pre-pass: \"\n                f\"removed {len(struct_remove)} duplicates before LLM batching\"\n            )\n\n        # ── Step 2: Overlapping window LLM dedup pass ─────────────────────────\n        # Track globally removed indices so overlap re-encounters don't re-add\n        # issues that an earlier window already removed.\n        removed_ids: set[str] = set()   # use issue.id for stable identity\n        result = list(pre_deduped)\n\n        step       = self._DEDUP_BATCH_SIZE - self._DEDUP_BATCH_OVERLAP\n        offset     = 0\n        iterations = 0\n        max_iter   = (len(result) // max(step, 1)) + 2   # safety bound\n\n        while offset < len(result) and iterations < max_iter:\n            iterations += 1\n            # Build the window, excluding already-removed issues\n            window_raw = result[offset : offset + self._DEDUP_BATCH_SIZE]\n            window     = [i for i in window_raw if i.id not in removed_ids]\n            if not window:\n                offset += step\n                continue\n\n            deduped_window = await self._dedup_semantic(window)\n\n            # Accumulate ids removed by this window\n            surviving_ids = {i.id for i in deduped_window}\n            for i in window:\n                if i.id not in surviving_ids:\n                    removed_ids.add(i.id)\n\n            removed_count = len(window) - len(deduped_window)\n            if removed_count > 0:\n                self.log.debug(\n                    f\"[synthesis] Overlapping batch @offset={offset}: \"\n                    f\"removed {removed_count} duplicates (window={len(window)})\"\n                )\n\n            offset += step\n\n        # Rebuild the final list in original order, excluding all removed ids\n        final = [i for i in pre_deduped if i.id not in removed_ids]\n        self.log.info(\n            f\"[synthesis] Batched dedup complete: \"\n            f\"{len(issues)} → {len(final)} \"\n            f\"(structural={len(struct_remove)} LLM={len(removed_ids)})\"\n        )\n        return final
+    async def _dedup_semantic_batched(self, issues: list[Issue]) -> list[Issue]:
+        """
+        For lists larger than _DEDUP_BATCH_SIZE, deduplicate in overlapping
+        windows to prevent cross-batch duplicate pairs from surviving.
 
+        CORRECTNESS FIX
+        ---------------
+        The original implementation processed non-overlapping sequential windows
+        (``result[offset:offset + batch_size]``) and incremented ``offset`` by
+        the deduped window length.  A duplicate pair whose two members straddle a
+        batch boundary — issue A in the last position of window N, issue B in the
+        first position of window N+1 — would never appear in the same LLM call
+        and would survive deduplication.  This is a silent correctness failure
+        that compounds on large codebases (thousands of findings across three
+        auditor domains).
+
+        Fix strategy
+        ------------
+        1. **Cross-batch structural pre-pass**: before any LLM call, remove
+           exact structural duplicates (same file + line range + description
+           prefix) regardless of batch position.  This catches the majority of
+           cross-batch duplicates cheaply without an LLM round-trip.
+
+        2. **Overlapping windows**: each window of size _DEDUP_BATCH_SIZE overlaps
+           the previous window by _DEDUP_BATCH_OVERLAP issues.  Every pair of
+           adjacent issues therefore appears in at least one shared window as long
+           as their index distance is ≤ _DEDUP_BATCH_SIZE - _DEDUP_BATCH_OVERLAP.
+           Indices removed in one window are excluded from all subsequent windows
+           so the overlap does not re-introduce already-removed issues.
+        """
+        if len(issues) <= self._DEDUP_BATCH_SIZE:
+            return await self._dedup_semantic(issues)
+
+        # ── Step 1: Cross-batch structural pre-pass ───────────────────────────
+        # Catch duplicates that would straddle batch boundaries using a
+        # deterministic structural key: (file_path, line_start, description_64).
+        # This is cheaper than the LLM dedup pass and catches the common case
+        # where the same finding is emitted by two different auditors in the
+        # same file at the same location.
+        struct_seen: dict[str, int] = {}   # key → first occurrence index
+        struct_remove: set[int] = set()
+        for idx, issue in enumerate(issues):
+            struct_key = (
+                f"{issue.file_path}:{issue.line_start}:{issue.line_end}:"
+                f"{issue.description[:64].lower().strip()}"
+            )
+            if struct_key in struct_seen:
+                # Keep the higher-priority one between the two
+                existing_idx = struct_seen[struct_key]
+                if self._issue_priority(issue) > self._issue_priority(issues[existing_idx]):
+                    struct_remove.add(existing_idx)
+                    struct_seen[struct_key] = idx
+                else:
+                    struct_remove.add(idx)
+            else:
+                struct_seen[struct_key] = idx
+
+        pre_deduped = [i for j, i in enumerate(issues) if j not in struct_remove]
+        if len(struct_remove) > 0:
+            self.log.info(
+                f"[synthesis] Cross-batch structural pre-pass: "
+                f"removed {len(struct_remove)} duplicates before LLM batching"
+            )
+
+        # ── Step 2: Overlapping window LLM dedup pass ─────────────────────────
+        # Track globally removed indices so overlap re-encounters don't re-add
+        # issues that an earlier window already removed.
+        removed_ids: set[str] = set()   # use issue.id for stable identity
+        result = list(pre_deduped)
+
+        step       = self._DEDUP_BATCH_SIZE - self._DEDUP_BATCH_OVERLAP
+        offset     = 0
+        iterations = 0
+        max_iter   = (len(result) // max(step, 1)) + 2   # safety bound
+
+        while offset < len(result) and iterations < max_iter:
+            iterations += 1
+            # Build the window, excluding already-removed issues
+            window_raw = result[offset : offset + self._DEDUP_BATCH_SIZE]
+            window     = [i for i in window_raw if i.id not in removed_ids]
+            if not window:
+                offset += step
+                continue
+
+            deduped_window = await self._dedup_semantic(window)
+
+            # Accumulate ids removed by this window
+            surviving_ids = {i.id for i in deduped_window}
+            for i in window:
+                if i.id not in surviving_ids:
+                    removed_ids.add(i.id)
+
+            removed_count = len(window) - len(deduped_window)
+            if removed_count > 0:
+                self.log.debug(
+                    f"[synthesis] Overlapping batch @offset={offset}: "
+                    f"removed {removed_count} duplicates (window={len(window)})"
+                )
+
+            offset += step
+
+        # Rebuild the final list in original order, excluding all removed ids
+        final = [i for i in pre_deduped if i.id not in removed_ids]
+        self.log.info(
+            f"[synthesis] Batched dedup complete: "
+            f"{len(issues)} → {len(final)} "
+            f"(structural={len(struct_remove)} LLM={len(removed_ids)})"
+        )
+        return final
     def _apply_dedup_response(
         self,
         issues: list[Issue],
@@ -411,24 +519,14 @@ class SynthesisAgent(BaseAgent):
         """
         Detect cross-domain compound findings.
 
-        A compound finding is a vulnerability that:
-          - Requires information from ≥2 auditor domains to identify
-          - Is MORE severe than any single-domain finding because the
-            combined effect enables an attack vector that neither domain
-            can see alone
-          - Requires a more comprehensive fix than patching a single issue
+        ARCH-04 FIX: runs in overlapping batches of _COMPOUND_BATCH_SIZE (40)
+        to prevent silent LLM context overflow. Previously this ran unbounded on
+        the full deduplicated list — 400 findings = ~80,000 chars = silent
+        truncation on 32K-token models. Results are deduplicated across batches.
 
-        Examples:
-          • Race condition (ARCHITECTURE) + auth bypass (SECURITY)
-            → race-condition-enabled privilege escalation
-          • Integer overflow (SECURITY/STANDARDS) + missing bounds check
-            (STANDARDS) + network input path (ARCHITECTURE)
-            → remote integer overflow exploit
-          • Memory management violation (STANDARDS) + callback into freed
-            object (ARCHITECTURE) + user-controlled trigger (SECURITY)
-            → use-after-free with user-controlled exploitation path
+        A compound finding requires information from ≥2 auditor domains and
+        is more severe than any single-domain finding in isolation.
         """
-        # Need findings from ≥2 different domains for cross-domain analysis
         domains_present = {i.executor_type for i in issues}
         if len(domains_present) < 2:
             self.log.debug(
@@ -444,6 +542,59 @@ class SynthesisAgent(BaseAgent):
             )
             return []
 
+        # Small list: run directly without batching overhead
+        if len(issues) <= self._COMPOUND_BATCH_SIZE:
+            return await self._detect_compound_findings_batch(issues)
+
+        # ARCH-04: overlapping batches for large issue lists
+        total_batches = max(
+            1,
+            (len(issues) - self._COMPOUND_BATCH_OVERLAP) //
+            (self._COMPOUND_BATCH_SIZE - self._COMPOUND_BATCH_OVERLAP) + 1
+        )
+        self.log.info(
+            "[synthesis] Compound detection: %d issues → %d overlapping batch(es) "
+            "(batch_size=%d overlap=%d)",
+            len(issues), total_batches,
+            self._COMPOUND_BATCH_SIZE, self._COMPOUND_BATCH_OVERLAP,
+        )
+
+        all_compounds: list[CompoundFinding] = []
+        seen_keys: set[str] = set()
+        step   = self._COMPOUND_BATCH_SIZE - self._COMPOUND_BATCH_OVERLAP
+        offset = 0
+
+        while offset < len(issues):
+            batch = issues[offset: offset + self._COMPOUND_BATCH_SIZE]
+            if len({i.executor_type for i in batch}) >= 2:
+                try:
+                    batch_results = await self._detect_compound_findings_batch(batch)
+                    for cf in batch_results:
+                        key = f"{cf.title.lower()[:60]}"
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_compounds.append(cf)
+                except Exception as exc:
+                    self.log.warning(
+                        "[synthesis] Compound batch @offset=%d failed: %s", offset, exc
+                    )
+            offset += step
+            if len(all_compounds) >= self.max_compound_findings:
+                break
+
+        self.log.info(
+            "[synthesis] Compound detection complete: %d unique findings across batches",
+            len(all_compounds),
+        )
+        return all_compounds[:self.max_compound_findings]
+
+    async def _detect_compound_findings_batch(
+        self, issues: list[Issue]
+    ) -> list[CompoundFinding]:
+        """
+        Run compound detection on one bounded batch. Do not call directly —
+        use _detect_compound_findings() which handles batching and dedup.
+        """
         # Build a rich summary grouping by domain
         domain_summaries = self._build_domain_grouped_summary(issues)
         summary_lines    = self._build_issue_summary(issues)
@@ -503,7 +654,6 @@ class SynthesisAgent(BaseAgent):
             f"Summary: {resp.synthesis_summary[:200]}"
         )
 
-        # Convert raw LLM response → CompoundFinding objects
         compound: list[CompoundFinding] = []
         for raw in resp.compound_findings[:self.max_compound_findings]:
             cf = self._raw_to_compound(raw, issues)
