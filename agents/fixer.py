@@ -419,9 +419,20 @@ class FixerAgent(BaseAgent):
                 raw_query = ' '.join(i.description[:100] for i in issues[:3])
                 query = self._normalize_bug_class(raw_query)
                 # Retrieve a generous set so we can count without trimming.
-                entries = self.fix_memory.retrieve(
-                    query, n=20, max_age_days=window_days
-                )
+                # FIX: _check_bug_recurrence is async — calling the sync
+                # retrieve() here drops federated augmentation silently because
+                # retrieve() detects the running event loop and defers the peer
+                # pull to a background task that resolves after this method
+                # returns.  Use retrieve_async() so federation is live and the
+                # recurrence counter includes cross-deployment pattern history.
+                if hasattr(self.fix_memory, 'retrieve_async'):
+                    entries = await self.fix_memory.retrieve_async(
+                        query, n=20, max_age_days=window_days
+                    )
+                else:
+                    entries = self.fix_memory.retrieve(
+                        query, n=20, max_age_days=window_days
+                    )
                 successful = [
                     e for e in entries
                     if not getattr(e, 'fix_approach', '').startswith('[REVERTED]')

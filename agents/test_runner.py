@@ -24,6 +24,23 @@ GAP 4 FIXES
   exercise the functions identified in the CPG impact set, not the full suite.
   Fixed: ``run_for_functions()`` builds a pytest ``-k`` expression from the
   function names and runs only matching tests.
+
+UNIVERSAL TEST RUNNER FIX
+──────────────────────────
+• _detect_and_run() previously only handled pytest and ``make test``.
+  Every other ecosystem (Go, Rust, Java/Kotlin/Gradle/Maven, JavaScript/
+  Jest/Vitest/Mocha, CMake/CTest, Linux KUnit/kselftest, LLVM lit) silently
+  returned NO_TESTS — the fixer had zero signal whether its patches passed
+  or failed, the mutation testing gate never ran, and the SWE-bench score
+  was artificially low because bad fixes passed undetected.
+
+  Fixed: _detect_and_run() now delegates to UniversalTestRunner which
+  auto-detects the framework from repo layout and runs the right tool.
+  Falls back to the original pytest/_run_make_test path if the universal
+  runner raises unexpectedly — no regression for existing Python repos.
+
+  UniversalTestResult is mapped to TestRunResult so all downstream
+  consumers (storage, coverage gate, mutation gate) work unchanged.
 """
 from __future__ import annotations
 
@@ -143,6 +160,91 @@ class TestRunnerAgent(BaseAgent):
         changed_files:    list[str],
         target_functions: list[str],
     ) -> TestRunResult:
+        """
+        Detect the test framework and run tests.
+
+        Delegates to UniversalTestRunner which auto-detects the framework
+        from the repo layout (go.mod, Cargo.toml, pom.xml, build.gradle,
+        package.json, CMakeLists.txt, Kconfig, lit.cfg, pytest.ini, etc.)
+        and dispatches to the correct runner.  Covers:
+
+            Python     → pytest
+            Go         → go test
+            Rust       → cargo test
+            Java       → maven / gradle
+            Kotlin     → gradle
+            JavaScript → jest / vitest / mocha / npm test
+            C/C++      → ctest / make test
+            Kernel     → kunit / kselftest
+            LLVM       → llvm-lit
+            Scala      → sbt test
+            Fallback   → make test
+
+        Called from run_in_executor (thread-pool context) so asyncio.run()
+        is safe here — there is no running event loop in this thread.
+        """
+        try:
+            from agents.test_runner_universal import (
+                UniversalTestRunner,
+                UniversalTestResult,
+            )
+
+            # asyncio.run() is safe: we are in a thread-pool worker thread
+            # launched by loop.run_in_executor(), so there is no running loop
+            # in this thread.
+            universal_result: UniversalTestResult = asyncio.run(
+                UniversalTestRunner(
+                    repo_root=self.repo_root,
+                    run_id=self.run_id,
+                ).run(
+                    changed_files=changed_files or None,
+                    target_functions=target_functions or None,
+                )
+            )
+
+            # Map UniversalTestResult → TestRunResult
+            _status_map = {
+                "PASSED":   TestRunStatus.PASSED,
+                "FAILED":   TestRunStatus.FAILED,
+                "ERROR":    TestRunStatus.ERROR,
+                "TIMEOUT":  TestRunStatus.ERROR,
+                "NO_TESTS": TestRunStatus.NO_TESTS,
+            }
+            status = _status_map.get(
+                universal_result.status, TestRunStatus.NO_TESTS
+            )
+            log.info(
+                "[test_runner] UniversalTestRunner: framework=%s "
+                "status=%s passed=%d failed=%d",
+                universal_result.framework,
+                universal_result.status,
+                universal_result.passed,
+                universal_result.failed,
+            )
+            return TestRunResult(
+                status=status,
+                passed=universal_result.passed,
+                failed=universal_result.failed,
+                errors=universal_result.errors,
+                skipped=universal_result.skipped,
+                coverage_pct=universal_result.coverage_pct,
+                output=universal_result.output[-3000:],
+                duration_s=universal_result.duration_s,
+            )
+
+        except ImportError:
+            # UniversalTestRunner not available — fall back to original logic.
+            log.debug(
+                "[test_runner] UniversalTestRunner not available — "
+                "falling back to pytest/make"
+            )
+        except Exception as exc:
+            log.warning(
+                "[test_runner] UniversalTestRunner failed (%s) — "
+                "falling back to pytest/make", exc
+            )
+
+        # ── Original fallback path (Python/make only) ─────────────────────
         if shutil.which("pytest"):
             return self._run_pytest(changed_files, target_functions)
         if (self.repo_root / "Makefile").exists():
