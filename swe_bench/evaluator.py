@@ -982,6 +982,25 @@ class SWEBenchEvaluator:
     @staticmethod
     def _log_report(report: BenchmarkReport) -> None:
         status = "✅ BEATS TARGET" if report.beats_target else "❌ BELOW TARGET"
+
+        # ARCH-01 FIX: qualify the benchmark output with CPG context state.
+        # A score produced without Joern is systematically lower for cross-file
+        # bugs and must not be published or compared to CPG-enabled results.
+        try:
+            from api.app import _state as _app_state
+            if _app_state.cpg_available is True:
+                cpg_line = "CPG context:     ✅ ACTIVE (Joern — causal context)"
+            elif _app_state.cpg_available is False:
+                cpg_line = (
+                    "CPG context:     ❌ INACTIVE — vector-similarity fallback\n"
+                    "                 Expected penalty: -15 to -20pp vs CPG-enabled\n"
+                    "                 DO NOT publish without this qualification"
+                )
+            else:
+                cpg_line = "CPG context:     ⚠  unknown (controller not initialised)"
+        except Exception:
+            cpg_line = "CPG context:     ⚠  unknown"
+
         log.info(
             f"\n{'='*65}\n"
             f"SWE-bench Verified Results — GAP 5 Pipeline\n"
@@ -999,6 +1018,7 @@ class SWEBenchEvaluator:
             + (f", avg score {report.avg_mutation_score:.1f}%" if report.mutation_usage_rate > 0 else " (mutmut not installed or no Python files)")
             + f"\n"
             f"RL corpus:       {report.trajectory_corpus_size} trajectories\n"
+            f"{cpg_line}\n"
             f"{'='*65}"
         )
 
