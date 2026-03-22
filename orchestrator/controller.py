@@ -664,6 +664,20 @@ class StabilizerController:
                     "To enable full CPG: docker-compose up joern"
                 )
 
+            # ARCH-01 FIX: report CPG availability to the /health endpoint so
+            # operators can see at a glance whether causal context is active.
+            # cpg_available=True  → Joern connected, full CPG context in use.
+            # cpg_available=False → Joern absent, every fix uses vector-similarity
+            #                       fallback (lower quality for cross-file bugs).
+            try:
+                from api.app import inject_cpg_state
+                inject_cpg_state(bool(connected))
+            except Exception as _cpg_state_exc:
+                self.log.debug(
+                    "CPG state injection skipped (API app not loaded): %s",
+                    _cpg_state_exc,
+                )
+
             # ProgramSlicer wraps CPGEngine with LLM-friendly output
             self._program_slicer = ProgramSlicer(
                 cpg_engine=self._cpg_engine,
@@ -733,6 +747,13 @@ class StabilizerController:
             self._cpg_context_selector   = None
             self._incremental_updater    = None
             self._commit_audit_scheduler = None
+            # ARCH-01 FIX: surface CPG unavailability in the health endpoint
+            # even when init raised an exception.
+            try:
+                from api.app import inject_cpg_state
+                inject_cpg_state(False)
+            except Exception:
+                pass
 
     async def _init_gap6(self) -> None:
         """
@@ -1237,6 +1258,24 @@ class StabilizerController:
                     if cf.severity == Severity.CRITICAL
                 )
                 total_deduped = raw_count - len(deduped_issues)
+
+                # ARCH-03 FIX: compute BoBN-inactive stats to persist in the
+                # SynthesisReport so the API, dashboards, and benchmark output
+                # can qualify scores by whether the full composite signal was
+                # available.  SynthesisAgent already computes these values and
+                # logs them; here we extract them for structured persistence.
+                _no_fail_tests = sum(1 for i in deduped_issues if not i.fail_tests)
+                _bobn_inactive_pct = (
+                    _no_fail_tests / len(deduped_issues) * 100.0
+                ) if deduped_issues else 0.0
+                # heuristic_tests_matched is written back onto the issue objects
+                # by SynthesisAgent._populate_fail_tests_heuristic(); the count
+                # after the run is the difference between the initial no-test
+                # count and whatever remains.  We approximate it as the agent
+                # already logged the exact count; use 0 as the conservative
+                # default so we never over-claim coverage.
+                _heuristic_matched = getattr(synthesis_agent, "_last_heuristic_matched", 0)
+
                 synthesis_report = SynthesisReport(
                     run_id=self.run.id,
                     cycle=self.run.cycle_count,
@@ -1250,6 +1289,9 @@ class StabilizerController:
                     dedup_enabled=self.config.synthesis_dedup_enabled,
                     compound_enabled=self.config.synthesis_compound_enabled,
                     duration_s=_synthesis_duration_s,
+                    issues_without_fail_tests=_no_fail_tests,
+                    bobn_inactive_pct=_bobn_inactive_pct,
+                    heuristic_tests_matched=_heuristic_matched,
                 )
                 try:
                     await self.storage.upsert_synthesis_report(synthesis_report)
@@ -1258,6 +1300,9 @@ class StabilizerController:
                         f"raw={raw_count} deduped={len(deduped_issues)} "
                         f"compound={len(compound_findings)} "
                         f"(critical={compound_critical}) "
+                        f"bobn_inactive={_bobn_inactive_pct:.0f}% "
+                        f"no_fail_tests={_no_fail_tests} "
+                        f"heuristic_matched={_heuristic_matched} "
                         f"duration={_synthesis_duration_s:.1f}s"
                     )
                 except Exception as report_exc:
