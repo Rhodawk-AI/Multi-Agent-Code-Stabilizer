@@ -134,17 +134,32 @@ async def lifespan(app: FastAPI):
     # Runs as a fire-and-forget background task so it does not block startup
     # from accepting traffic; the scheduler is idempotent so a concurrent
     # webhook for the same SHA will be deduplicated automatically.
-    asyncio.create_task(_startup_commit_catchup(app))
+    startup_task = asyncio.create_task(_startup_commit_catchup(app))
 
     yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("Rhodawk AI API shutting down")
+
+    # MISSING-2 FIX: cancel the background git-poll loop so asyncio does not
+    # log "Task was destroyed but it is pending" warnings during shutdown.
+    scheduler = getattr(app.state, "scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "stop_background_poll"):
+        scheduler.stop_background_poll()
+
+    # Cancel the startup task if it is still waiting for the scheduler to appear
+    # (happens when the API is stopped immediately after starting).
+    if not startup_task.done():
+        startup_task.cancel()
 
 
 async def _startup_commit_catchup(app: FastAPI) -> None:
     """
-    MISSING-2 FIX: On every API startup, ask the CommitAuditScheduler to
-    replay any commits that landed in the gap window (service downtime,
-    webhook timeout, no-webhook repos).
+    MISSING-2 FIX: On every API startup:
+      1. Ask the CommitAuditScheduler to replay any commits that landed in the
+         gap window (service downtime, webhook timeout, no-webhook repos).
+      2. Start the continuous background git-polling loop so commits that arrive
+         mid-session through a broken or missing webhook are still processed.
 
     The scheduler is expected to be stored on ``app.state.scheduler`` by
     StabilizerController after initialise() wires its subsystems into the
@@ -153,7 +168,11 @@ async def _startup_commit_catchup(app: FastAPI) -> None:
 
     We wait up to 30 seconds for the scheduler to appear (controller
     initialise() runs concurrently on first /api/runs/start) before giving up.
+
+    Poll interval is read from RHODAWK_POLL_INTERVAL_S (default: 60 seconds).
     """
+    poll_interval_s = float(os.environ.get("RHODAWK_POLL_INTERVAL_S", "60"))
+
     scheduler = None
     for _ in range(30):
         scheduler = getattr(app.state, "scheduler", None)
@@ -164,10 +183,12 @@ async def _startup_commit_catchup(app: FastAPI) -> None:
     if scheduler is None:
         log.debug(
             "[startup] No CommitAuditScheduler on app.state — "
-            "missed-commit replay skipped (normal for API-only deployments)"
+            "missed-commit replay and poll loop skipped "
+            "(normal for API-only deployments)"
         )
         return
 
+    # ── Step 1: one-shot startup replay ──────────────────────────────────────
     try:
         log.info("[startup] Running missed-commit replay via CommitAuditScheduler …")
         records = await scheduler.replay_missed_commits(max_commits=50)
@@ -176,9 +197,28 @@ async def _startup_commit_catchup(app: FastAPI) -> None:
             len(records),
         )
     except Exception as exc:
-        # Non-fatal: the API continues to serve traffic; the next webhook or
-        # manual trigger will catch any remaining gaps.
+        # Non-fatal: the API continues to serve traffic; the poll loop and the
+        # next webhook or manual trigger will catch any remaining gaps.
         log.warning("[startup] Missed-commit replay failed (non-fatal): %s", exc)
+
+    # ── Step 2: start continuous background polling loop ─────────────────────
+    # MISSING-2 FIX: the startup replay runs once per restart but cannot catch
+    # commits that arrive mid-session through a broken or absent webhook.
+    # The poll loop fills this gap by periodically calling replay_missed_commits
+    # on a configurable interval.
+    try:
+        scheduler.start_background_poll(
+            poll_interval_s=poll_interval_s,
+            max_commits_per_poll=20,
+        )
+        log.info(
+            "[startup] Background git-poll loop started (interval=%ss)",
+            poll_interval_s,
+        )
+    except Exception as exc:
+        log.warning(
+            "[startup] Could not start background poll loop (non-fatal): %s", exc
+        )
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
