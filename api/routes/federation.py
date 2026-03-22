@@ -133,25 +133,8 @@ class UsageFeedback(BaseModel):
 
 _FP_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Identifies tokens that look like un-normalized user identifiers.
-# A correctly normalized pattern should have only: structural markers,
-# ID0/ID1/... slots, <str>/<num> literals, and language keywords.
-_SUSPECT_IDENTIFIER_RE = re.compile(
-    r"\b(?!func_|var_|arg_|cls_|mod_|id_|ID\d|<)[A-Za-z][a-zA-Z0-9]{4,}\b"
-)
-
-# SEC-2: detect long prose runs — sequences of word-like tokens with no
-# structural markers, indicating natural language or embedded instructions
-# rather than normalized structural code tokens.
-# A real normalized pattern has structural markers ([if_statement], brackets,
-# operators) interspersed throughout. A sequence of 7+ consecutive word-like
-# tokens with no punctuation or structural markers is anomalous.
-_PROSE_RUN_RE = re.compile(
-    r"(?<![<\[\(])\b[A-Za-z]{3,}\b(?:\s+\b[A-Za-z]{3,}\b){6,}(?![>\]\)])"
-)
-
-# SEC-2: comment patterns across common languages.
-# These are stripped from normalized_text before storage to prevent
+# Comment patterns across common languages.
+# Stripped from normalized_text before storage and validation to prevent
 # instruction injection via comment-embedded text.
 _COMMENT_PATTERNS = [
     re.compile(r"//[^\n]*",           re.MULTILINE),   # C/C++/JS/Java/Go single-line
@@ -168,32 +151,57 @@ _COMMENT_PATTERNS = [
 
 
 def _strip_comments(text: str) -> str:
-    """
-    SEC-2 FIX: Strip all comment syntax from normalized_text before
-    storage and validation. Comment text survives PatternNormalizer's
-    tree-sitter CST walk (comment nodes are dropped as text but their
-    content can be reconstructed from the diff in the regex fallback
-    path). Stripping comment syntax here closes the injection vector.
-    """
+    """Strip all comment syntax from normalized_text before storage."""
     for pattern in _COMMENT_PATTERNS:
         text = pattern.sub(" ", text)
-    # Collapse multiple spaces left by stripping
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def _validate_pattern(body: PatternSubmission) -> str:
+# SEC-02 FIX: strict structural token allowlist.
+# The previous _SUSPECT_IDENTIFIER_RE + _PROSE_RUN_RE heuristics could be
+# bypassed by fragmenting natural-language instructions across structural
+# tokens, e.g.:
+#   [if_statement] ID0 SYSTEM: ID1 ignore [return_statement] ID2 prior ID3 instructions
+# Each substring had ≤6 consecutive word-like tokens — passing _PROSE_RUN_RE.
+# With up to 10 "suspect" tokens allowed, an attacker had budget to embed
+# exactly 10 carefully chosen instruction words.
+#
+# Fix: a correctly normalized pattern from PatternNormalizer must consist
+# ONLY of structural markers, IDN slots, <str>/<num> literals, language
+# keywords, and punctuation. ANY token outside these categories is rejected.
+
+_STRUCTURAL_MARKER_RE = re.compile(r"^\[/?[a-z][a-z0-9_]*\]$")
+_SLOT_TOKEN_RE        = re.compile(r"^ID\d+$")
+_LITERAL_TOKEN_RE     = re.compile(r"^<(?:str|num)>$")
+_LANG_KEYWORDS: frozenset[str] = frozenset({
+    "if", "else", "elif", "for", "while", "do", "switch", "case", "default",
+    "break", "continue", "return", "yield", "try", "catch", "except", "finally",
+    "raise", "throw", "new", "delete", "import", "from", "as", "with",
+    "class", "struct", "enum", "interface", "trait", "impl", "fn", "func",
+    "function", "def", "let", "var", "const", "val", "mut", "pub", "priv",
+    "static", "final", "abstract", "override", "virtual", "async", "await",
+    "true", "false", "null", "nil", "none", "self", "this", "super",
+    "and", "or", "not", "in", "is", "instanceof", "typeof", "sizeof",
+    "void", "int", "float", "bool", "string", "char", "byte", "long",
+    "short", "double", "unsigned", "signed", "auto", "type", "any",
+})
+_PUNCT_ONLY_RE = re.compile(r"^[(){}\[\]:;,.<>!&|^~+\-*/%=@#?'\"\\]+$")
+
+
+def _validate_pattern(body: "PatternSubmission") -> str:
     """
-    Validate pattern submission and return sanitized normalized_text.
+    Validate and sanitize a pattern submission.
 
-    SEC-2 FIX: Three-layer validation:
-    1. Fingerprint format check (existing).
-    2. Comment stripping + prose run detection (new).
-    3. Un-normalized identifier count (existing, now applied to stripped text).
+    SEC-02 FIX: Two layers:
+    1. Fingerprint format check.
+    2. Comment stripping then strict structural token allowlist — every token
+       must be a structural marker, IDN slot, <str>/<num>, language keyword,
+       or punctuation. Any word-form token outside these categories is rejected,
+       closing the prose-fragmentation bypass in the previous heuristic.
 
-    Returns the sanitized normalized_text to store.
-    Raises HTTPException on any validation failure.
+    Returns the sanitized normalized_text. Raises HTTPException on violation.
     """
     if not _FP_RE.match(body.fingerprint):
         raise HTTPException(
@@ -201,32 +209,33 @@ def _validate_pattern(body: PatternSubmission) -> str:
             detail="fingerprint must be a 64-char lowercase hex SHA-256",
         )
 
-    # SEC-2 Layer 1: strip all comment syntax.
+    # Layer 1: strip all comment syntax before allowlist check
     sanitized = _strip_comments(body.normalized_text)
 
-    # SEC-2 Layer 2: prose-run detection — reject text containing long
-    # natural-language sentences. These are anomalous in a structural
-    # code token sequence and indicate potential instruction injection.
-    prose_runs = _PROSE_RUN_RE.findall(sanitized)
-    if prose_runs:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"normalized_text contains long prose runs "
-                f"({len(prose_runs)} detected). "
-                "Structural patterns should not contain natural-language sentences. "
-                "Re-run PatternNormalizer on the original fix diff."
-            ),
-        )
+    # Layer 2: strict token allowlist
+    suspect_tokens: list[str] = []
+    for token in sanitized.split():
+        if not token:
+            continue
+        if (
+            _STRUCTURAL_MARKER_RE.match(token) or
+            _SLOT_TOKEN_RE.match(token) or
+            _LITERAL_TOKEN_RE.match(token) or
+            token.lower() in _LANG_KEYWORDS or
+            _PUNCT_ONLY_RE.match(token)
+        ):
+            continue
+        suspect_tokens.append(token)
 
-    # Layer 3: un-normalized identifier count (applied to sanitized text).
-    suspects = _SUSPECT_IDENTIFIER_RE.findall(sanitized)
-    if len(suspects) > 10:
+    if suspect_tokens:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"normalized_text appears to contain un-normalized identifiers "
-                f"({len(suspects)} suspect tokens). Re-run PatternNormalizer."
+                f"normalized_text contains {len(suspect_tokens)} token(s) that are "
+                "not valid structural markers, slot tokens (IDN), literal placeholders "
+                "(<str>/<num>), language keywords, or punctuation: "
+                f"{suspect_tokens[:5]}. Re-run PatternNormalizer on the original "
+                "fix diff to produce a valid normalized pattern."
             ),
         )
 
@@ -373,7 +382,18 @@ async def serve_patterns(
 
     return {
         "count":    len(patterns),
-        "patterns": [asdict(p) for p in patterns],
+        # ADD-04 FIX: exclude source_instance from the response.
+        # source_instance is a 24-char SHA-256 of the contributing deployment's
+        # instance_id. Returning it verbatim allows a passive observer on a shared
+        # registry to correlate which patterns came from which deployment across
+        # multiple GET requests, potentially enabling inference of the origin
+        # codebase's characteristics. Stripping it here means peers receive the
+        # structural pattern data needed for few-shot examples without the
+        # provenance field that enables this correlation.
+        "patterns": [
+            {k: v for k, v in asdict(p).items() if k != "source_instance"}
+            for p in patterns
+        ],
         "registry": {
             "instance":       "rhodawk-registry",
             "total_patterns": total,
