@@ -64,7 +64,7 @@ Environment variables
   RHODAWK_BENCH_SPLIT      — dataset split (default: test)
   RHODAWK_BENCH_LIMIT      — max instances to evaluate (default: all)
   RHODAWK_BENCH_WORKERS    — parallel evaluation workers (default: 4)
-  RHODAWK_BOBN_CANDIDATES  — total BoBN candidates per instance (default: 5)
+  RHODAWK_BOBN_CANDIDATES  — total BoBN candidates per instance (default: 10, matches router.BOBN_N_CANDIDATES)
   RHODAWK_MAX_FEEDBACK_ROUNDS — test-execute rounds per candidate (default: 3)
   RHODAWK_DISABLE_BOBN     — "1" to use legacy one-shot crew (debugging only)
   RHODAWK_DISABLE_LOCALIZE — "1" to skip localization (debugging only)
@@ -92,6 +92,15 @@ _SPLIT    = os.environ.get("RHODAWK_BENCH_SPLIT",   "test")
 _LIMIT    = int(os.environ.get("RHODAWK_BENCH_LIMIT", "0"))
 _WORKERS  = int(os.environ.get("RHODAWK_BENCH_WORKERS", "4"))
 _TARGET   = 0.90  # GAP 5 target: beat Claude Opus 4 (72.5%)
+
+# BUG-5 FIX: Import BOBN_N_CANDIDATES from models.router so the evaluator
+# and the production pipeline use the same default (10, not 5).
+# Previously the evaluator documented default=5, the router defaulted to 10,
+# and any benchmark run measured a system with N=5 while production ran N=10.
+try:
+    from models.router import BOBN_N_CANDIDATES as _BOBN_N_CANDIDATES
+except ImportError:
+    _BOBN_N_CANDIDATES = int(os.environ.get("RHODAWK_BOBN_CANDIDATES", "10"))
 
 _DISABLE_BOBN     = os.environ.get("RHODAWK_DISABLE_BOBN",     "0") == "1"
 _DISABLE_LOCALIZE = os.environ.get("RHODAWK_DISABLE_LOCALIZE", "0") == "1"
@@ -231,18 +240,38 @@ async def evaluate_patch_docker(
     patch:    str,
     timeout:  int = 300,
 ) -> bool:
-    try:
-        import docker
-    except ImportError:
-        log.warning("docker not installed — using heuristic evaluation")
-        return _heuristic_eval(patch, instance)
+    """
+    BUG-4 FIX: The previous implementation fell back to a word-overlap
+    heuristic (_heuristic_eval) when the docker SDK was not installed or when
+    the Docker eval failed. That heuristic returned True whenever a patch
+    contained 2 or more words from the problem statement — trivially satisfied
+    by any patch that touched the relevant file. Any score produced against
+    that heuristic was fabricated and incomparable to published SWE-bench baselines.
 
+    Fix:
+    1. ImportError on docker raises RuntimeError immediately — forces the
+       operator to install docker before running benchmarks.
+    2. Docker execution failures log the full error and raise rather than
+       falling back to heuristic evaluation. A score is only reported when
+       the official harness actually ran.
+    3. _heuristic_eval is removed entirely to prevent accidental use.
+    """
     try:
-        import tempfile
-        client = docker.from_env()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            patch_file = Path(tmpdir) / "patch.diff"
-            patch_file.write_text(patch, encoding="utf-8")
+        import docker  # type: ignore[import]
+    except ImportError:
+        raise RuntimeError(
+            "docker SDK not installed — cannot run official SWE-bench evaluation. "
+            "Install with: pip install docker>=6.0  "
+            "The docker package must be present for benchmark scores to be valid and "
+            "comparable to published baselines."
+        )
+
+    import tempfile
+    client = docker.from_env()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        patch_file = Path(tmpdir) / "patch.diff"
+        patch_file.write_text(patch, encoding="utf-8")
+        try:
             result = client.containers.run(
                 image="ghcr.io/princeton-nlp/swe-bench-eval:latest",
                 command=[
@@ -257,20 +286,16 @@ async def evaluate_patch_docker(
                 timeout=timeout,
             )
             return "RESOLVED" in result.decode(errors="replace").upper()
-    except Exception as exc:
-        log.debug(f"Docker eval failed for {instance.instance_id}: {exc}")
-        return _heuristic_eval(patch, instance)
-
-
-def _heuristic_eval(patch: str, instance: SWEInstance) -> bool:
-    if not patch or len(patch) < 20:
-        return False
-    words_in_problem = set(instance.problem_stmt.lower().split())
-    patch_lower      = patch.lower()
-    matches = sum(
-        1 for w in words_in_problem if len(w) > 4 and w in patch_lower
-    )
-    return matches >= 2
+        except Exception as exc:
+            # Log the full error and raise — do NOT fall back to heuristics.
+            # A failed Docker eval means no result, not a fabricated result.
+            log.error(
+                f"Docker eval failed for {instance.instance_id}: {exc}. "
+                "Check that Docker is running, the eval image is pulled "
+                "(docker pull ghcr.io/princeton-nlp/swe-bench-eval:latest), "
+                "and the instance environment is correctly configured."
+            )
+            raise
 
 
 # ──────────────────────────────────────────────────────────────────────────────
