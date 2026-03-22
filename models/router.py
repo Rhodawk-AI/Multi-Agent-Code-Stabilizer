@@ -274,6 +274,31 @@ class TieredModelRouter:
         self._vllm_critic_url     = os.environ.get("VLLM_CRITIC_BASE_URL", "")
         self._vllm_synthesis_url  = os.environ.get("VLLM_SYNTHESIS_BASE_URL", "")
 
+        # BUG-6 FIX (runtime): Cache the critic model's family at init time so
+        # _select_model can enforce family independence at *inference time*, not
+        # only at startup via assert_family_independence().  The startup check
+        # validates the *configured* model names; this cache is what guards
+        # against a misconfigured _TIER_CLOUD_FALLBACK silently producing a
+        # collision when a tier degrades mid-run.
+        #
+        # Import is deferred to avoid a circular import at module load time.
+        # If the import fails (e.g. verification package not installed) we set
+        # the cache to None — the runtime guard is skipped but a WARNING is
+        # emitted so the operator knows family isolation may not be enforced.
+        self._critic_family: str | None = None
+        try:
+            from verification.independence_enforcer import extract_model_family
+            self._critic_family = extract_model_family(self.critic_model())
+            log.debug(
+                "[router] Critic family cached for runtime guard: %s",
+                self._critic_family,
+            )
+        except Exception as exc:
+            log.warning(
+                "[router] Could not cache critic family for runtime guard — "
+                "family isolation will NOT be enforced at inference time: %s", exc
+            )
+
     # ── GAP 5: Model selectors ────────────────────────────────────────────────
 
     def primary_model(self, task: str = "fix") -> str:
@@ -556,25 +581,40 @@ class TieredModelRouter:
         ModelTier.VLLM_SYNTHESIS: "openrouter/deepseek/deepseek-coder-v2-0724",
     }
 
-    def _select_model(self, tier: ModelTier, models: list[str]) -> str:
+    def _select_model(self, tier: ModelTier, models: list[str]) -> str:  # noqa: C901
         """
-        BUG-6 FIX: When a local vLLM tier degrades (3 consecutive failures),
-        route to a per-tier cloud fallback that respects family independence.
+        Route a tier to the best available model and enforce family independence
+        at inference time.
 
-        Previously ALL degraded tiers fell back to CLOUD_OSS[0] which is
-        Llama-4-Scout (Meta family). This silently violated the four-family
-        independence constraint whenever any vLLM node went down, because the
-        adversarial critic (Llama-3.3-70B) is also Meta family.
+        Degradation path
+        ----------------
+        When a vLLM tier has accumulated >= _max_local_fails consecutive
+        failures, it routes to a per-tier cloud fallback in _TIER_CLOUD_FALLBACK
+        rather than the shared CLOUD_OSS list (which is Meta/Llama family and
+        would collide with the adversarial critic).
 
-        Each tier now has a dedicated cloud fallback from a different family,
-        stored in _TIER_CLOUD_FALLBACK. The critic tier (Meta) falls back to
-        Devstral/Mistral; fixer tiers fall back to DeepSeek or Qwen.
+        BUG-6 RUNTIME FIX
+        -----------------
+        assert_family_independence() validates *configured* model names at
+        startup.  That is insufficient: a misconfigured _TIER_CLOUD_FALLBACK
+        entry, a future model-list edit, or an operator env-var override could
+        introduce a mid-run collision that the startup check never sees.
 
-        ADD-3 FIX: The previous catch-all fallback was the hardcoded string
-        "claude-sonnet-4-6". In a local-only deployment with no Anthropic key
-        this produced an unroutable model causing every LLM call to fail with
-        an authentication error rather than a clear routing error.
-        Replaced with RuntimeError.
+        After choosing the model (normal or fallback path) we compare its family
+        against self._critic_family (cached at __init__ time from the configured
+        critic model).  If they match — and the tier is not the critic itself —
+        we raise RuntimeError immediately so the caller surfaces the violation
+        rather than producing correlated output with no warning.
+
+        If extract_model_family is unavailable (verification package not
+        installed) the guard is skipped with a debug log; a WARNING was already
+        emitted at __init__ time so operators know isolation is unenforced.
+
+        ADD-3 FIX
+        ---------
+        Hardcoded "claude-sonnet-4-6" emergency fallback replaced with
+        RuntimeError so local-only deployments without an Anthropic key get a
+        clear routing error instead of an authentication failure.
         """
         if not models:
             raise RuntimeError(
@@ -584,24 +624,48 @@ class TieredModelRouter:
                 "VLLM_CRITIC_BASE_URL / OPENROUTER_API_KEY is set."
             )
 
+        # ── Model selection ───────────────────────────────────────────────────
         if self._force_cloud or self._is_degraded(tier):
-            # Use the per-tier family-independent cloud fallback, not CLOUD_OSS.
             tier_fallback = self._TIER_CLOUD_FALLBACK.get(tier)
             if tier_fallback and self._is_cloud_configured():
                 log.warning(
                     "[router] Tier %s degraded — routing to family-safe cloud fallback %s",
                     tier.value, tier_fallback,
                 )
-                return tier_fallback
-            # If cloud is not configured either, raise rather than silently failing.
-            if self._is_degraded(tier):
+                chosen = tier_fallback
+            elif self._is_degraded(tier):
                 raise RuntimeError(
                     f"Tier {tier.value} is degraded after {self._max_local_fails} failures "
                     "and no cloud fallback is configured. "
                     "Set OPENROUTER_API_KEY or reduce load on the local vLLM endpoint."
                 )
+            else:
+                chosen = models[0]
+        else:
+            chosen = models[0]
 
-        return models[0]
+        # ── BUG-6 RUNTIME FAMILY GUARD ───────────────────────────────────────
+        # Skip self-check for the critic tier (it IS the baseline we compare against).
+        if tier != ModelTier.VLLM_CRITIC and self._critic_family:
+            try:
+                from verification.independence_enforcer import extract_model_family
+                chosen_family = extract_model_family(chosen)
+                if chosen_family == self._critic_family:
+                    raise RuntimeError(
+                        f"BUG-6: family independence violated at inference time — "
+                        f"tier '{tier.value}' selected '{chosen}' "
+                        f"(family '{chosen_family}') which matches critic family "
+                        f"'{self._critic_family}'. "
+                        "Fix: update _TIER_CLOUD_FALLBACK so every non-critic tier "
+                        "maps to a model from a family distinct from the adversarial critic."
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                # extract_model_family unavailable — guard already warned at init.
+                log.debug("[router] runtime family guard skipped for '%s': %s", chosen, exc)
+
+        return chosen
 
     def _is_degraded(self, tier: ModelTier) -> bool:
         return (
