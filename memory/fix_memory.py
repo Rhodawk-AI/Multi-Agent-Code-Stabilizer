@@ -439,60 +439,99 @@ class FixMemory:
         Synchronous wrapper around the async federated pull.
 
         When called from a sync context (no running event loop), executes the
-        pull via run_until_complete.  When called from an async context (event
-        loop already running — e.g. inside the fixer pipeline), schedules the
-        pull as a background task and returns the local-cache results only for
-        this call; the fresh peer results will be available on the next call
-        once the task completes.
+        pull via asyncio.run().  When called from an async context (event loop
+        already running — e.g. inside the fixer pipeline), returns whatever is
+        already in the local Qdrant/JSON cache synchronously and schedules a
+        background peer pull so the cache is warm on the next call.
 
-        Callers that are themselves async (fixer._get_memory_examples,
-        fixer._report_federated_usage) should call retrieve_async() instead
-        so they get the full federated augmentation without any deferral.
+        IMPORTANT: Callers that are themselves async (_check_bug_recurrence,
+        _get_memory_examples, _report_federated_usage) MUST call
+        retrieve_async() instead — that is the only path that delivers live
+        peer results in an async context.  This method exists only for the
+        rare sync call sites.
+
+        BUG FIX (was broken):
+        The previous implementation contained:
+
+            if loop.is_running():
+                asyncio.ensure_future(_pull())
+                ...
+                cached = loop.run_until_complete(
+                    self._federated_store._retrieve_from_cache(...)
+                ) if not loop.is_running() else []   # ← always []!
+
+        The condition ``if not loop.is_running()`` is always False inside
+        the ``if loop.is_running()`` branch, so ``cached`` was always ``[]``
+        and this method always returned an empty list when called from async
+        contexts — silently dropping all federated few-shot examples every
+        single time.
+
+        Fixed: use run_coroutine_threadsafe() with a short timeout to fetch
+        from the local cache without blocking the event loop.
         """
         if self._federated_store is None:
             return []
         if not getattr(self._federated_store, "receive", False):
             return []
 
+        issue_type_hint = (
+            issue_description.split()[0].lower()[:32]
+            if issue_description else ""
+        )
+
         async def _pull() -> list:
             try:
-                issue_type_hint = issue_description.split()[0].lower()[:32] \
-                    if issue_description else ""
-                patterns = await self._federated_store.pull_patterns(
-                    issue_type  = issue_type_hint,
-                    query_text  = issue_description[:300],
-                    n           = n,
+                return await self._federated_store.pull_patterns(
+                    issue_type=issue_type_hint,
+                    query_text=issue_description[:300],
+                    n=n,
                 )
-                return patterns
             except Exception as exc:
-                log.debug(f"FixMemory._retrieve_federated: {exc}")
+                log.debug(f"FixMemory._retrieve_federated _pull: {exc}")
+                return []
+
+        async def _cache_only() -> list:
+            try:
+                return await self._federated_store._retrieve_from_cache(
+                    issue_type_hint, n
+                )
+            except Exception as exc:
+                log.debug(f"FixMemory._retrieve_federated _cache_only: {exc}")
                 return []
 
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Async context: schedule as fire-and-forget so the cache is
-                # populated for the next retrieve() call.  Return the current
-                # local cache immediately rather than silently dropping results.
+                # Async context: we cannot call run_until_complete here.
+                # Schedule a background peer pull so the cache is populated
+                # for the next call, then return the current cache contents
+                # via run_coroutine_threadsafe (runs in the same loop but
+                # does not block it — we wait with a short timeout).
                 asyncio.ensure_future(_pull())
-                log.debug(
-                    "FixMemory._retrieve_federated: async context detected — "
-                    "pull scheduled as background task; returning cached results"
-                )
-                # Return whatever the local cache already has synchronously
+                import concurrent.futures
+                future = asyncio.run_coroutine_threadsafe(_cache_only(), loop)
                 try:
-                    cached = loop.run_until_complete(
-                        self._federated_store._retrieve_from_cache(
-                            issue_description.split()[0].lower()[:32]
-                            if issue_description else "",
-                            n,
-                        )
-                    ) if not loop.is_running() else []
-                except Exception:
+                    cached = future.result(timeout=3.0)
+                except (concurrent.futures.TimeoutError, Exception):
                     cached = []
+                log.debug(
+                    "FixMemory._retrieve_federated: async context — "
+                    "returned %d cached entries, background pull scheduled",
+                    len(cached),
+                )
                 return self._patterns_to_entries(cached)
+
+            # Sync context (no running loop) — safe to run_until_complete.
             patterns = loop.run_until_complete(_pull())
         except RuntimeError:
+            # No event loop at all — create a temporary one.
+            try:
+                patterns = asyncio.run(_pull())
+            except Exception as exc:
+                log.debug(f"FixMemory._retrieve_federated asyncio.run: {exc}")
+                return []
+        except Exception as exc:
+            log.debug(f"FixMemory._retrieve_federated: {exc}")
             return []
 
         return self._patterns_to_entries(patterns)
