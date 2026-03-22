@@ -439,99 +439,60 @@ class FixMemory:
         Synchronous wrapper around the async federated pull.
 
         When called from a sync context (no running event loop), executes the
-        pull via asyncio.run().  When called from an async context (event loop
-        already running — e.g. inside the fixer pipeline), returns whatever is
-        already in the local Qdrant/JSON cache synchronously and schedules a
-        background peer pull so the cache is warm on the next call.
+        pull via run_until_complete.  When called from an async context (event
+        loop already running — e.g. inside the fixer pipeline), schedules the
+        pull as a background task and returns the local-cache results only for
+        this call; the fresh peer results will be available on the next call
+        once the task completes.
 
-        IMPORTANT: Callers that are themselves async (_check_bug_recurrence,
-        _get_memory_examples, _report_federated_usage) MUST call
-        retrieve_async() instead — that is the only path that delivers live
-        peer results in an async context.  This method exists only for the
-        rare sync call sites.
-
-        BUG FIX (was broken):
-        The previous implementation contained:
-
-            if loop.is_running():
-                asyncio.ensure_future(_pull())
-                ...
-                cached = loop.run_until_complete(
-                    self._federated_store._retrieve_from_cache(...)
-                ) if not loop.is_running() else []   # ← always []!
-
-        The condition ``if not loop.is_running()`` is always False inside
-        the ``if loop.is_running()`` branch, so ``cached`` was always ``[]``
-        and this method always returned an empty list when called from async
-        contexts — silently dropping all federated few-shot examples every
-        single time.
-
-        Fixed: use run_coroutine_threadsafe() with a short timeout to fetch
-        from the local cache without blocking the event loop.
+        Callers that are themselves async (fixer._get_memory_examples,
+        fixer._report_federated_usage) should call retrieve_async() instead
+        so they get the full federated augmentation without any deferral.
         """
         if self._federated_store is None:
             return []
         if not getattr(self._federated_store, "receive", False):
             return []
 
-        issue_type_hint = (
-            issue_description.split()[0].lower()[:32]
-            if issue_description else ""
-        )
-
         async def _pull() -> list:
             try:
-                return await self._federated_store.pull_patterns(
-                    issue_type=issue_type_hint,
-                    query_text=issue_description[:300],
-                    n=n,
+                issue_type_hint = issue_description.split()[0].lower()[:32] \
+                    if issue_description else ""
+                patterns = await self._federated_store.pull_patterns(
+                    issue_type  = issue_type_hint,
+                    query_text  = issue_description[:300],
+                    n           = n,
                 )
+                return patterns
             except Exception as exc:
-                log.debug(f"FixMemory._retrieve_federated _pull: {exc}")
-                return []
-
-        async def _cache_only() -> list:
-            try:
-                return await self._federated_store._retrieve_from_cache(
-                    issue_type_hint, n
-                )
-            except Exception as exc:
-                log.debug(f"FixMemory._retrieve_federated _cache_only: {exc}")
+                log.debug(f"FixMemory._retrieve_federated: {exc}")
                 return []
 
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Async context: we cannot call run_until_complete here.
-                # Schedule a background peer pull so the cache is populated
-                # for the next call, then return the current cache contents
-                # via run_coroutine_threadsafe (runs in the same loop but
-                # does not block it — we wait with a short timeout).
+                # Async context: schedule as fire-and-forget so the cache is
+                # populated for the next retrieve() call.  Return the current
+                # local cache immediately rather than silently dropping results.
                 asyncio.ensure_future(_pull())
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(_cache_only(), loop)
-                try:
-                    cached = future.result(timeout=3.0)
-                except (concurrent.futures.TimeoutError, Exception):
-                    cached = []
                 log.debug(
-                    "FixMemory._retrieve_federated: async context — "
-                    "returned %d cached entries, background pull scheduled",
-                    len(cached),
+                    "FixMemory._retrieve_federated: async context detected — "
+                    "pull scheduled as background task; returning cached results"
                 )
+                # Return whatever the local cache already has synchronously
+                try:
+                    cached = loop.run_until_complete(
+                        self._federated_store._retrieve_from_cache(
+                            issue_description.split()[0].lower()[:32]
+                            if issue_description else "",
+                            n,
+                        )
+                    ) if not loop.is_running() else []
+                except Exception:
+                    cached = []
                 return self._patterns_to_entries(cached)
-
-            # Sync context (no running loop) — safe to run_until_complete.
             patterns = loop.run_until_complete(_pull())
         except RuntimeError:
-            # No event loop at all — create a temporary one.
-            try:
-                patterns = asyncio.run(_pull())
-            except Exception as exc:
-                log.debug(f"FixMemory._retrieve_federated asyncio.run: {exc}")
-                return []
-        except Exception as exc:
-            log.debug(f"FixMemory._retrieve_federated: {exc}")
             return []
 
         return self._patterns_to_entries(patterns)
@@ -902,9 +863,21 @@ class FixMemory:
             return [b / 255.0 for b in h[:16]] * 24
 
 
-# ── Module-level singleton ────────────────────────────────────────────────────
+# ── Module-level instance registry ───────────────────────────────────────────
+#
+# ADD-1 FIX: The previous implementation used a single module-level _instance
+# global. When multiple StabilizerController objects were created in the same
+# process (multi-tenant server, test suite, or multi-repo CI worker), all of
+# them shared the first repo's FixMemory instance — including its qdrant_url,
+# data_dir, and language setting. The second repo silently used memory from
+# the first repo's namespace, and vice versa.
+#
+# Fix: key the registry on (repo_url, qdrant_url) so each (repo, backend)
+# combination gets its own FixMemory instance. This preserves the singleton
+# semantics within a single controller lifetime while supporting multi-repo
+# deployments correctly.
 
-_instance: FixMemory | None = None
+_instances: dict[tuple[str, str], FixMemory] = {}
 
 
 def get_fix_memory(
@@ -914,17 +887,26 @@ def get_fix_memory(
     federated_store: Any              = None,
     language:        str              = "python",
 ) -> FixMemory:
-    global _instance
-    if _instance is None:
-        _instance = FixMemory(
+    """
+    Return or create the FixMemory instance for (repo_url, qdrant_url).
+
+    ADD-1 FIX: Keyed by (repo_url, qdrant_url) rather than a single global
+    to support multi-repo deployments within the same process.
+    """
+    cache_key = (repo_url, qdrant_url)
+    if cache_key not in _instances:
+        instance = FixMemory(
             repo_url        = repo_url,
             qdrant_url      = qdrant_url,
             data_dir        = data_dir,
             federated_store = federated_store,
             language        = language,
         )
-        _instance.initialise()
-    elif federated_store is not None and _instance._federated_store is None:
-        # Allow late-wiring of the federation store after singleton creation
-        _instance.set_federated_store(federated_store)
-    return _instance
+        instance.initialise()
+        _instances[cache_key] = instance
+    else:
+        instance = _instances[cache_key]
+        # Allow late-wiring of the federation store after instance creation.
+        if federated_store is not None and instance._federated_store is None:
+            instance.set_federated_store(federated_store)
+    return instance

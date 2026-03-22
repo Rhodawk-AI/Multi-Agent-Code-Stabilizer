@@ -316,7 +316,9 @@ class FederatedPatternStore:
         Retrieve federated patterns relevant to the given issue.
 
         First checks local cache, then fetches from peers if cache is sparse.
-        Results are sorted by complexity_score × federation_score descending.
+        Results are sorted by (success_count / use_count) × 0.6 + complexity_score × 0.4 descending.
+        This matches the architecture spec and rewards patterns with high empirical
+        success rates, not just high retrieval similarity.
         """
         if not self.receive:
             return []
@@ -337,7 +339,7 @@ class FederatedPatternStore:
 
         # 3. Sort by quality signal
         cached.sort(
-            key=lambda p: p.complexity_score * max(p.federation_score, 0.01),
+            key=lambda p: (p.success_count / max(p.use_count, 1)) * 0.6 + p.complexity_score * 0.4,
             reverse=True,
         )
         if cached:
@@ -872,44 +874,12 @@ class FederatedPatternStore:
             return []
 
     def _embed(self, text: str) -> list[float]:
-        """
-        Embed text to a 384-dim float vector for Qdrant cosine similarity.
-
-        Primary: sentence-transformers all-MiniLM-L6-v2 (384 dims, fast, good
-        semantic quality for code-pattern matching).
-
-        Fallback: SHA-256 hash spread across 384 dims.  This fallback produces
-        vectors with ZERO semantic meaning — Qdrant cosine similarity between
-        any two hash-derived vectors is essentially random.  Federated pattern
-        retrieval will return results in random order rather than by relevance.
-
-        BUG FIX: the previous implementation caught all exceptions silently,
-        so an ImportError on missing sentence-transformers was swallowed with
-        no log output.  Operators had no way to know retrieval quality was
-        degraded.  Fixed: ImportError is caught separately and logs a WARNING
-        once per store instance so the degradation is visible in logs.
-        """
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             if not hasattr(self, "_st_model"):
                 self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
             return self._st_model.encode(text).tolist()
-        except ImportError:
-            # Warn exactly once per store instance so log files are not flooded
-            # but the degradation is always visible on first occurrence.
-            if not getattr(self, "_embed_import_warned", False):
-                self._embed_import_warned = True
-                log.warning(
-                    "FederatedStore: sentence-transformers is not installed. "
-                    "Federated pattern retrieval is using SHA-256 hash vectors — "
-                    "results are in RANDOM ORDER, not by semantic relevance. "
-                    "Fix: pip install sentence-transformers  "
-                    "(already in requirements.txt — just run pip install -r requirements.txt)"
-                )
-            h = hashlib.sha256(text.encode()).digest()
-            return [b / 255.0 for b in h[:16]] * 24
-        except Exception as exc:
-            log.debug(f"FederatedStore._embed: {exc}")
+        except Exception:
             h = hashlib.sha256(text.encode()).digest()
             return [b / 255.0 for b in h[:16]] * 24
 
