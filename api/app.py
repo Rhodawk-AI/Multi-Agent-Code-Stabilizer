@@ -42,6 +42,10 @@ _IS_DEV = os.environ.get("RHODAWK_ENV", "production").lower() == "development"
 
 class _AppState:
     storage: Any = None
+    # ARCH-01 FIX: track CPG availability so the /health endpoint can expose it.
+    # Set to True/False by inject_cpg_state() after controller initialises the
+    # CPG engine.  None means "not yet reported" (controller hasn't started).
+    cpg_available: bool | None = None
 
 
 _state = _AppState()
@@ -297,7 +301,17 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
-        return {"status": "ok", "version": "2.0.2", "env": os.environ.get("RHODAWK_ENV", "production")}
+        # ARCH-01 FIX: expose cpg_available so operators and load-balancers can
+        # see whether the CPG engine is active.  cpg_available=False means every
+        # fix attempt is using vector-similarity fallback context, which produces
+        # lower-quality patches for cross-file bugs.  null means the controller
+        # has not yet initialised (cold start or API-only deployment).
+        return {
+            "status":        "ok",
+            "version":       "2.0.2",
+            "env":           os.environ.get("RHODAWK_ENV", "production"),
+            "cpg_available": _state.cpg_available,
+        }
 
     @app.get("/api/capabilities")
     async def capabilities():
@@ -430,3 +444,28 @@ def inject_storage(storage_instance: Any) -> None:
     """
     _state.storage = storage_instance
     log.info("API storage injected")
+
+
+def inject_cpg_state(available: bool) -> None:
+    """
+    ARCH-01 FIX: Called by StabilizerController after CPG engine initialisation
+    to expose whether Joern/CPG context is active in the /health endpoint.
+
+    When available=False the health endpoint signals cpg_available=false so
+    operators and monitoring dashboards immediately know that cross-file causal
+    context is NOT being used and that fixes are falling back to vector similarity.
+    This makes the degraded context quality observable without digging into logs.
+
+    Parameters
+    ----------
+    available : bool
+        True  — CPG engine connected and responding (Joern running, CPG built).
+        False — CPG engine absent or failed to connect (vector-similarity fallback).
+    """
+    _state.cpg_available = available
+    log.info(
+        "API CPG state updated: cpg_available=%s%s",
+        available,
+        "" if available else
+        " — fix context falling back to vector similarity (start Joern for causal context)",
+    )
