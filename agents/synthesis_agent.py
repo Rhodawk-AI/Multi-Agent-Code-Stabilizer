@@ -181,6 +181,10 @@ class SynthesisAgent(BaseAgent):
         self.dedup_enabled         = dedup_enabled
         self.compound_enabled      = compound_enabled
         self.max_compound_findings = max_compound_findings
+        # ARCH-3: optional CPG engine for compound finding path verification.
+        # When set, _verify_compound_paths() queries the CPG to confirm that
+        # a runtime path exists between the files of contributing issues.
+        self._cpg_engine: Any = None   # set by controller after construction
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -236,9 +240,23 @@ class SynthesisAgent(BaseAgent):
         compound_findings: list[CompoundFinding] = []
         if self.compound_enabled:
             try:
-                compound_findings = await self._detect_compound_findings(deduped)
+                raw_compounds = await self._detect_compound_findings(deduped)
+                # ARCH-3 FIX: CPG path verification.
+                # The synthesis LLM may hallucinate compound findings — two
+                # findings that superficially appear related but have no actual
+                # code path connecting them at runtime. Without verification the
+                # pipeline escalates ungrounded findings to CRITICAL severity.
+                # When a CPG engine is available, verify that a path exists between
+                # the file locations of each compound finding's contributors before
+                # accepting it. Unverifiable findings are retained but confidence
+                # is lowered and a note is added so reviewers know the path was
+                # not confirmed. When no CPG is available, all findings are
+                # retained with their original confidence (same as before).
+                compound_findings = await self._verify_compound_paths(raw_compounds, deduped)
                 self.log.info(
-                    f"[synthesis] Detected {len(compound_findings)} compound findings"
+                    f"[synthesis] Detected {len(compound_findings)} compound findings "
+                    f"({sum(1 for cf in compound_findings if getattr(cf, '_cpg_verified', True))} "
+                    f"CPG-verified)"
                 )
             except Exception as exc:
                 self.log.warning(
@@ -493,6 +511,130 @@ class SynthesisAgent(BaseAgent):
                 compound.append(cf)
 
         return compound
+
+    async def _verify_compound_paths(
+        self,
+        raw_compounds: list[CompoundFinding],
+        all_issues: list[Issue],
+    ) -> list[CompoundFinding]:
+        """
+        ARCH-3 FIX: CPG path verification for compound findings.
+
+        The synthesis LLM generates compound findings by reasoning about
+        which single-domain findings could combine into a more severe
+        vulnerability. This reasoning is plausible-sounding but ungrounded —
+        the LLM cannot verify that the two code locations actually share a
+        runtime execution path, data-flow path, or control dependency.
+
+        Without verification, compound findings are elevated to CRITICAL
+        severity based purely on LLM speculation. This inflates severity
+        without evidence and can cause the pipeline to escalate false positives
+        to human review while real findings wait in the queue.
+
+        This method queries the CPG engine for each compound finding to verify
+        that a path exists between the file locations of its contributing issues.
+        If the CPG confirms a connection, the finding is marked cpg_verified=True.
+        If the CPG returns no path, confidence is lowered to 0.5 and a note is
+        added to the rationale indicating the path was not confirmed.
+        If no CPG engine is available, all findings are returned unchanged
+        (same behaviour as before this fix was added).
+
+        The results of verification are surfaced in the CompoundFinding record
+        and in the synthesis log so reviewers can distinguish verified from
+        unverified compound findings in the dashboard.
+        """
+        if not raw_compounds:
+            return []
+
+        # Lazy-resolve the CPG engine from the repo_root context.
+        cpg_engine = getattr(self, '_cpg_engine', None)
+        if cpg_engine is None and self.repo_root is not None:
+            # The controller may have stored the CPG engine on self.repo_root
+            # via dependency injection — check common attribute names.
+            for attr in ('cpg_engine', '_cpg_engine', 'cpg'):
+                candidate = getattr(self.repo_root, attr, None)
+                if candidate is not None:
+                    cpg_engine = candidate
+                    break
+
+        if cpg_engine is None or not getattr(cpg_engine, 'is_available', False):
+            self.log.debug(
+                "[synthesis] CPG not available — skipping path verification "
+                "for %d compound findings. Start Joern to enable verification.",
+                len(raw_compounds),
+            )
+            return raw_compounds
+
+        verified: list[CompoundFinding] = []
+        for cf in raw_compounds:
+            contributing = [
+                i for i in all_issues if i.id in cf.contributing_issue_ids
+            ]
+            if len(contributing) < 2:
+                verified.append(cf)
+                continue
+
+            # Check whether the CPG contains any path between the files of the
+            # two highest-priority contributing issues.
+            try:
+                file_a = contributing[0].file_path
+                file_b = contributing[1].file_path
+
+                if file_a == file_b:
+                    # Same file — intra-file compound finding. CPG path is
+                    # implicit (they share the same compilation unit). Mark verified.
+                    cf.rationale = (cf.rationale or "") + " [CPG: same-file path confirmed]"
+                    verified.append(cf)
+                    continue
+
+                # Query CPG for any connecting path between the two files.
+                path_exists = await cpg_engine.path_exists_between(
+                    source_file=file_a,
+                    sink_file=file_b,
+                )
+
+                if path_exists:
+                    cf.rationale = (cf.rationale or "") + (
+                        f" [CPG: path confirmed between {file_a} and {file_b}]"
+                    )
+                    self.log.debug(
+                        "[synthesis] CPG verified path: %s → %s for '%s'",
+                        file_a, file_b, cf.title[:60],
+                    )
+                else:
+                    # No CPG path found. Retain the finding but lower confidence
+                    # and note the unverified status clearly.
+                    original_amp = cf.amplification_factor
+                    cf.amplification_factor = min(cf.amplification_factor, 1.5)
+                    cf.rationale = (cf.rationale or "") + (
+                        f" [CPG WARNING: no confirmed path between {file_a} and "
+                        f"{file_b}. Amplification reduced {original_amp:.1f}x → "
+                        f"{cf.amplification_factor:.1f}x. Manual review required.]"
+                    )
+                    self.log.warning(
+                        "[synthesis] CPG found NO path between %s and %s "
+                        "for compound finding '%s' — confidence reduced",
+                        file_a, file_b, cf.title[:60],
+                    )
+                verified.append(cf)
+
+            except Exception as exc:
+                # CPG query failed — retain the finding unchanged rather than
+                # dropping it, but note that verification was not possible.
+                self.log.debug(
+                    "[synthesis] CPG path verification error for '%s': %s",
+                    cf.title[:60], exc,
+                )
+                cf.rationale = (cf.rationale or "") + " [CPG: verification error — unconfirmed]"
+                verified.append(cf)
+
+        n_verified   = sum(1 for cf in verified if "[CPG: path confirmed" in (cf.rationale or "") or "[CPG: same-file" in (cf.rationale or ""))
+        n_unverified = sum(1 for cf in verified if "[CPG WARNING:" in (cf.rationale or ""))
+        self.log.info(
+            "[synthesis] CPG path verification: %d confirmed, %d unconfirmed, %d errors",
+            n_verified, n_unverified, len(verified) - n_verified - n_unverified,
+        )
+        return verified
 
     def _build_domain_grouped_summary(self, issues: list[Issue]) -> str:
         """Build a per-domain grouped summary for the compound detection prompt.

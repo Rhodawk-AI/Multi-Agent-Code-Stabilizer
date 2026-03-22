@@ -22,35 +22,15 @@ _DEFAULT_SURGICAL_THRESHOLD = 2000
 _AST_REWRITE_THRESHOLD = 500
 
 # ── Gap 3 proactive architectural smell thresholds ────────────────────────────
-# Recurrence: if the same bug class has been patched this many times (or more)
-# within the memory window, escalate to a refactor proposal instead of patching.
 _RECURRENCE_ESCALATION_THRESHOLD = 3
-# Coupling: if the changed functions are called from this many distinct
-# directory-level modules or more, the design is over-coupled and a patch will
-# not fix the structural cause.
 _COUPLING_MODULE_THRESHOLD = 5
 
-# ── Bug-class normalisation for recurrence matching ──────────────────────────
-# The recurrence gate in _check_bug_recurrence() queries fix_memory using the
-# raw issue description as the lookup key.  Without normalisation, two instances
-# of the same structural bug class at different line numbers produce different
-# keys ("null dereference in process_payment at line 47" vs. "…at line 52") and
-# the recurrence counter never exceeds 1, silently preventing the gate from
-# ever firing.
-#
-# _normalize_bug_class() strips all location-specific noise from a description
-# so that the same structural defect maps to the same memory key regardless of
-# which line it was found on or which exact variable name appeared.
 import re as _re_mod
 
 _NORM_LINE_PATTERNS = [
-    # "at line 47", "at line N", "on line 52"
     _re_mod.compile(r'\bat (line|col|column)\s+\d+\b', _re_mod.IGNORECASE),
-    # ":47", "L47", "L 47" — standalone location suffixes
     _re_mod.compile(r'(?<!\w)(?:L\s*)?\d{1,6}(?!\w)'),
-    # file path prefixes: "services/auth/validator.py:" or "/abs/path:"
     _re_mod.compile(r'(?:[a-zA-Z0-9_.\-/\\]+\.(?:py|c|cpp|h|hpp|js|ts|go|rs|java))\s*:?\s*'),
-    # "in function foo_bar" — function names are structural noise for the class key
     _re_mod.compile(r'\bin (?:function|method|class)\s+\w+', _re_mod.IGNORECASE),
 ]
 
@@ -99,41 +79,11 @@ class FixerAgent(BaseAgent):
 
     @staticmethod
     def _normalize_bug_class(description: str) -> str:
-        """Return a location-stripped, lowercased bug-class key for fix_memory.
-
-        WHY THIS EXISTS
-        ---------------
-        fix_memory.retrieve() uses embedding similarity against stored
-        ``issue_type`` keys.  When we store the raw description as the key
-        ("null dereference in process_payment at line 47") and then query with
-        a slightly different description ("null dereference in process_payment
-        at line 52"), the embedding similarity is high but not 1.0 — and,
-        more importantly, when the query comes from a completely different call
-        site in the same function after a refactor, the line number changes and
-        even the function name may differ.
-
-        By stripping all location-specific tokens before storing AND before
-        querying, we ensure that the same structural defect class ("null
-        dereference in process_payment") always produces an identical or
-        near-identical key regardless of where it manifests in the file, what
-        variable name appeared, or which exact line number was reported.
-
-        Transformations applied (in order):
-          1. Strip file-path prefixes (``services/foo.py:``)
-          2. Strip "at/on line N" phrases
-          3. Strip bare numbers (line numbers, offsets)
-          4. Strip "in function/method/class <name>" phrases
-          5. Lowercase and collapse whitespace
-
-        The result is a short structural description like
-        "null dereference process_payment" that is stable across re-audits.
-        """
-        text = description[:200]           # cap to avoid giant embeddings
+        """Return a location-stripped, lowercased bug-class key for fix_memory."""
+        text = description[:200]
         for pat in _NORM_LINE_PATTERNS:
-            text = pat.sub(" ", text)
-        # Collapse runs of whitespace and strip
+            text = pat.sub(' ', text)
         text = _re_mod.sub(r'\s+', ' ', text).strip().lower()
-        # Keep only the first 80 chars — this is a memory key, not a full desc
         return text[:80]
 
     async def run(self, **kwargs: Any) -> list[FixAttempt]:
@@ -238,10 +188,6 @@ class FixerAgent(BaseAgent):
         repo_map_text = self._get_repo_map_context(file_paths)
         memory_examples = await self._get_memory_examples(issues)
 
-        # ── Gap 3: Proactive architectural smell check (BEFORE blast radius) ──
-        # Extract the function names for the coupling query.  We reuse the same
-        # tree-sitter symbol extraction that _get_forward_impact_context uses so
-        # the two gates operate on consistent symbol sets.
         all_symbols: list[str] = []
         for fp in file_paths:
             syms = await self._extract_file_symbols(fp)
@@ -254,10 +200,6 @@ class FixerAgent(BaseAgent):
             window_days=180,
         )
         if recurrence_signal.is_structural:
-            # Build a minimal blast object so _generate_refactor_proposal has
-            # required fields.  If cpg_engine is available we try a real blast
-            # compute first; otherwise we stub a zero-score blast so the
-            # proposal is still generated with the recurrence/coupling context.
             stub_blast = None
             if self.cpg_engine and self.cpg_engine.is_available:
                 try:
@@ -278,7 +220,6 @@ class FixerAgent(BaseAgent):
                     requires_human_review=True,
                 )
 
-            # Determine trigger source label for the RefactorProposal.
             has_recurrence = recurrence_signal.recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD
             has_coupling   = recurrence_signal.distinct_caller_modules >= _COUPLING_MODULE_THRESHOLD
             if has_recurrence and has_coupling:
@@ -323,10 +264,7 @@ class FixerAgent(BaseAgent):
             self.log.info(f'[Fixer] feedback_round={feedback_round}/{MAX_FEEDBACK_ROUNDS} test_passed={test_passed}')
             if test_passed:
                 break
-        # Gap 3.A fix: close the revert-memory feedback loop.
-        # When all rounds exhaust without a passing probe, persist the failed
-        # approach as a negative example so the fixer never repeats it for the
-        # same issue type and file context in future runs.
+
         if not test_passed and self.fix_memory and last_result is not None:
             await self._store_failure_memory(issues, file_paths, last_result, last_test_output)
         result = last_result
@@ -370,34 +308,14 @@ class FixerAgent(BaseAgent):
     ) -> BugRecurrenceSignal:
         """Gap 3 — Proactive Architectural Smell Detection.
 
-        Check two independent structural signals BEFORE generating a patch:
+        BUG-1 FIX: Previously called the sync self.fix_memory.retrieve() at
+        line 422 inside an async context (running event loop).  That caused
+        _retrieve_federated() to detect loop.is_running() == True and always
+        return [] for the federated pull, silently giving zero federated
+        augmentation on every recurrence check.
 
-        Signal 1 — Recurrence (fix_memory)
-        ------------------------------------
-        Query fix_memory for historical fix entries whose issue_type is
-        semantically similar to the current issue description.  Count:
-          - successful (non-reverted) fixes  → ``recurrence_count``
-          - reverted fixes                   → ``reverted_count``
-
-        If recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD the same bug
-        class has been patched enough times that the code has a structural
-        problem a patch will not eliminate.
-
-        Signal 2 — CPG Coupling (Joern)
-        --------------------------------
-        Query the CPG for the number of distinct directory-level modules that
-        call the functions being fixed.  A function called from 5+ unrelated
-        modules has no ownership boundary — any change to it is architecturally
-        unsafe regardless of how small the numeric blast radius is.
-
-        If distinct_caller_modules >= _COUPLING_MODULE_THRESHOLD the design is
-        over-coupled and the caller should escalate to a refactor proposal.
-
-        Returns
-        -------
-        BugRecurrenceSignal
-            ``is_structural=True`` when either signal fires.
-            ``escalation_reason`` explains which signal(s) triggered.
+        Fix: always call retrieve_async() and await it so the full federated
+        augmentation path executes correctly without the nested-loop workaround.
         """
         signal = BugRecurrenceSignal(
             window_days=window_days,
@@ -407,24 +325,12 @@ class FixerAgent(BaseAgent):
         # ── Signal 1: recurrence check ────────────────────────────────────────
         if self.fix_memory:
             try:
-                # CORRECTNESS FIX: normalise the description before using it
-                # as the fix_memory query key.  Without normalisation, the same
-                # structural bug at different line numbers produces a different
-                # embedding key each time ("null dereference … at line 47" ≠
-                # "null dereference … at line 52"), so the recurrence counter
-                # never exceeds 1 and this gate silently never fires.
-                # _normalize_bug_class() strips line numbers, file-path prefixes,
-                # and other location-specific noise so every instance of the same
-                # structural class maps to the same (or near-identical) key.
                 raw_query = ' '.join(i.description[:100] for i in issues[:3])
                 query = self._normalize_bug_class(raw_query)
-                # Retrieve a generous set so we can count without trimming.
-                # FIX: _check_bug_recurrence is async — calling the sync
-                # retrieve() here drops federated augmentation silently because
-                # retrieve() detects the running event loop and defers the peer
-                # pull to a background task that resolves after this method
-                # returns.  Use retrieve_async() so federation is live and the
-                # recurrence counter includes cross-deployment pattern history.
+                # BUG-1 FIX: use retrieve_async() so federated augmentation is
+                # live in this async context.  The sync retrieve() detected
+                # loop.is_running() == True and silently returned [] for
+                # federated patterns on every call from this method.
                 if hasattr(self.fix_memory, 'retrieve_async'):
                     entries = await self.fix_memory.retrieve_async(
                         query, n=20, max_age_days=window_days
@@ -444,7 +350,6 @@ class FixerAgent(BaseAgent):
                 signal.recurrence_count = len(successful)
                 signal.reverted_count   = len(reverted)
 
-                # Most common file context across historical entries.
                 ctx_counts: dict[str, int] = {}
                 for e in entries:
                     fc = getattr(e, 'file_context', '') or ''
@@ -498,7 +403,6 @@ class FixerAgent(BaseAgent):
                         + 'A patch is locally correct but structurally unsound.'
                     )
                     if signal.is_structural:
-                        # Append to existing recurrence reason.
                         signal.escalation_reason += ' | ' + coupling_reason
                     else:
                         signal.is_structural      = True
@@ -531,6 +435,15 @@ class FixerAgent(BaseAgent):
             ctx = await self.cpg_context_selector.select_context_for_issues(issues=issues, max_lines=3000)
             if not ctx.context_text:
                 return ''
+            # ARCH-1: emit WARNING when CPG fallback is active so operators can
+            # see that causal context is degraded rather than silently missing it.
+            if ctx.source != 'cpg':
+                self.log.warning(
+                    '[Fixer] CPG context source=%s (not full Joern CPG) — '
+                    'cross-file causal relationships may be missed. '
+                    'Start Joern with: docker-compose up joern',
+                    ctx.source,
+                )
             total_info = f'total_functions={ctx.total_functions} files={ctx.total_files} source={ctx.source}'
             self.log.info(f'[Fixer] CPG context: {total_info}')
             return ctx.context_text
@@ -542,23 +455,9 @@ class FixerAgent(BaseAgent):
         if not (self.cpg_engine and self.cpg_engine.is_available):
             return ('', None)
         try:
-            # Joern stores method identifiers as fully qualified names whose
-            # exact format depends on the language, e.g.:
-            #   Python:  <module_path>.<ClassName>.<method_name>
-            #   C/C++:   namespace::ClassName::method_name
-            #
-            # Passing bare tree-sitter symbol names (e.g. "process_payment")
-            # to JoernClient.compute_impact_set() produces zero hits because
-            # no CPG node matches the unqualified form.  The fix: derive a
-            # dotted module path from the file path (the common Python/JS
-            # convention) and build both a bare name AND a qualified name for
-            # every symbol, then pass all candidates to compute_blast_radius.
-            # Joern's impact-set query applies an "endsWith" / "matches" filter
-            # so candidate lists are deduplicated server-side.
             function_names: list[str] = []
             for fp in file_paths:
                 syms = await self._extract_file_symbols(fp)
-                # Build the module-qualified prefix: "a/b/c.py" → "a.b.c"
                 module_prefix = (
                     Path(fp)
                     .with_suffix('')
@@ -566,16 +465,12 @@ class FixerAgent(BaseAgent):
                     .replace('/', '.')
                 )
                 for sym in sorted(syms)[:20]:
-                    # Always include the bare name (works for C/C++ globals
-                    # and short-path Python modules).
                     function_names.append(sym)
-                    # Add the module-qualified form for Python / JS conventions.
-                    qualified = f"{module_prefix}.{sym}"
+                    qualified = f'{module_prefix}.{sym}'
                     if qualified not in function_names:
                         function_names.append(qualified)
 
             if not function_names:
-                # Last-resort fallback: derive module path from file path alone.
                 function_names = [
                     Path(fp).with_suffix('').as_posix().replace('/', '.')
                     for fp in file_paths
@@ -611,11 +506,6 @@ class FixerAgent(BaseAgent):
                     lines.append(f'  - `{tf}`')
                 lines.append('')
 
-            # ── Import-only references ─────────────────────────────────────────
-            # These files import a changed symbol but never call any changed
-            # function.  They are invisible to the call graph and were the
-            # undercount identified in the Gap 3 audit.  A type or signature
-            # change will break them even though no call site exists.
             if blast.importing_modules:
                 lines.append(
                     f'**Import-only references** — files that import a changed symbol '
@@ -676,7 +566,7 @@ class FixerAgent(BaseAgent):
             issue.fix_attempts += 1
             issue.status = IssueStatus.FIX_GENERATED
             await self.storage.upsert_issue(issue)
-        self.log.warning(f'[Fixer] Refactor proposal created: proposal_id={proposal.id[:12]} escalation_id={(escalation_id[:12] if escalation_id else 'none')} blast={blast.affected_function_count} fns')
+        self.log.warning(f'[Fixer] Refactor proposal created: proposal_id={proposal.id[:12]} escalation_id={(escalation_id[:12] if escalation_id else "none")} blast={blast.affected_function_count} fns')
         return fix
 
     async def _get_memory_examples(self, issues: list) -> str:
@@ -684,12 +574,7 @@ class FixerAgent(BaseAgent):
             return ''
         try:
             raw_query = ' '.join((i.description[:100] for i in issues[:3]))
-            # Normalise for the same reason as _check_bug_recurrence — ensures
-            # the few-shot examples retrieved match the structural class of the
-            # current issue, not just the exact description text at one line number.
             query = self._normalize_bug_class(raw_query)
-            # Use retrieve_async so federated augmentation is live (not deferred)
-            # in the async fixer pipeline.
             if hasattr(self.fix_memory, 'retrieve_async'):
                 entries = await self.fix_memory.retrieve_async(query, n=3, max_age_days=180)
             else:
@@ -703,8 +588,6 @@ class FixerAgent(BaseAgent):
         if not self.fix_memory:
             return
         try:
-            # Normalise the issue_type key so the recurrence gate finds this
-            # entry when the same bug manifests at a different line next time.
             raw_type  = issues[0].description[:80] if issues else 'unknown'
             issue_type = self._normalize_bug_class(raw_type)
             file_context = ', '.join((ff.path for ff in fixed_files[:3]))
@@ -712,30 +595,18 @@ class FixerAgent(BaseAgent):
             self.fix_memory.store_success(issue_type=issue_type, file_context=file_context, fix_approach=fix_approach, test_result='gate_passed=True', run_id=self.run_id)
         except Exception as exc:
             self.log.debug(f'_store_fix_memory: {exc}')
-        # GAP 6 (Defect 3): report success back to federation for any
-        # federated patterns that were used as few-shot examples.  This
-        # increments use_count and success_count so quality ranking improves.
         try:
             await self._report_federated_usage(issues, success=True)
         except Exception as exc:
             self.log.debug(f'_store_fix_memory federated_usage: {exc}')
 
     async def _store_failure_memory(self, issues: list, file_paths: list[str], last_result: Any, test_output: str) -> None:
-        """Gap 3.A: Persist a failed approach as a negative example.
-
-        Called when all MAX_FEEDBACK_ROUNDS probe attempts fail so the fixer
-        never re-applies the same approach for the same issue type and file
-        context in future runs.  The entry is stored with a ``[REVERTED]``
-        prefix by ``fix_memory.store_failure`` so the LLM prompt treats it as
-        an explicit negative example.
-        """
         if not self.fix_memory:
             return
         try:
             raw_type   = issues[0].description[:80] if issues else 'unknown'
             issue_type = self._normalize_bug_class(raw_type)
             file_context = ', '.join(file_paths[:3])
-            # Extract a readable approach summary from the last generated result.
             if isinstance(last_result, PatchResponse) and last_result.patched_files:
                 fix_approach = '; '.join(
                     pf.diff_summary[:80] for pf in last_result.patched_files[:3] if pf.diff_summary
@@ -760,26 +631,12 @@ class FixerAgent(BaseAgent):
             )
         except Exception as exc:
             self.log.debug(f'_store_failure_memory: {exc}')
-        # GAP 6 (Defect 3): report failure back to federation — use_count is
-        # still incremented so the registry knows this pattern was tried but
-        # did not produce a passing fix in this context.
         try:
             await self._report_federated_usage(issues, success=False)
         except Exception as exc:
             self.log.debug(f'_store_failure_memory federated_usage: {exc}')
 
     async def _report_federated_usage(self, issues: list, success: bool) -> None:
-        """
-        Notify fix_memory of the outcome for any federated patterns that
-        appeared as few-shot examples for the current issue set.
-
-        Re-queries memory with retrieve_async (not the sync retrieve) so
-        federated entries are actually present in the result set.  Passes the
-        full 64-character fingerprint stored in entry.id — the previous
-        implementation passed only a 16-char prefix, causing abs(hash(prefix))
-        to differ from abs(hash(full_fp)) and silently breaking the Qdrant
-        use_count / success_count feedback loop.
-        """
         if not self.fix_memory:
             return
         if not hasattr(self.fix_memory, 'record_federated_usage'):
@@ -789,19 +646,14 @@ class FixerAgent(BaseAgent):
         try:
             raw_query = ' '.join(i.description[:100] for i in issues[:3])
             query = self._normalize_bug_class(raw_query)
-            # Use retrieve_async so federated entries are present in this
-            # async context rather than silently deferred.
             if hasattr(self.fix_memory, 'retrieve_async'):
                 entries = await self.fix_memory.retrieve_async(query, n=10, max_age_days=180)
             else:
                 entries = self.fix_memory.retrieve(query, n=10, max_age_days=180)
             for entry in entries:
                 if entry.fix_approach.startswith('[FEDERATED]'):
-                    # entry.id now holds the FULL 64-char SHA-256 fingerprint
-                    # (fixed from the previous 16-char truncation that caused
-                    # abs(hash(prefix)) != abs(hash(full_fp)) in Qdrant lookups).
                     fp = entry.id
-                    if len(fp) == 64:  # only report if fingerprint is intact
+                    if len(fp) == 64:
                         self.fix_memory.record_federated_usage(
                             fingerprint=fp,
                             success=success,
@@ -989,8 +841,6 @@ class FixerAgent(BaseAgent):
                 pass
         return ''
 
-    # ── Gap 5: BoBN winning-patch ingestion ───────────────────────────────────
-
     async def run_with_patch(
         self,
         issues:      list,
@@ -998,45 +848,12 @@ class FixerAgent(BaseAgent):
         patch_model: str,
         patch_meta:  dict | None = None,
     ) -> list[FixAttempt]:
-        """
-        Accept a pre-computed winning patch from the BoBN adversarial ensemble
-        and persist it as a FixAttempt without re-running the LLM fixer.
-
-        Called by StabilizerController._phase_fix_gap5() after BoBNSampler
-        selects the composite-score winner.  The caller already ran the full
-        execution-feedback loop and adversarial critique — this method only
-        handles persistence and issue-status bookkeeping.
-
-        Parameters
-        ----------
-        issues:
-            The Issue objects being fixed by this patch.
-        patch:
-            Unified-diff text of the winning candidate patch.
-        patch_model:
-            LiteLLM model identifier that generated the patch.
-        patch_meta:
-            Optional dict with BoBN scoring fields:
-              bobn_candidate_id, bobn_composite_score, bobn_test_score,
-              bobn_n_candidates, attack_confidence.
-            Stored verbatim as JSON in FixAttempt.extra_notes so the audit
-            trail and API surface full ensemble provenance.
-
-        Returns
-        -------
-        list[FixAttempt]
-            Single-element list containing the persisted FixAttempt, or an
-            empty list if the patch is empty (falls back to standard run()).
-        """
         if not patch or not patch.strip():
-            self.log.warning(
-                '[run_with_patch] Empty patch — falling back to standard run()'
-            )
+            self.log.warning('[run_with_patch] Empty patch — falling back to standard run()')
             return await self.run()
 
         fixed_files = self._parse_unified_diff_to_fixed_files(patch, patch_model)
 
-        # Encode BoBN metadata into extra_notes as compact JSON
         import json as _json
         meta = patch_meta or {}
         extra_notes = _json.dumps({
@@ -1058,7 +875,6 @@ class FixerAgent(BaseAgent):
         )
         await self.storage.upsert_fix(fix)
 
-        # Update issue status — mirrors the bookkeeping in _fix_group()
         for issue in issues:
             issue.fix_attempts += 1
             issue.status = IssueStatus.FIX_GENERATED
@@ -1077,70 +893,33 @@ class FixerAgent(BaseAgent):
         patch:       str,
         patch_model: str,
     ) -> list[FixedFile]:
-        """
-        Parse a unified-diff string into a list of FixedFile objects.
-
-        Handles both git-style headers (``--- a/path`` / ``+++ b/path``)
-        and plain diff headers (``--- path`` / ``+++ path``).  Git ``a/``
-        and ``b/`` prefixes are stripped so the stored path matches the
-        actual repo-relative file path.
-
-        For each file hunk the method counts ``lines_changed`` as the sum
-        of added (``+``) and removed (``-``) lines, excluding the ``---``
-        and ``+++`` header lines.  The full hunk text is stored in
-        ``FixedFile.patch`` so downstream agents can apply it with
-        ``patch -p0``.
-
-        Parameters
-        ----------
-        patch:
-            Raw unified-diff text covering one or more files.
-        patch_model:
-            Model identifier; stored in FixedFile.diff_summary for tracing.
-
-        Returns
-        -------
-        list[FixedFile]
-            One element per changed file, in the order they appear in the
-            diff.  Returns an empty list when the patch is blank.
-        """
         import re as _re
 
         if not patch or not patch.strip():
             return []
 
         fixed_files: list[FixedFile] = []
-        # Split on '--- ' headers to isolate per-file hunks.
-        # The pattern captures the header start so we can reconstruct each
-        # file's full diff text.
         file_blocks = _re.split(r'(?=^--- )', patch, flags=_re.MULTILINE)
 
         for block in file_blocks:
             if not block.strip():
                 continue
 
-            # Extract old-file path from the '--- ' header line
             old_match = _re.match(r'^--- (.+)', block)
             if not old_match:
                 continue
 
-            # Extract new-file path from the '+++ ' header line
             new_match = _re.search(r'^\+\+\+ (.+)', block, _re.MULTILINE)
             if not new_match:
                 continue
 
             raw_path = new_match.group(1).strip()
-            # Strip git-style 'b/' prefix and any trailing whitespace / tab
-            # that some diff generators emit after the path.
             path = _re.sub(r'^[ab]/', '', raw_path)
-            # Strip anything after a tab (diff timestamp field)
             path = path.split('\t')[0].strip()
 
             if not path or path == '/dev/null':
                 continue
 
-            # Count changed lines: any line starting with '+' or '-' that
-            # is NOT the '+++' or '---' header.
             lines      = block.splitlines()
             added      = sum(1 for l in lines if l.startswith('+') and not l.startswith('+++'))
             removed    = sum(1 for l in lines if l.startswith('-') and not l.startswith('---'))
