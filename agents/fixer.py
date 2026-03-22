@@ -677,7 +677,12 @@ class FixerAgent(BaseAgent):
             # the few-shot examples retrieved match the structural class of the
             # current issue, not just the exact description text at one line number.
             query = self._normalize_bug_class(raw_query)
-            entries = self.fix_memory.retrieve(query, n=3, max_age_days=180)
+            # Use retrieve_async so federated augmentation is live (not deferred)
+            # in the async fixer pipeline.
+            if hasattr(self.fix_memory, 'retrieve_async'):
+                entries = await self.fix_memory.retrieve_async(query, n=3, max_age_days=180)
+            else:
+                entries = self.fix_memory.retrieve(query, n=3, max_age_days=180)
             return self.fix_memory.format_as_few_shot(entries)
         except Exception as exc:
             self.log.debug(f'_get_memory_examples: {exc}')
@@ -754,13 +759,15 @@ class FixerAgent(BaseAgent):
 
     async def _report_federated_usage(self, issues: list, success: bool) -> None:
         """
-        Fire-and-forget: notify fix_memory of the outcome for any federated
-        patterns that appeared as few-shot examples for the current issue set.
+        Notify fix_memory of the outcome for any federated patterns that
+        appeared as few-shot examples for the current issue set.
 
-        Extracts the fingerprints of [FEDERATED] entries from the last
-        retrieve() call by re-querying with n=10 (cheap — all in-process).
-        Only actually calls record_federated_usage when a federated entry
-        is found so non-federated deployments incur zero overhead.
+        Re-queries memory with retrieve_async (not the sync retrieve) so
+        federated entries are actually present in the result set.  Passes the
+        full 64-character fingerprint stored in entry.id — the previous
+        implementation passed only a 16-char prefix, causing abs(hash(prefix))
+        to differ from abs(hash(full_fp)) and silently breaking the Qdrant
+        use_count / success_count feedback loop.
         """
         if not self.fix_memory:
             return
@@ -771,20 +778,28 @@ class FixerAgent(BaseAgent):
         try:
             raw_query = ' '.join(i.description[:100] for i in issues[:3])
             query = self._normalize_bug_class(raw_query)
-            entries = self.fix_memory.retrieve(query, n=10, max_age_days=180)
+            # Use retrieve_async so federated entries are present in this
+            # async context rather than silently deferred.
+            if hasattr(self.fix_memory, 'retrieve_async'):
+                entries = await self.fix_memory.retrieve_async(query, n=10, max_age_days=180)
+            else:
+                entries = self.fix_memory.retrieve(query, n=10, max_age_days=180)
             for entry in entries:
                 if entry.fix_approach.startswith('[FEDERATED]'):
-                    # id field is first 16 chars of fingerprint stored by
-                    # _retrieve_federated(); full fingerprint is in the local
-                    # Qdrant/JSON record but the short id is sufficient to
-                    # locate it via record_usage (uses hash(fingerprint) for
-                    # Qdrant uid, which collides at 16 chars).
-                    # Use full fingerprint stored as entry.id padded to 64.
-                    fp = entry.id  # 16-char prefix — enough for local lookup
-                    self.fix_memory.record_federated_usage(
-                        fingerprint=fp,
-                        success=success,
-                    )
+                    # entry.id now holds the FULL 64-char SHA-256 fingerprint
+                    # (fixed from the previous 16-char truncation that caused
+                    # abs(hash(prefix)) != abs(hash(full_fp)) in Qdrant lookups).
+                    fp = entry.id
+                    if len(fp) == 64:  # only report if fingerprint is intact
+                        self.fix_memory.record_federated_usage(
+                            fingerprint=fp,
+                            success=success,
+                        )
+                    else:
+                        self.log.debug(
+                            f'_report_federated_usage: skipping entry with '
+                            f'short fingerprint id={fp!r} (legacy entry)'
+                        )
         except Exception as exc:
             self.log.debug(f'_report_federated_usage: {exc}')
 
