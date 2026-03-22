@@ -2650,6 +2650,12 @@ class StabilizerController:
         assert self.run and self.storage
         combined: list[tuple[str, str, str]] = []  # (path, content, patch)
         all_ids: list[str] = []
+        # ADD-02 FIX (part 1): collect fixes whose files were fully written to
+        # disk but whose brain state has NOT yet been flipped to CLOSED.
+        # Brain state is only updated after the VCS commit succeeds (see part 2
+        # below). If the VCS step fails, these fixes are never marked CLOSED so
+        # the scheduler can retry them on the next cycle.
+        write_ok_fixes: list = []
 
         # ── Determine VCS mode ──────────────────────────────────────────────────
         import shutil
@@ -2701,27 +2707,18 @@ class StabilizerController:
                     fix_write_ok = False
                     continue
 
-            # ADD-02 FIX: only mark committed_at and CLOSED if at least one file
-            # was successfully written to disk. Previously these were set
-            # unconditionally inside the loop, which could mark a fix as committed
-            # even when every file write failed — leaving the brain permanently
-            # out of sync with the repository (fix shows as CLOSED, no VCS commit).
-            # The VCS commit step (git/jj) below will only run if combined is
-            # non-empty, so this guard ensures consistency between brain state
-            # and repository state.
+            # ADD-02 FIX (part 2): do NOT set committed_at / CLOSED here.
+            # Files are now on disk, but we haven't committed to VCS yet.
+            # If the git/jj step below fails, marking CLOSED here would leave
+            # the brain permanently out of sync (CLOSED with no VCS commit, never
+            # retried by the scheduler).  Instead, collect this fix in
+            # write_ok_fixes and let the post-VCS block do the brain update only
+            # once we know the commit actually landed.
             if fix_write_ok and any(ff.path in [c[0] for c in combined] for ff in fix.fixed_files):
-                fix.committed_at = datetime.now(tz=timezone.utc)
-                await self.storage.upsert_fix(fix)
-                for iid in fix.issue_ids:
-                    await self.storage.update_issue_status(iid, IssueStatus.CLOSED.value)
-                await self._trail(
-                    "FIX_COMMITTED", fix.id, "fix",
-                    after=str([ff.path for ff in fix.fixed_files]),
-                    artifact_type=ArtifactType.FIX,
-                )
+                write_ok_fixes.append(fix)
             elif not fix_write_ok:
                 self.log.error(
-                    f"[commit] Fix {fix.id[:12]} had file write failures — "\
+                    f"[commit] Fix {fix.id[:12]} had file write failures — "
                     "NOT marking as committed. Issues remain open for retry."
                 )
 
@@ -2760,6 +2757,13 @@ class StabilizerController:
             f"(run={self.run.id[:8]} cycle={self.run.cycle_count})"
         )
 
+        # ADD-02 FIX (part 3): track whether the VCS step actually landed.
+        # Brain state (committed_at + CLOSED) is written only when vcs_ok=True.
+        # On VCS failure we revert all written files from .orig backups so the
+        # repository stays consistent with the brain — both OPEN and unchanged.
+        # The scheduler will re-attempt these issues on the next cycle.
+        vcs_ok: bool = not combined   # vacuously True when there is nothing to commit
+
         if jj_change_opened and combined:
             # JJ path: describe the already-opened change
             try:
@@ -2770,8 +2774,13 @@ class StabilizerController:
                     capture_output=True, timeout=15,
                 )
                 self.log.info(f"[commit] JJ change described: {commit_msg}")
+                vcs_ok = True
             except Exception as exc:
-                self.log.warning(f"[commit] jj describe failed: {exc}")
+                self.log.error(
+                    f"[commit] jj describe failed — files written to disk but NOT "
+                    f"committed to VCS. Issues will remain OPEN for retry. Error: {exc}"
+                )
+                vcs_ok = False
         elif _git_ok and combined:
             # Git fallback: stage and commit
             try:
@@ -2783,10 +2792,6 @@ class StabilizerController:
                     capture_output=True, timeout=30,
                 )
                 # BUG-04 FIX: check git add returncode.
-                # subprocess.run() never raises for non-zero exit codes.
-                # A failed git add (e.g. untracked file outside worktree, index
-                # locked by another process) was previously silently ignored and
-                # the commit would then stage nothing or fail for a different reason.
                 if add_result.returncode != 0:
                     raise RuntimeError(
                         f"git add failed rc={add_result.returncode}: "
@@ -2799,19 +2804,50 @@ class StabilizerController:
                     capture_output=True, timeout=30,
                 )
                 # BUG-04 FIX: check git commit returncode.
-                # Previously the log.info("git commit: msg") fired unconditionally
-                # regardless of the exit code, meaning silent commit failures would
-                # leave issues marked CLOSED with no actual VCS commit. Now a
-                # non-zero rc raises RuntimeError which is caught by the outer
-                # try/except, logged as a warning, and surfaces to the operator.
                 if commit_result.returncode != 0:
                     raise RuntimeError(
                         f"git commit failed rc={commit_result.returncode}: "
                         f"{commit_result.stderr.decode(errors='replace')[:300]}"
                     )
                 self.log.info(f"[commit] git commit: {commit_msg}")
+                vcs_ok = True
             except Exception as exc:
-                self.log.warning(f"[commit] git commit failed: {exc}")
+                self.log.error(
+                    f"[commit] git commit failed — files written to disk but NOT "
+                    f"committed to VCS. Issues will remain OPEN for retry. Error: {exc}"
+                )
+                vcs_ok = False
+
+        # ADD-02 FIX (part 3 continued): apply brain state update based on outcome.
+        if vcs_ok and write_ok_fixes:
+            # VCS commit landed — safe to mark fixes as CLOSED in the brain.
+            _committed_at = datetime.now(tz=timezone.utc)
+            for _fix in write_ok_fixes:
+                _fix.committed_at = _committed_at
+                await self.storage.upsert_fix(_fix)
+                for _iid in _fix.issue_ids:
+                    await self.storage.update_issue_status(_iid, IssueStatus.CLOSED.value)
+                await self._trail(
+                    "FIX_COMMITTED", _fix.id, "fix",
+                    after=str([ff.path for ff in _fix.fixed_files]),
+                    artifact_type=ArtifactType.FIX,
+                )
+        elif not vcs_ok and write_ok_fixes:
+            # VCS commit failed — revert written files from .orig backups so the
+            # working tree is consistent with the brain (both OPEN / unchanged).
+            self.log.error(
+                f"[commit] VCS commit failed for module={module}. "
+                f"Reverting {len(write_ok_fixes)} written fix(es) from .orig backups. "
+                "Issues remain OPEN and will be retried on the next cycle."
+            )
+            for _fix in write_ok_fixes:
+                try:
+                    await self._revert_fix(_fix)
+                except Exception as _rev_exc:
+                    self.log.warning(
+                        f"[commit] Revert of fix {_fix.id[:12]} failed: {_rev_exc}. "
+                        "Manual inspection of the working tree is recommended."
+                    )
 
         if self.pr_manager and combined:
             try:
