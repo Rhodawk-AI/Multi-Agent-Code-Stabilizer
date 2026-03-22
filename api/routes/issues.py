@@ -28,6 +28,10 @@ class IssueOut(BaseModel):
     fix_attempt_count: int
     created_at: str
     escalated_reason: str | None = None
+    # ARCH-1 FIX: surface which CPG context source was used so dashboards can
+    # track Joern coverage rate without parsing log files.
+    # Values: "cpg" | "graph_fallback" | "vector_fallback" | null
+    cpg_context_source: str | None = None
 
 
 @router.get("/", response_model=list[IssueOut])
@@ -125,4 +129,7 @@ def _to_out(issue) -> IssueOut:
         fix_attempt_count=issue.fix_attempt_count,
         created_at=issue.created_at.isoformat(),
         escalated_reason=issue.escalated_reason,
+        # ARCH-1 FIX: expose cpg_context_source so the dashboard can show
+        # whether Joern, import-graph fallback, or vector fallback was used.
+        cpg_context_source=getattr(issue, "cpg_context_source", None) or None,
     )
