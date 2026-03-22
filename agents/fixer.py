@@ -479,17 +479,47 @@ class FixerAgent(BaseAgent):
             function_names: list[str] = []
             for fp in file_paths:
                 syms = await self._extract_file_symbols(fp)
-                module_prefix = (
-                    Path(fp)
-                    .with_suffix('')
-                    .as_posix()
-                    .replace('/', '.')
-                )
                 for sym in sorted(syms)[:20]:
-                    function_names.append(sym)
-                    qualified = f'{module_prefix}.{sym}'
-                    if qualified not in function_names:
-                        function_names.append(qualified)
+                    # Always include the bare name so Joern's .name() lookup works
+                    # for simple cases.
+                    if sym not in function_names:
+                        function_names.append(sym)
+
+                    # ARCH-02 FIX: resolve each bare symbol to its canonical Joern
+                    # FQN using JoernClient.resolve_method_fqn().  The previous
+                    # approach derived a module-path prefix from the filesystem path
+                    # (e.g. "src.services.payment_service.handle_request") which is
+                    # an approximation.  Joern stores FQNs in language-specific
+                    # formats — Python: "<module>.<Class>.<method>", C++:
+                    # "<namespace>::<class>::<method>" — that may not match the
+                    # filesystem-derived prefix for class methods, nested functions,
+                    # or non-standard package layouts.
+                    #
+                    # resolve_method_fqn() queries Joern directly:
+                    #   cpg.method.name("<sym>").filter(_.filename.endsWith("<file>"))
+                    #   .fullName.dedup.l
+                    # and returns the actual FQN(s) as stored in the CPG.  These are
+                    # then passed to compute_blast_radius() alongside the bare name so
+                    # that both lookup paths (cpg.method.name() for bare names and
+                    # cpg.method.filter(_.fullName==...) for FQNs) are covered.
+                    if hasattr(self.cpg_engine, 'resolve_method_fqn'):
+                        try:
+                            fqns = await self.cpg_engine.resolve_method_fqn(
+                                bare_name=sym,
+                                file_path=fp,
+                            )
+                            for fqn in fqns:
+                                if fqn and fqn not in function_names:
+                                    function_names.append(fqn)
+                                    self.log.debug(
+                                        '[Fixer] ARCH-02: resolved %r → FQN %r (file=%s)',
+                                        sym, fqn, fp,
+                                    )
+                        except Exception as _fqn_exc:
+                            self.log.debug(
+                                '[Fixer] ARCH-02: resolve_method_fqn(%r, %r) failed: %s',
+                                sym, fp, _fqn_exc,
+                            )
 
             if not function_names:
                 function_names = [
@@ -499,11 +529,11 @@ class FixerAgent(BaseAgent):
 
             blast = await self.cpg_engine.compute_blast_radius(function_names=function_names, file_paths=file_paths, depth=3)
 
-            # ARCH-02 FIX: warn when Joern is live but returned zero impact.
-            # Zero score from a live CPG almost always means the CPG was built
-            # from a different commit or the import is incomplete.  Without this
-            # warning the blast-radius gate silently passes and high-impact changes
-            # bypass human review.
+            # ARCH-02: warn when Joern is live but still returned zero impact after
+            # FQN resolution.  After the FQN fix this is a stronger signal than
+            # before — if Joern is live AND we passed resolved FQNs AND the score
+            # is still 0, the CPG was almost certainly built from a different commit
+            # or the cpg import is incomplete.
             if (
                 getattr(blast, 'source', None) == 'cpg'
                 and blast.blast_radius_score == 0.0
@@ -512,7 +542,8 @@ class FixerAgent(BaseAgent):
             ):
                 self.log.warning(
                     '[Fixer] ARCH-02: Joern CPG live (source=cpg) but returned '
-                    'blast_radius_score=0 and 0 affected functions for %d symbol(s) %s. '
+                    'blast_radius_score=0 and 0 affected functions for %d name(s) %s '
+                    '(includes resolved FQNs where available). '
                     'CPG may be built from a different checkout or cpg import is '
                     'incomplete. Blast-radius gate will PASS but may be incorrect — '
                     'high-impact fixes may bypass human review. '
