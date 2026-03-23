@@ -92,6 +92,12 @@ _CHUNK_SIZE        = 64 * 1024   # 64 KB read/write chunks — O(1) RAM per entr
 # Upload base directory — all extractions live here
 _UPLOAD_BASE = Path(os.environ.get("RHODAWK_UPLOAD_DIR", "/tmp/rhodawk_uploads"))
 
+# MISSING-4 FIX: per-process concurrency limit for upload runs.
+# Without a cap, a client can submit hundreds of concurrent 2 GB zips, each
+# spawning a full StabilizerController, exhausting file descriptors and RAM.
+# Workers OOM with no recovery (state is in-process _run_state dict).
+_MAX_CONCURRENT_RUNS = int(os.environ.get("RHODAWK_MAX_CONCURRENT_UPLOADS", "5"))
+
 # In-process run state (run_id → dict)
 # For multi-process deployments this should be backed by Redis.
 # For single-process (default) this is sufficient.
@@ -301,36 +307,60 @@ async def _run_audit_on_extracted(
         state["status"]       = "DONE"
         state["final_status"] = final_status.value
 
+        # BUG-4 FIX: collect changed paths while controller is guaranteed alive,
+        # immediately after stabilize() returns and before the controller goes
+        # out of scope. Previously _build_download_zip re-queried storage after
+        # the controller could be GC'd. Also, partial fixes committed before a
+        # crash are now available for download even when status=ERROR.
+        rhodawk_run_id = run_obj.id
+        try:
+            fixes = await controller.storage.list_fixes(
+                run_id=rhodawk_run_id)
+            changed_paths: set[str] = {
+                ff.path
+                for fix in fixes
+                for ff in (fix.fixed_files or [])
+                if ff.path
+            }
+            state["_changed_paths"] = changed_paths
+        except Exception as _cp_exc:
+            log.warning("ZipUpload: could not collect changed paths: %s", _cp_exc)
+            state["_changed_paths"] = set()
+
         # Build download zip of fixed files
-        await _build_download_zip(run_id, controller, extract_dir)
+        await _build_download_zip(run_id, state["_changed_paths"], extract_dir)
 
     except Exception as exc:
         log.exception("ZipUpload run_id=%s audit failed: %s", run_id, exc)
         state["status"] = "ERROR"
         state["error"]  = str(exc)
+        # BUG-4 FIX: attempt to build partial download zip even on failure.
+        # Fixes committed before the crash are still useful to the operator.
+        if state.get("_changed_paths"):
+            try:
+                await _build_download_zip(
+                    run_id, state["_changed_paths"], extract_dir)
+            except Exception:
+                pass
 
 
 async def _build_download_zip(
-    run_id:     str,
-    controller: Any,
-    repo_root:  Path,
+    run_id:        str,
+    changed_paths: set[str],
+    repo_root:     Path,
 ) -> None:
     """
-    After a successful run, build a zip of all fixed files for download.
-    Only changed files are included — not the whole extracted repo.
+    BUG-4 FIX: Build a zip of changed files using a pre-collected path set.
+
+    Previously this function re-queried controller.storage after the controller
+    may have been GC'd, causing AttributeError or connection pool errors.
+    The caller now collects changed_paths while the controller is alive and
+    passes them directly — no storage query needed here.
     """
     state    = _run_state[run_id]
     out_path = _UPLOAD_BASE / run_id / "fixed_files.zip"
 
     try:
-        rhodawk_run_id = state.get("rhodawk_run_id", "")
-        fixes = await controller.storage.list_fixes(run_id=rhodawk_run_id)
-        changed_paths: set[str] = set()
-        for fix in fixes:
-            for ff in (fix.fixed_files or []):
-                if ff.path:
-                    changed_paths.add(ff.path)
-
         if not changed_paths:
             state["download_path"] = None
             return
@@ -384,6 +414,20 @@ async def upload_zip(
         # Be lenient with content type — browsers send different values.
         # Rely on the file extension and magic bytes instead.
         pass
+
+    # MISSING-4 FIX: enforce per-process concurrency limit before allocating resources
+    active_runs = sum(
+        1 for s in _run_state.values()
+        if s.get("status") not in ("DONE", "ERROR")
+    )
+    if active_runs >= _MAX_CONCURRENT_RUNS:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Too many concurrent audit runs ({active_runs}/{_MAX_CONCURRENT_RUNS}). "
+                "Wait for a run to complete or increase RHODAWK_MAX_CONCURRENT_UPLOADS."
+            ),
+        )
 
     filename = file.filename or "upload.zip"
     if not filename.lower().endswith(".zip"):

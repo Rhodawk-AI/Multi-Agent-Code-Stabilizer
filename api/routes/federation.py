@@ -441,10 +441,24 @@ async def register_peer(
     """Register a new peer deployment with this registry."""
     _check_fed_auth(request)
 
-    if not body.url.startswith(("http://", "https://")):
+    # SEC-3 FIX: validate peer URL against SSRF risks before storing.
+    # The previous check only verified that the URL started with "http://" or
+    # "https://", allowing http:// (unencrypted) and any IP address including
+    # 169.254.169.254 (AWS IMDS), 127.x (loopback), and RFC 1918 ranges.
+    # An attacker who can call this endpoint can cause the federation client to
+    # POST pattern payloads to internal services on every sync cycle, exfiltrating
+    # credentials or triggering unintended side effects.
+    try:
+        from memory.federated_store import _validate_peer_url
+        _validate_peer_url(body.url)
+    except ValueError as _ssrf_err:
         raise HTTPException(
             status_code=422,
-            detail="url must start with http:// or https://",
+            detail=(
+                f"Peer URL rejected: {_ssrf_err}. "
+                "Federation peers must use https:// and must not target private, "
+                "loopback, or link-local IP ranges."
+            ),
         )
 
     peer = await store.register_peer(url=body.url, name=body.name)
