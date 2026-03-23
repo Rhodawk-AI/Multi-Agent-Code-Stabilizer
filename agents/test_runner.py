@@ -85,10 +85,22 @@ Environment variables
     RHODAWK_TEST_SANDBOX_TIMEOUT
         Timeout in seconds for the sandboxed test run.  Default: 300.
 
-If Docker is not installed (shutil.which("docker") is None) execution
-falls back to direct host execution with a WARNING logged.  Operators
-running in a Docker-in-Docker environment must ensure the host socket
-is mounted: -v /var/run/docker.sock:/var/run/docker.sock.
+SEC-1 FIX — Sandbox failure is now a hard abort, not a silent bypass
+──────────────────────────────────────────────────────────────────────
+If Docker is not installed (shutil.which("docker") is None) at startup,
+``_use_sandbox`` is set to False and a WARNING is logged.  Direct host
+execution is only permitted when RHODAWK_TEST_SANDBOX_DISABLED=1 is set
+explicitly by the operator.
+
+If Docker IS installed but the ``docker run`` call raises at runtime
+(socket permission error, OOM kill, container start failure, etc.),
+execution is now ABORTED with returncode=-1 and a CRITICAL log.  The
+previous behaviour of falling through to unsandboxed host execution is
+removed — a Docker socket error must not silently become an unsandboxed
+test run.  Operators must fix the Docker socket mount and restart.
+
+Operators running in a Docker-in-Docker environment must ensure the host
+socket is mounted: -v /var/run/docker.sock:/var/run/docker.sock.
 """
 from __future__ import annotations
 
@@ -201,10 +213,12 @@ class TestRunnerAgent(BaseAgent):
             )
         elif not _docker_available():
             log.warning(
-                "[test_runner] Docker not found on PATH — test sandbox is DISABLED. "
-                "Test code will run directly on the host. "
-                "Install Docker or set RHODAWK_TEST_SANDBOX_IMAGE and ensure "
-                "the docker CLI is available to enable isolation."
+                "[test_runner] Docker CLI not found on PATH — test sandbox is DISABLED. "
+                "Direct host execution is active; set RHODAWK_TEST_SANDBOX_DISABLED=1 "
+                "explicitly to acknowledge this. Install Docker and ensure the daemon "
+                "socket is mounted (/var/run/docker.sock) to enable isolation. "
+                "Note: if Docker IS found at startup but the docker run call fails at "
+                "runtime, execution will ABORT (not fall back to the host)."
             )
         else:
             log.info(
@@ -405,13 +419,36 @@ class TestRunnerAgent(BaseAgent):
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess:
         """
-        ARCH-2/SEC-3: Execute ``cmd`` inside the Docker sandbox when available,
-        or directly on the host with a WARNING when not.
+        SEC-1 FIX: Execute ``cmd`` inside the Docker sandbox when available,
+        or directly on the host ONLY when RHODAWK_TEST_SANDBOX_DISABLED=1 is
+        explicitly set.
+
+        Sandbox failure behaviour (CHANGED from previous implementation)
+        ─────────────────────────────────────────────────────────────────
+        Previously, if ``docker run`` raised an exception at runtime (socket
+        permission error, OOM kill, daemon not reachable, etc.), the code
+        fell through to unsandboxed host execution with a WARNING log.  This
+        silently bypassed the security boundary on every standard deployment
+        where the Docker socket was not mounted — exactly the scenario SEC-1
+        describes.
+
+        New behaviour:
+          • ``docker run`` timeout → returns CompletedProcess(returncode=-1)
+            with a descriptive stderr string (non-fatal — the pipeline can
+            retry or skip).
+          • ``docker run`` exception at runtime → logs CRITICAL and returns
+            CompletedProcess(returncode=-1, stderr="Sandbox unavailable — …").
+            Execution does NOT fall through to the host.  The caller receives
+            a failed result and the pipeline treats the fix attempt as untested.
+          • ``_use_sandbox=False`` (Docker absent at startup OR
+            RHODAWK_TEST_SANDBOX_DISABLED=1) → runs directly on the host.
+            This path is only reached intentionally, with a WARNING already
+            emitted at __init__ time.
 
         Parameters
         ----------
         cmd:
-            The bare command, e.g. ["pytest", "--tb=short", "-q", "tests/"].
+            The bare command to execute, e.g. ["pytest", "--tb=short", "-q", ...].
         timeout:
             Subprocess timeout in seconds.
         cwd:
@@ -444,18 +481,43 @@ class TestRunnerAgent(BaseAgent):
                     stdout="", stderr=f"Sandbox timeout after {timeout}s",
                 )
             except Exception as exc:
-                log.error("[test_runner] sandbox run failed: %s — falling back to host", exc)
-                # Fall through to direct execution so a docker startup failure
-                # does not permanently break the test loop.  The security
-                # boundary is lost but the pipeline can continue.
-                log.warning(
-                    "[test_runner] SECURITY: sandbox unavailable — running test "
-                    "command directly on host: %s", cmd[:3],
+                # SEC-1 FIX: do NOT fall through to unsandboxed host execution.
+                #
+                # Previous behaviour: log a WARNING and fall through to
+                # subprocess.run() on the host — silently bypassing the Docker
+                # security boundary on every deployment without a socket mount.
+                #
+                # New behaviour: log CRITICAL and return a failed result.
+                # The caller (BoBNSampler / _phase_fix_gap5 / _run_pytest) will
+                # see returncode=-1 / TestRunStatus.FAILED and treat the fix
+                # attempt as untested.  The pipeline continues without the test
+                # signal rather than executing LLM-generated code unsandboxed.
+                #
+                # Operators must fix the Docker socket mount and restart:
+                #   docker-compose.yml rhodawk-worker volumes:
+                #     - /var/run/docker.sock:/var/run/docker.sock
+                log.critical(
+                    "[test_runner] SECURITY: Docker sandbox failed — "
+                    "ABORTING test execution. LLM-generated code will NOT run "
+                    "on the host. Fix the Docker socket mount and restart. "
+                    "Error: %s", exc,
+                )
+                return subprocess.CompletedProcess(
+                    full_cmd, returncode=-1,
+                    stdout="",
+                    stderr=(
+                        f"Sandbox unavailable — test execution aborted. "
+                        f"Fix /var/run/docker.sock mount. Error: {exc}"
+                    ),
                 )
         else:
-            log.debug("[test_runner] running test command on host (no sandbox): %s", cmd[:3])
+            # _use_sandbox is False: either Docker was absent at startup
+            # (shutil.which returned None) or RHODAWK_TEST_SANDBOX_DISABLED=1
+            # was set explicitly.  A WARNING was already emitted at __init__
+            # time.  Direct host execution is intentional here.
+            log.debug("[test_runner] running test command on host (sandbox disabled): %s", cmd[:3])
 
-        # Direct (unsandboxed) execution path — docker unavailable or disabled.
+        # Direct (unsandboxed) execution — only reached when _use_sandbox=False.
         try:
             return subprocess.run(
                 cmd,
