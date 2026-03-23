@@ -105,30 +105,7 @@ _INIT_DONE:   bool       = False
 
 
 def _check_secret_entropy(secret: str, algorithm: str) -> None:
-    """
-    SEC-2 FIX: Validate Shannon entropy of HS* JWT secrets.
-
-    The length check in _init_config() catches short secrets (< 64 chars in
-    production, < 32 chars always) but does NOT catch low-entropy strings of
-    adequate length. A placeholder like "CHANGE_ME_generate_with_python" is
-    41 chars — it passes the min_len=32 check in development mode with only
-    a warning, while being trivially guessable (known public string, low entropy).
-
-    Shannon entropy measures information density in bits per character.
-    A truly random hex string (secrets.token_hex(32)) scores ~4.0 bits/char.
-    Known placeholder strings score < 4.0 bits/char due to repeated patterns.
-
-    Threshold: 4.5 bits/char. This rejects:
-      - "CHANGE_ME_generate_with_python"  (~3.5 bits/char)
-      - "password", "secret", "test123"   (< 3.0 bits/char)
-    While accepting:
-      - secrets.token_hex(32)             (~4.0 bits/char — marginal; length saves it)
-    Note: token_hex(32) produces exactly 64 chars which meet the length requirement;
-    the entropy check is belt-and-suspenders for non-hex secrets of adequate length.
-
-    Applied unconditionally regardless of RHODAWK_ENV so development deployments
-    do not accidentally use a guessable secret against databases containing real data.
-    """
+    """Validate Shannon entropy of HS* secrets. Rejects placeholders and low-entropy strings."""
     import collections
     import math
 
