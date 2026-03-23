@@ -1940,7 +1940,7 @@ class TestArch02BlastRadiusSmoke:
             f"ARCH-02: get_callers() used cpg.method.name() for FQN '{fqn}'. "
             f"Query was: {q!r}. "
             f"cpg.method.name() looks up the bare name field and returns nothing "
-            f"for FQNs. Must use cpg.method.filter(_.fullName == "...") instead."
+            f"for FQNs. Must use cpg.method.filter(_.fullName == \"...\") instead."
         )
         assert 'method.name(' not in q or fqn not in q, (
             f"ARCH-02: get_callers() passed FQN '{fqn}' to cpg.method.name() — "
