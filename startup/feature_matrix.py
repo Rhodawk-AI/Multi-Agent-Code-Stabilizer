@@ -93,13 +93,6 @@ _CAPABILITIES: list[Capability] = [
         degraded_fallback="Multi-language syntax gate degraded; C/C++ AST parsing unavailable",
     ),
     Capability(
-        name="qdrant_client",
-        description="Qdrant vector database client for semantic search",
-        check_type="import", check_target="qdrant_client",
-        required_for=set(),
-        degraded_fallback="Vector similarity search unavailable",
-    ),
-    Capability(
         name="langgraph",
         description="LangGraph state machine orchestration",
         check_type="import", check_target="langgraph",
@@ -257,16 +250,10 @@ _CAPABILITIES: list[Capability] = [
     Capability(
         name="audit_secret",
         description="RHODAWK_AUDIT_SECRET entropy validation (non-empty, non-placeholder, ≥32 chars)",
-        check_type="subprocess",
-        check_target=(
-            "python3 -c \"import os,sys; "
-            "s=os.environ.get('RHODAWK_AUDIT_SECRET',''); "
-            "bad=not s or len(s)<32 or s.startswith('CHANGE_ME') or s.startswith('changeme'); "
-            "sys.exit(1 if bad else 0)\""
-        ),
+        check_type="env_entropy",
+        check_target="RHODAWK_AUDIT_SECRET",
         required_for={"GENERAL", "MILITARY", "AEROSPACE", "NUCLEAR", "MEDICAL", "FINANCE", "EMBEDDED"},
-        degraded_fallback="NONE — audit trail integrity cannot be guaranteed; "
-                          "set RHODAWK_AUDIT_SECRET to a 32+ char random hex string",
+        degraded_fallback="NONE — set RHODAWK_AUDIT_SECRET to a 32+ char random hex string",
     ),
     # 0-A FIX: qdrant-client absence causes an unhandled ImportError crash at
     # _init_vector_store() even though the preflight check reports it as UNAVAILABLE
@@ -321,6 +308,14 @@ class FeatureMatrix:
         """
         force_strict = domain_mode in {"MILITARY", "AEROSPACE", "NUCLEAR"}
         strict = strict or force_strict
+
+        _names = [cap.name for cap in _CAPABILITIES]
+        _dupes = {n for n in _names if _names.count(n) > 1}
+        if _dupes:
+            raise ValueError(
+                f"Duplicate capability names in _CAPABILITIES: {_dupes}. "
+                "Each capability must have a unique name."
+            )
 
         for cap in _CAPABILITIES:
             checked = self._check_capability(cap)
@@ -404,6 +399,8 @@ class FeatureMatrix:
                 return self._check_executable(cap)
             elif cap.check_type == "subprocess":
                 return self._check_subprocess(cap)
+            elif cap.check_type == "env_entropy":
+                return self._check_env_entropy(cap)
             else:
                 cap.status = CapabilityStatus.UNAVAILABLE
                 cap.error_detail = f"Unknown check_type: {cap.check_type}"
@@ -446,7 +443,8 @@ class FeatureMatrix:
 
     def _check_subprocess(self, cap: Capability) -> Capability:
         try:
-            parts = cap.check_target.split()
+            import shlex
+            parts = shlex.split(cap.check_target)
             result = subprocess.run(
                 parts, capture_output=True, text=True, timeout=10
             )
@@ -463,6 +461,31 @@ class FeatureMatrix:
             cap.status = CapabilityStatus.DEGRADED
             cap.error_detail = "Timeout — process may be available but slow"
         return cap
+
+    def _check_env_entropy(self, cap: Capability) -> Capability:
+        import collections, math
+        val = __import__('os').environ.get(cap.check_target, '')
+        if not val or len(val) < 32:
+            cap.status = CapabilityStatus.UNAVAILABLE
+            cap.error_detail = f"{cap.check_target} is empty or < 32 chars"
+            return cap
+        bad = ('CHANGE_ME', 'changeme', 'change_me', 'placeholder', 'PLACEHOLDER')
+        if any(val.lower().startswith(p.lower()) for p in bad):
+            cap.status = CapabilityStatus.UNAVAILABLE
+            cap.error_detail = f"{cap.check_target} is a known placeholder"
+            return cap
+        freq = collections.Counter(val)
+        entropy = -sum((c/len(val))*math.log2(c/len(val)) for c in freq.values())
+        if entropy < 4.0:
+            cap.status = CapabilityStatus.DEGRADED
+            cap.error_detail = f"Low entropy ({entropy:.2f} bits/char < 4.0)"
+            return cap
+        cap.status = CapabilityStatus.AVAILABLE
+        return cap
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
 
     def _emit_report(self, domain_mode: str) -> None:
         available  = [c for c in self._capabilities.values()
