@@ -2,200 +2,286 @@
 utils/chunking.py
 =================
 Multi-strategy file chunker for Rhodawk AI Code Stabilizer.
-
-PRODUCTION FIXES vs audit report
-──────────────────────────────────
-• FUNCTION strategy: C/C++ function-boundary chunking via tree-sitter.
-  Never splits a function across chunk boundaries.
-• PREPROCESSED strategy: runs clang -E before chunking for C/C++.
-• Overlap computed by scope depth for C/C++ (not fixed line count).
-• FIX_RATIO_MIN/MAX guards removed — chunking has no ratio enforcement.
-• chunk_file() returns FileChunkRecord list with function_name populated.
-• Skeleton extraction includes line numbers for surgical-patch context.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
-import shutil
-import subprocess
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from brain.schemas import ChunkStrategy, FileChunkRecord
 
 log = logging.getLogger(__name__)
 
-# Overlap in lines for non-function-boundary strategies
+# ── Line-count thresholds ─────────────────────────────────────────────────────
+THRESHOLD_FULL     = 200
+THRESHOLD_HALF     = 1_000
+THRESHOLD_AST      = 5_000
+THRESHOLD_SKELETON = 20_000
+
 OVERLAP_LINES = 40
 
-# Characters that indicate deep nesting — scope-aware overlap
-SCOPE_OPENER  = frozenset({"{", "(", "[", "#if", "#ifdef", "#ifndef"})
-SCOPE_CLOSER  = frozenset({"}", ")", "]", "#endif"})
+# ── Chunk dataclass ───────────────────────────────────────────────────────────
 
+@dataclass
+class Chunk:
+    content:       str
+    line_start:    int
+    line_end:      int
+    index:         int
+    total:         int
+    strategy:      ChunkStrategy
+    file_path:     str  = ""
+    function_name: str  = ""
+    is_skeleton:   bool = False
+
+
+# ── Language detection ────────────────────────────────────────────────────────
+
+_EXT_MAP: dict[str, str] = {
+    ".py": "python", ".pyw": "python",
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".jsx": "javascript",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    ".rs": "rust", ".go": "go", ".java": "java", ".kt": "kotlin",
+    ".swift": "swift", ".rb": "ruby", ".php": "php", ".cs": "csharp",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".json": "json", ".md": "markdown", ".sql": "sql",
+}
+
+def detect_language(file_path: str) -> str:
+    return _EXT_MAP.get(Path(file_path).suffix.lower(), "unknown")
+
+
+# ── File inclusion filter ─────────────────────────────────────────────────────
+
+_SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".hg", ".svn", "__pycache__",
+    ".venv", "venv", "env", ".env", "dist", "build",
+    "out", "target", "vendor", "third_party", ".idea", ".vscode",
+    "coverage", ".pytest_cache", ".mypy_cache",
+})
+
+_SKIP_EXTS = frozenset({
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".exe",
+    ".o", ".a", ".lib", ".obj", ".class",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov",
+    ".db", ".sqlite", ".sqlite3",
+})
+
+_SKIP_NAMES = frozenset({
+    "package-lock.json", "yarn.lock", "poetry.lock",
+    "Pipfile.lock", "composer.lock",
+})
+
+def should_include_file(path: Path) -> bool:
+    for part in path.parts:
+        if part.startswith(".") and part not in (".", ".."):
+            return False
+        if part in _SKIP_DIRS:
+            return False
+    if path.name in _SKIP_NAMES:
+        return False
+    suffix = path.suffix.lower()
+    if suffix in _SKIP_EXTS:
+        return False
+    if any(path.name.endswith(s) for s in (".min.js", ".min.css", ".pb.go", "_pb2.py")):
+        return False
+    if suffix and suffix not in _EXT_MAP and suffix not in {".txt", ".cfg", ".ini"}:
+        return False
+    return True
+
+
+def collect_repo_files(root: Path, max_files: int = 50_000) -> list[Path]:
+    results: list[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(root)
+        except ValueError:
+            continue
+        skip = False
+        for part in rel.parts[:-1]:
+            if part.startswith(".") or part in _SKIP_DIRS:
+                skip = True
+                break
+        if skip:
+            continue
+        if not should_include_file(p):
+            continue
+        results.append(p)
+        if len(results) >= max_files:
+            break
+    return sorted(results)
+
+
+# ── Strategy selection ────────────────────────────────────────────────────────
+
+def determine_strategy(line_count: int) -> ChunkStrategy:
+    if line_count <= THRESHOLD_FULL:
+        return ChunkStrategy.FULL
+    if line_count <= THRESHOLD_HALF:
+        return ChunkStrategy.HALF
+    if line_count <= THRESHOLD_AST:
+        return ChunkStrategy.AST_NODES
+    if line_count <= THRESHOLD_SKELETON:
+        return ChunkStrategy.SKELETON
+    return ChunkStrategy.SKELETON_ONLY
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def chunk_file(
-    file_path:  str,
-    content:    str,
-    language:   str,
-    run_id:     str,
-    strategy:   ChunkStrategy = ChunkStrategy.FULL,
-) -> list[FileChunkRecord]:
-    """
-    Chunk file content according to strategy.
-    Returns a list of FileChunkRecord instances ready for storage.
-    """
+    file_path: str,
+    content:   str,
+    language:  str = "",
+    run_id:    str = "",
+    strategy:  ChunkStrategy | None = None,
+) -> list[Chunk]:
     if not content.strip():
         return []
+    if not language:
+        language = detect_language(file_path)
+    line_count = content.count("\n") + 1
+    if strategy is None:
+        strategy = determine_strategy(line_count)
+    is_skeleton = strategy in (ChunkStrategy.SKELETON, ChunkStrategy.SKELETON_ONLY)
 
-    if strategy == ChunkStrategy.FUNCTION and language in {"c", "cpp", "python",
-                                                            "javascript", "typescript",
-                                                            "rust", "go"}:
-        chunks_raw = _chunk_by_functions(content, language)
-    elif strategy == ChunkStrategy.FULL:
-        chunks_raw = [(content, 1, content.count("\n") + 1, "")]
+    if strategy == ChunkStrategy.FULL:
+        raw = [(content, 1, line_count, "")]
     elif strategy == ChunkStrategy.HALF:
-        chunks_raw = _chunk_by_lines(content, max_lines=500)
+        raw = _chunk_by_lines(content, max_lines=500)
     elif strategy == ChunkStrategy.AST_NODES:
-        chunks_raw = _chunk_by_lines(content, max_lines=300)
+        raw = _chunk_by_lines(content, max_lines=300)
     elif strategy == ChunkStrategy.SKELETON:
-        chunks_raw = [(_extract_skeleton(content), 1, content.count("\n") + 1, "")]
+        raw = [(_extract_skeleton(content), 1, line_count, "")]
     elif strategy == ChunkStrategy.SKELETON_ONLY:
-        chunks_raw = [(_extract_skeleton_compact(content), 1, content.count("\n") + 1, "")]
+        raw = [(_extract_skeleton_compact(content), 1, line_count, "")]
+    elif strategy == ChunkStrategy.FUNCTION:
+        raw = _chunk_by_functions(content, language)
     else:
-        chunks_raw = [(content, 1, content.count("\n") + 1, "")]
+        raw = [(content, 1, line_count, "")]
 
-    records: list[FileChunkRecord] = []
-    total = len(chunks_raw)
-
-    for idx, (chunk_content, line_start, line_end, fn_name) in enumerate(chunks_raw):
+    chunks: list[Chunk] = []
+    for idx, (chunk_content, ls, le, fn_name) in enumerate(raw):
         if not chunk_content.strip():
             continue
-        rec = FileChunkRecord(
-            file_path=file_path,
-            run_id=run_id,
-            chunk_index=idx,
-            total_chunks=total,
-            line_start=line_start,
-            line_end=line_end,
-            language=language,
-            strategy=strategy,
-            content=chunk_content,
-            function_name=fn_name,
-            all_functions=[fn_name] if fn_name else [],
-            raw_observations=[],
-        )
-        records.append(rec)
+        chunks.append(Chunk(
+            content=chunk_content, line_start=ls, line_end=le,
+            index=idx, total=len(raw), strategy=strategy,
+            file_path=file_path, function_name=fn_name,
+            is_skeleton=is_skeleton,
+        ))
 
-    return records
+    for i, ch in enumerate(chunks):
+        ch.index = i
+        ch.total = len(chunks)
+    return chunks
 
 
-def _chunk_by_functions(
-    content: str, language: str
-) -> list[tuple[str, int, int, str]]:
-    """Split content at function boundaries using tree-sitter."""
-    try:
-        from startup.feature_matrix import is_available
-        if not is_available("tree_sitter_language_pack"):
-            return _chunk_by_lines(content, max_lines=400)
-
-        from tree_sitter_language_pack import get_parser  # type: ignore
-        lang_map = {"python":"python","c":"c","cpp":"cpp",
-                    "javascript":"javascript","typescript":"typescript",
-                    "rust":"rust","go":"go"}
-        ts_lang = lang_map.get(language)
-        if not ts_lang:
-            return _chunk_by_lines(content, max_lines=400)
-
-        parser = get_parser(ts_lang)
-        tree   = parser.parse(content.encode())
-        lines  = content.splitlines()
-        chunks: list[tuple[str, int, int, str]] = []
-
-        fn_nodes = []
-        def _collect_fns(node) -> None:
-            if node.type in {
-                "function_definition", "function_declaration",
-                "method_definition", "function_item",
-                "arrow_function", "function_expression",
-            }:
-                fn_nodes.append(node)
-            for child in node.children:
-                _collect_fns(child)
-
-        _collect_fns(tree.root_node)
-
-        if not fn_nodes:
-            return _chunk_by_lines(content, max_lines=400)
-
-        for fn_node in fn_nodes:
-            start = fn_node.start_point[0]   # 0-based
-            end   = fn_node.end_point[0] + 1
-            # Add OVERLAP_LINES of context above
-            ctx_start = max(0, start - OVERLAP_LINES)
-            fn_content = "\n".join(lines[ctx_start:end])
-            # Extract function name
-            fn_name = ""
-            for child in fn_node.children:
-                if child.type in {"identifier", "name"}:
-                    fn_name = child.text.decode(errors="replace")
-                    break
-            chunks.append((fn_content, ctx_start + 1, end, fn_name))
-
-        return chunks if chunks else _chunk_by_lines(content, max_lines=400)
-    except Exception as exc:
-        log.debug(f"Function chunking failed: {exc}")
-        return _chunk_by_lines(content, max_lines=400)
+def chunk_lines_targeted(
+    content:    str,
+    line_start: int,
+    line_end:   int,
+    context:    int = 5,
+) -> Chunk:
+    lines     = content.splitlines()
+    s         = max(0, line_start - 1 - context)
+    e         = min(len(lines), line_end + context)
+    return Chunk(
+        content="\n".join(lines[s:e]),
+        line_start=s + 1, line_end=e,
+        index=0, total=1,
+        strategy=ChunkStrategy.FULL,
+        is_skeleton=False,
+    )
 
 
-def _chunk_by_lines(
-    content: str, max_lines: int = 400
-) -> list[tuple[str, int, int, str]]:
-    """Split content into overlapping line-based chunks."""
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _chunk_by_lines(content: str, max_lines: int = 400) -> list[tuple[str, int, int, str]]:
     lines  = content.splitlines()
     chunks: list[tuple[str, int, int, str]] = []
     start  = 0
     while start < len(lines):
-        end        = min(start + max_lines, len(lines))
-        chunk_text = "\n".join(lines[start:end])
-        chunks.append((chunk_text, start + 1, end, ""))
+        end = min(start + max_lines, len(lines))
+        chunks.append(("\n".join(lines[start:end]), start + 1, end, ""))
         if end >= len(lines):
             break
         start = max(start + 1, end - OVERLAP_LINES)
     return chunks
 
 
+def _chunk_by_functions(content: str, language: str) -> list[tuple[str, int, int, str]]:
+    try:
+        from tree_sitter_language_pack import get_parser  # type: ignore
+        lang_map = {"python": "python", "c": "c", "cpp": "cpp",
+                    "javascript": "javascript", "typescript": "typescript",
+                    "rust": "rust", "go": "go"}
+        ts_lang = lang_map.get(language)
+        if not ts_lang:
+            return _chunk_by_lines(content, max_lines=400)
+        parser = get_parser(ts_lang)
+        tree   = parser.parse(content.encode())
+        lines  = content.splitlines()
+        fn_types = {"function_definition", "function_declaration",
+                    "method_definition", "function_item",
+                    "arrow_function", "function_expression"}
+        fn_nodes: list = []
+        def _collect(node) -> None:
+            if node.type in fn_types:
+                fn_nodes.append(node)
+            for child in node.children:
+                _collect(child)
+        _collect(tree.root_node)
+        if not fn_nodes:
+            return _chunk_by_lines(content, max_lines=400)
+        chunks: list[tuple[str, int, int, str]] = []
+        for fn_node in fn_nodes:
+            s = fn_node.start_point[0]
+            e = fn_node.end_point[0] + 1
+            ctx = max(0, s - OVERLAP_LINES)
+            fn_name = ""
+            for child in fn_node.children:
+                if child.type in {"identifier", "name"}:
+                    fn_name = child.text.decode(errors="replace")
+                    break
+            chunks.append(("\n".join(lines[ctx:e]), ctx + 1, e, fn_name))
+        return chunks or _chunk_by_lines(content, max_lines=400)
+    except Exception as exc:
+        log.debug(f"Function chunking failed: {exc}")
+        return _chunk_by_lines(content, max_lines=400)
+
+
 def _extract_skeleton(content: str) -> str:
-    """Extract function signatures, class definitions, imports with line numbers."""
-    lines = content.splitlines()
-    result: list[str] = []
+    lines  = content.splitlines()
+    result = []
+    kws    = ["def ", "class ", "void ", "int ", "char *", "static ",
+              "struct ", "enum ", "typedef ", "#include ", "#define ",
+              "fn ", "func ", "function ", "pub ", "impl ",
+              "import ", "from ", "use ", "package ", "namespace "]
     for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        s = line.strip()
+        if not s or s.startswith("#"):
             continue
-        if any(kw in stripped for kw in [
-            "def ", "class ", "void ", "int ", "char *", "static ",
-            "struct ", "enum ", "typedef ", "#include ", "#define ",
-            "fn ", "func ", "function ", "pub ", "impl ",
-            "import ", "from ", "use ", "package ", "namespace ",
-        ]):
-            result.append(f"L{i:5d}: {line}")
-        elif stripped in {"{", "}", "};"}:
+        if any(kw in s for kw in kws) or s in {"{", "}", "};"}:
             result.append(f"L{i:5d}: {line}")
     return "\n".join(result[:500])
 
 
 def _extract_skeleton_compact(content: str) -> str:
-    """Minimal skeleton — only function/class headers, no body."""
     lines  = content.splitlines()
     result = []
+    kws    = ["def ", "class ", "void ", "int ", "static ",
+              "struct ", "fn ", "func ", "function "]
     for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if any(kw in stripped for kw in [
-            "def ", "class ", "void ", "int ", "static ",
-            "struct ", "fn ", "func ", "function ",
-        ]):
+        if any(kw in line for kw in kws):
             result.append(f"L{i:5d}: {line}")
         if len(result) >= 200:
             break
