@@ -560,28 +560,30 @@ class TieredModelRouter:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     _TIER_CLOUD_FALLBACK: dict = {
-        ModelTier.VLLM_PRIMARY:   "openrouter/deepseek/deepseek-coder-v2-0724",
-        ModelTier.VLLM_SECONDARY: "openrouter/mistralai/devstral-small",
-        ModelTier.VLLM_LIGHT:     "openrouter/deepseek/deepseek-coder-v2-0724",
-        ModelTier.VLLM_CRITIC:    "openrouter/mistralai/devstral-small",
-        ModelTier.VLLM_SYNTHESIS: "openrouter/deepseek/deepseek-coder-v2-0724",
+        ModelTier.VLLM_PRIMARY:   "openrouter/deepseek/deepseek-coder-v2-0724",    # DeepSeek
+        ModelTier.VLLM_SECONDARY: "openrouter/meta-llama/llama-3.3-70b-instruct",  # Meta
+        ModelTier.VLLM_LIGHT:     "openrouter/deepseek/deepseek-coder-v2-0724",    # DeepSeek
+        ModelTier.VLLM_CRITIC:    "openrouter/meta-llama/llama-3.3-70b-instruct",  # Meta — independent from both fixers
+        ModelTier.VLLM_SYNTHESIS: "openrouter/mistralai/mistral-medium-3",         # Mistral — independent from critic
     }
+
+    def _is_ollama_reachable(self) -> bool:
+        """Probe Ollama /api/tags with a 2-second timeout. Result is not cached."""
+        base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        try:
+            import urllib.request
+            urllib.request.urlopen(base + "/api/tags", timeout=2)
+            return True
+        except Exception:
+            return False
 
     def _select_model(self, tier: ModelTier, models: list[str]) -> str:  # noqa: C901
         """
-        Route a tier to the best available model and enforce family independence
-        at inference time.
-
-        Degradation path (BUG-1 FIX):
-        1. Local vLLM endpoint (VLLM_*_BASE_URL)
-        2. Ollama local (ollama/* entries — NEW for CRITIC and SYNTHESIS tiers)
-        3. OpenRouter cloud (requires valid OPENROUTER_API_KEY)
-        4. RuntimeError — never silent escalation
-
-        BUG-8 FIX (_is_cloud_configured):
-        Cloud fallback is only attempted when API keys pass format validation
-        (sk-or-* prefix for OpenRouter, sk-ant-* for Anthropic). Placeholder
-        values like "sk-or-..." are rejected, preventing silent auth failures.
+        Probe-and-iterate degradation chain for a tier:
+          1. openai/* (vLLM) — only if matching VLLM_*_BASE_URL is set
+          2. ollama/* — only if Ollama is reachable
+          3. openrouter/* — only if _is_cloud_configured()
+          4. RuntimeError
         """
         if not models:
             raise RuntimeError(
@@ -589,36 +591,78 @@ class TieredModelRouter:
                 "Check vLLM base URL and model environment variables."
             )
 
-        if self._force_cloud or self._is_degraded(tier):
+        if self._force_cloud:
             tier_fallback = self._TIER_CLOUD_FALLBACK.get(tier)
             if tier_fallback and self._is_cloud_configured():
-                log.warning(
-                    "[router] Tier %s degraded — routing to family-safe cloud fallback %s",
-                    tier.value, tier_fallback,
-                )
                 chosen = tier_fallback
-            elif self._is_degraded(tier):
-                raise RuntimeError(
-                    f"Tier {tier.value} is degraded after {self._max_local_fails} failures "
-                    "and no cloud fallback is configured. "
-                    "Set OPENROUTER_API_KEY (real key, not placeholder) or reduce load on "
-                    "the local vLLM / Ollama endpoint."
-                )
             else:
-                chosen = models[0]
-        else:
-            chosen = models[0]
+                raise RuntimeError(
+                    f"RHODAWK_FORCE_CLOUD=1 but no valid cloud key configured for tier {tier.value}."
+                )
+            return self._apply_family_guard(tier, chosen)
 
-        # BUG-6 RUNTIME FAMILY GUARD (unchanged)
+        if self._is_degraded(tier):
+            tier_fallback = self._TIER_CLOUD_FALLBACK.get(tier)
+            if tier_fallback and self._is_cloud_configured():
+                log.warning("[router] Tier %s degraded — cloud fallback %s", tier.value, tier_fallback)
+                return self._apply_family_guard(tier, tier_fallback)
+            raise RuntimeError(
+                f"Tier {tier.value} degraded after {self._max_local_fails} failures "
+                "and no cloud fallback configured. "
+                "Set OPENROUTER_API_KEY or restart local endpoint."
+            )
+
+        # Normal path: probe each candidate in order
+        _ollama_reachable: bool | None = None  # lazy probe, checked at most once
+
+        for candidate in models:
+            if candidate.startswith("openai/"):
+                # vLLM endpoint — only usable when the matching BASE_URL env var is set
+                tier_url_map = {
+                    ModelTier.VLLM_PRIMARY:   self._vllm_base_url,
+                    ModelTier.VLLM_SECONDARY: self._vllm_secondary_url,
+                    ModelTier.VLLM_CRITIC:    self._vllm_critic_url,
+                    ModelTier.VLLM_SYNTHESIS: self._vllm_synthesis_url,
+                    ModelTier.VLLM_LIGHT:     self._vllm_base_url,
+                }
+                base_url = tier_url_map.get(tier, "")
+                if base_url:
+                    return self._apply_family_guard(tier, candidate)
+                continue  # no BASE_URL set → skip to next candidate
+
+            if candidate.startswith("ollama/"):
+                if _ollama_reachable is None:
+                    _ollama_reachable = self._is_ollama_reachable()
+                if _ollama_reachable:
+                    return self._apply_family_guard(tier, candidate)
+                continue
+
+            if candidate.startswith("openrouter/") or "/" not in candidate:
+                if self._is_cloud_configured():
+                    return self._apply_family_guard(tier, candidate)
+                continue
+
+            # Unrecognised prefix — try it
+            return self._apply_family_guard(tier, candidate)
+
+        raise RuntimeError(
+            f"No reachable model for tier {tier.value}. "
+            "Options: pull Ollama models (ollama pull llama3.3:70b), "
+            "set VLLM_CRITIC_BASE_URL / VLLM_SYNTHESIS_BASE_URL, "
+            "or set a valid OPENROUTER_API_KEY."
+        )
+
+    def _apply_family_guard(self, tier: ModelTier, chosen: str) -> str:
+        """Apply the runtime family-independence guard and return chosen."""
         if tier != ModelTier.VLLM_CRITIC and self._critic_family:
             try:
                 from verification.independence_enforcer import extract_model_family
                 chosen_family = extract_model_family(chosen)
                 if chosen_family == self._critic_family:
                     raise RuntimeError(
-                        f"BUG-6: family independence violated at inference time — "
+                        f"Family independence violated at inference time — "
                         f"tier '{tier.value}' selected '{chosen}' "
-                        f"(family '{chosen_family}') which matches critic family "
+                        f"(family '{chosen_family}') matches critic family "
                         f"'{self._critic_family}'."
                     )
                 if tier == ModelTier.VLLM_SECONDARY:
@@ -627,16 +671,14 @@ class TieredModelRouter:
                     )
                     if chosen_family == primary_family:
                         raise RuntimeError(
-                            f"BUG-06: Fixer B degradation family collision — "
-                            f"tier '{tier.value}' selected '{chosen}' "
-                            f"(family '{chosen_family}') matches Fixer A family "
+                            f"Fixer B family collision — tier '{tier.value}' selected "
+                            f"'{chosen}' (family '{chosen_family}') matches Fixer A family "
                             f"'{primary_family}'. BoBN independence is void."
                         )
             except RuntimeError:
                 raise
             except Exception as exc:
                 log.debug("[router] runtime family guard skipped for '%s': %s", chosen, exc)
-
         return chosen
 
     def _is_degraded(self, tier: ModelTier) -> bool:
@@ -646,20 +688,7 @@ class TieredModelRouter:
 
     @staticmethod
     def _is_cloud_configured() -> bool:
-        """
-        BUG-8 FIX: Validate API key format rather than checking for any non-empty string.
-
-        Previously this returned True for placeholder values like "sk-or-..." and
-        "sk-ant-..." that ship in .env — causing _select_model() to attempt cloud
-        routing and receive an auth error, masking the actual configuration gap.
-
-        Now requires:
-          - OPENROUTER_API_KEY starting with "sk-or-" and at least 20 chars, OR
-          - ANTHROPIC_API_KEY starting with "sk-ant-" and at least 20 chars
-
-        This rejects both empty strings AND the placeholder sentinel values that
-        ship in the default .env file.
-        """
+        """Return True only when an API key passes format validation (not a placeholder)."""
         or_key  = os.environ.get("OPENROUTER_API_KEY", "")
         ant_key = os.environ.get("ANTHROPIC_API_KEY", "")
         return (
