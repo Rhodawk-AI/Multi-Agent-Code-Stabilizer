@@ -210,6 +210,27 @@ class CPGEngine:
         # 3. Shard manager — manages multi-instance Joern for large repos
         self._shard_manager: Any | None = None          # ShardManager
 
+    # ── ARCH-01 FIX: public shard_manager property ───────────────────────────
+    # Previously the controller called:
+    #   self._cpg_engine.shard_manager = _shard_mgr
+    # which set a plain instance attribute but CPGEngine never consulted it —
+    # it only checked self._shard_manager (the private attribute set in
+    # initialise()). The external assignment created a shadow attribute that
+    # was silently ignored, so compute_blast_radius and compute_context_slice
+    # never used the ShardManager even when it was correctly constructed.
+    #
+    # This property bridges the two names so any external assignment to
+    # .shard_manager (the public API) writes through to ._shard_manager
+    # (the internal attribute checked by all routing logic).
+
+    @property
+    def shard_manager(self) -> "Any | None":
+        return self._shard_manager
+
+    @shard_manager.setter
+    def shard_manager(self, value: "Any | None") -> None:
+        self._shard_manager = value
+
         # 4. JNI bridge tracker — cross-language boundary analysis
         self._bridge_result: Any | None = None          # BridgeAnalysisResult
         # Pre-computed bridge findings indexed by source file for O(1) lookup
