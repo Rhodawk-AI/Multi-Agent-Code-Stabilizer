@@ -547,7 +547,7 @@ class CPGEngine:
             result.source = "vector_fallback"
 
         # ARCH-1 FIX: emit Prometheus counter so dashboards track fallback rate.
-        _record_cpg_context(result.source) ────────────────────────────────────────
+        _record_cpg_context(result.source)
         all_files: set[str] = {issue_file}
         for item in (
             result.causal_functions + result.callers
