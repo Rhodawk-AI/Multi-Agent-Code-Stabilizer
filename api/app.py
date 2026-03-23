@@ -112,6 +112,17 @@ def _enforce_production_security() -> None:
         # logging.shutdown() flushes and closes all handlers synchronously,
         # guaranteeing that the diagnostic message reaches the log sink before
         # the hard exit.
+        #
+        # ADD-3 NOTE — asyncio cleanup gap:
+        # os._exit() bypasses asyncio's shutdown sequence.  Any async resources
+        # opened at startup (database connection pools from the lifespan handler)
+        # are not closed cleanly.  On PostgreSQL this leaves dangling connections
+        # until the server times them out (~30 s per connection).  On a
+        # high-connection-limit deployment, repeated crash-restarts before
+        # RHODAWK_DEV_AUTH is corrected can exhaust the PostgreSQL connection
+        # limit.  If this is a concern, add a lifespan guard:
+        #   if os.environ.get("RHODAWK_DEV_AUTH") == "1" and not _IS_DEV:
+        #       return  # skip pool init entirely — nothing to clean up on _exit
         import logging as _logging
         import os as _os
         _logging.shutdown()
