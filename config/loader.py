@@ -45,6 +45,31 @@ def load_config(
     if "repo_root" not in data:
         data["repo_root"] = Path(os.environ.get("RHODAWK_REPO_ROOT", "."))
 
+    # ADD-1 FIX: validate that every key in flattened TOML maps to a known
+    # StabilizerConfig field BEFORE constructing the object. Previously, unknown
+    # keys from typos (e.g. "gap5_bobn_n_canddiates") silently passed through
+    # _flatten_toml() and only failed when StabilizerConfig(**data) raised
+    # TypeError: unexpected keyword argument — a confusing error pointing at the
+    # Python constructor, not the TOML file key that caused it.
+    #
+    # We check against __fields__ (Pydantic v1) or model_fields (Pydantic v2)
+    # and report every unrecognised key with a clear message before raising.
+    try:
+        import pydantic
+        _pydantic_v2 = int(pydantic.VERSION.split(".")[0]) >= 2
+        if _pydantic_v2:
+            _known_fields = set(StabilizerConfig.model_fields.keys())
+        else:
+            _known_fields = set(StabilizerConfig.__fields__.keys())
+        _unknown = {k for k in data if k not in _known_fields}
+        if _unknown:
+            raise ValueError(
+                f"Unknown configuration key(s) — check spelling against "
+                f"StabilizerConfig field names: {sorted(_unknown)}"
+            )
+    except ImportError:
+        pass  # pydantic not installed — let StabilizerConfig raise on unknown keys
+
     try:
         return StabilizerConfig(**data)
     except Exception as exc:
