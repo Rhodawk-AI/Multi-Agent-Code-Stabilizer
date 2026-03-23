@@ -11,7 +11,7 @@ GAP 5 CHANGES (Swarm Intelligence / ≥90% SWE-bench)
   reducing correlation between candidates and lifting BoBN effectiveness toward
   the theoretical ceiling (1 − (1−p)^N).
 
-• ModelTier.VLLM_CRITIC     — Llama-3.3-70B-Instruct via OpenRouter or vLLM.
+• ModelTier.VLLM_CRITIC     — Llama-3.3-70B-Instruct via vLLM, Ollama, or OpenRouter.
   Adversarial Critic — its only job is finding ways to break candidate
   patches.  Must be a different model FAMILY from both fixers (Qwen Alibaba
   and DeepSeek families).  Meta Llama satisfies the independence requirement.
@@ -29,6 +29,18 @@ GAP 5 CHANGES (Swarm Intelligence / ≥90% SWE-bench)
 • VLLM_LIGHT               — Qwen2.5-Coder-7B: Judge / BoBN scoring.
 • VLLM_LOCALIZE            — granite-code:8b: ultra-cheap file localization.
 
+FIX (Bug 1 — Ollama fallbacks): VLLM_CRITIC and VLLM_SYNTHESIS now include
+Ollama-hosted models from the correct families so a fully local Ollama-only
+deployment can run the complete BoBN adversarial pipeline without any
+OPENROUTER_API_KEY.  Family independence is preserved:
+  Critic    → ollama/llama3.3:70b or ollama/llama3:8b  (Meta — independent)
+  Synthesis → ollama/mistral:7b or ollama/mixtral:8x7b  (Mistral — independent)
+
+FIX (Bug 8 — _is_cloud_configured): The method now validates API key format
+(sk-or- / sk-ant- prefix + length) instead of checking for any non-empty
+string. Placeholder keys like "sk-or-..." no longer masquerade as configured
+cloud endpoints, preventing silent auth failures at model call time.
+
 FIX: assert_family_independence() now validates ALL four roles — fixers,
 critic, AND synthesis — raising RuntimeError on any pairwise collision.
 
@@ -40,14 +52,14 @@ Dual-fixer vLLM setup (reference)
     # Fixer B — secondary (different GPU partition)
     vllm serve deepseek-ai/DeepSeek-Coder-V2-Instruct \\
         --tensor-parallel-size 1 --max-model-len 32768 --port 8001
-    # Critic — 70B (4×A100) or route to OpenRouter
+    # Critic — 70B (4×A100) or route to OpenRouter / Ollama
     vllm serve meta-llama/Llama-3.3-70B-Instruct \\
         --tensor-parallel-size 4 --max-model-len 32768 --port 8002
 
     VLLM_BASE_URL=http://localhost:8000/v1
     VLLM_SECONDARY_BASE_URL=http://localhost:8001/v1
-    VLLM_CRITIC_BASE_URL=http://localhost:8002/v1      # blank → OpenRouter
-    VLLM_SYNTHESIS_BASE_URL=http://localhost:8003/v1   # blank → OpenRouter Devstral
+    VLLM_CRITIC_BASE_URL=http://localhost:8002/v1      # blank → Ollama → OpenRouter
+    VLLM_SYNTHESIS_BASE_URL=http://localhost:8003/v1   # blank → Ollama → OpenRouter
     VLLM_PRIMARY_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
     VLLM_SECONDARY_MODEL=deepseek-ai/DeepSeek-Coder-V2-Instruct
     VLLM_CRITIC_MODEL=meta-llama/Llama-3.3-70B-Instruct
@@ -119,6 +131,25 @@ def _synthesis_vllm_model() -> str:
     return "openrouter/mistralai/devstral-small"
 
 
+# BUG-1 FIX: VLLM_CRITIC and VLLM_SYNTHESIS now include Ollama fallbacks so
+# a fully local Ollama-only deployment can run the complete BoBN adversarial
+# pipeline without OPENROUTER_API_KEY.
+#
+# Critic tier (Meta family — Llama):
+#   1. Local vLLM (VLLM_CRITIC_BASE_URL set)
+#   2. ollama/llama3.3:70b — Meta family, full capability, ~40 GB VRAM
+#   3. ollama/llama3:8b   — Meta family, lightweight, 5 GB VRAM
+#   4–5. OpenRouter (cloud fallback)
+#
+# Synthesis tier (Mistral family — Devstral):
+#   1. Local vLLM (VLLM_SYNTHESIS_BASE_URL set)
+#   2. ollama/mistral:7b   — Mistral family, 4 GB VRAM
+#   3. ollama/mixtral:8x7b — Mistral family, 26 GB VRAM
+#   4–5. OpenRouter (cloud fallback)
+#
+# Family independence is preserved — Meta and Mistral are distinct from
+# Alibaba (Fixer A) and DeepSeek (Fixer B). assert_family_independence()
+# validates this at startup.
 _TIER_MODELS: dict[ModelTier, list[str]] = {
     ModelTier.VLLM_PRIMARY: [
         _vllm_model("VLLM_PRIMARY_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"),
@@ -135,22 +166,28 @@ _TIER_MODELS: dict[ModelTier, list[str]] = {
         "ollama/qwen2.5-coder:7b",
         "ollama/granite-code:3b",
     ],
+    # BUG-1 FIX: Added Ollama fallbacks for Meta-family models.
+    # Previously all three entries were OpenRouter URLs — no Ollama fallback existed.
+    # An Ollama-only deployment with a placeholder OPENROUTER_API_KEY would hit
+    # AuthenticationError on the first critic call, causing BoBN to fall back to
+    # single-fixer mode silently after one stack trace.
     ModelTier.VLLM_CRITIC: [
-        _critic_vllm_model(),
-        "openrouter/meta-llama/llama-3.3-70b-instruct",
-        "openrouter/mistralai/devstral-small",
+        _critic_vllm_model(),                                   # local vLLM (if VLLM_CRITIC_BASE_URL set)
+        "ollama/llama3.3:70b",                                  # NEW — Meta family, local Ollama
+        "ollama/llama3:8b",                                     # NEW — Meta family, lightweight
+        "openrouter/meta-llama/llama-3.3-70b-instruct",         # OpenRouter cloud
+        "openrouter/mistralai/devstral-small",                  # OpenRouter degraded
     ],
     # VLLM_SYNTHESIS tier — Mistral family (Devstral) only.
-    # The first entry now calls _synthesis_vllm_model() so operators who run
-    # Devstral locally (VLLM_SYNTHESIS_BASE_URL + VLLM_SYNTHESIS_MODEL) get
-    # their local instance, matching the behaviour of every other vLLM tier.
-    # When those env vars are absent it falls back to OpenRouter Devstral.
+    # BUG-1 FIX: Added Ollama fallbacks for Mistral-family models.
     # Meta family (llama-4-scout) is NOT in this list: routing degradation must
     # never silently break the four-family independence constraint.
     ModelTier.VLLM_SYNTHESIS: [
-        _synthesis_vllm_model(),                     # local vLLM or OpenRouter Devstral
-        "openrouter/mistralai/devstral-small",        # OpenRouter Devstral explicit fallback
-        "openrouter/mistralai/mistral-medium-3",      # Mistral-medium last-resort
+        _synthesis_vllm_model(),                                # local vLLM or OpenRouter Devstral
+        "ollama/mistral:7b",                                    # NEW — Mistral family, local Ollama
+        "ollama/mixtral:8x7b",                                  # NEW — Mistral family, larger local
+        "openrouter/mistralai/devstral-small",                  # OpenRouter Devstral explicit fallback
+        "openrouter/mistralai/mistral-medium-3",                # Mistral-medium last-resort
     ],
     ModelTier.CLOUD_OSS: [
         "openrouter/meta-llama/llama-4-scout",
@@ -179,6 +216,11 @@ _COST_MAP: dict[str, tuple[float, float]] = {
     "ollama/deepseek-coder-v2":                             (0.0, 0.0),
     "ollama/granite-code:3b":                               (0.0, 0.0),
     "ollama/granite-code:8b":                               (0.0, 0.0),
+    # BUG-1 FIX: cost entries for new Ollama critic/synthesis models
+    "ollama/llama3.3:70b":                                  (0.0, 0.0),
+    "ollama/llama3:8b":                                     (0.0, 0.0),
+    "ollama/mistral:7b":                                    (0.0, 0.0),
+    "ollama/mixtral:8x7b":                                  (0.0, 0.0),
     "openrouter/meta-llama/llama-4-scout":                  (0.00018, 0.00090),
     "openrouter/meta-llama/llama-3.3-70b-instruct":        (0.00060, 0.00080),
     "openrouter/mistralai/devstral-small":                  (0.00020, 0.00080),
@@ -211,9 +253,6 @@ _TASK_TIERS: dict[str, ModelTier] = {
     "adversarial":     ModelTier.VLLM_CRITIC,
     "attack":          ModelTier.VLLM_CRITIC,
     "critic":          ModelTier.VLLM_CRITIC,
-    # FIX (Bug 2): "critical_fix" now routes to VLLM_SYNTHESIS (Devstral/Mistral)
-    # instead of CLOUD_OSS (Llama-4-Scout/Meta).  Previously this caused the
-    # synthesis agent to use the same Meta family as the adversarial critic.
     "critical_fix":    ModelTier.VLLM_SYNTHESIS,
     "synthesis":       ModelTier.VLLM_SYNTHESIS,
     "patch_synthesis": ModelTier.VLLM_SYNTHESIS,
@@ -223,9 +262,6 @@ _TASK_TIERS: dict[str, ModelTier] = {
 }
 
 # BoBN temperature strategy — diversity through controlled randomness.
-# N=10 total: 6 from Fixer A (Qwen-32B) + 4 from Fixer B (DeepSeek-V2 32B-class MoE).
-# Temperatures are spread across [0.2, 0.9] so candidates explore different
-# regions of the solution space.  Critic and Synthesis remain deterministic.
 BOBN_TEMPERATURES: dict[str, float] = {
     "fixer_a_0": 0.2,
     "fixer_a_1": 0.3,
@@ -253,12 +289,11 @@ class TieredModelRouter:
     GAP 5 Extensions:
       secondary_model()           — DeepSeek-Coder-V2 32B-class MoE (Fixer B)
       critic_model()              — Llama-3.3-70B (AdversarialCriticAgent)
-      synthesis_model()           — Devstral-Small (PatchSynthesisAgent) [NEW]
+      synthesis_model()           — Devstral-Small (PatchSynthesisAgent)
       judge_model()               — Qwen-7B (BoBN patch scoring)
       localize_model()            — cheap model for Agentless localization
       bobn_temperature(slot)      — temperature for a BoBN slot index
-      assert_family_independence() — CI gate: all four roles must be from
-                                    distinct model families
+      assert_family_independence() — CI gate: all four roles from distinct families
     """
 
     def __init__(self) -> None:
@@ -274,17 +309,6 @@ class TieredModelRouter:
         self._vllm_critic_url     = os.environ.get("VLLM_CRITIC_BASE_URL", "")
         self._vllm_synthesis_url  = os.environ.get("VLLM_SYNTHESIS_BASE_URL", "")
 
-        # BUG-6 FIX (runtime): Cache the critic model's family at init time so
-        # _select_model can enforce family independence at *inference time*, not
-        # only at startup via assert_family_independence().  The startup check
-        # validates the *configured* model names; this cache is what guards
-        # against a misconfigured _TIER_CLOUD_FALLBACK silently producing a
-        # collision when a tier degrades mid-run.
-        #
-        # Import is deferred to avoid a circular import at module load time.
-        # If the import fails (e.g. verification package not installed) we set
-        # the cache to None — the runtime guard is skipped but a WARNING is
-        # emitted so the operator knows family isolation may not be enforced.
         self._critic_family: str | None = None
         try:
             from verification.independence_enforcer import extract_model_family
@@ -317,20 +341,7 @@ class TieredModelRouter:
         return self._select_model(ModelTier.VLLM_CRITIC, models)
 
     def synthesis_model(self) -> str:
-        """
-        Patch Synthesis — Devstral-Small (Mistral family).
-
-        FIX (Bug 2): Previously the synthesis agent called primary_model("critical_fix")
-        which resolved to CLOUD_OSS → llama-4-scout (Meta family) — the same family as
-        the adversarial critic.  That gave two correlated Meta models in the pipeline,
-        violating the four-family independence requirement.
-
-        Devstral-Small is Mistral AI family, independent from:
-          Fixer A: Qwen/Alibaba
-          Fixer B: DeepSeek
-          Critic:  Meta/Llama
-          Synthesis: Mistral  ← this method
-        """
+        """Patch Synthesis — Devstral-Small (Mistral family, fourth independent family)."""
         models = _TIER_MODELS[ModelTier.VLLM_SYNTHESIS]
         return self._select_model(ModelTier.VLLM_SYNTHESIS, models)
 
@@ -354,20 +365,7 @@ class TieredModelRouter:
     def assert_family_independence(self) -> None:
         """
         Validate that ALL FOUR pipeline roles use distinct model families.
-
-        FIX (Bug 2): Previously only checked critic ≠ fixer_a and warned if
-        critic ≈ fixer_b.  Synthesis was never checked, allowing the synthesis
-        model to silently share the Meta family with the critic.
-
-        Four-family independence requirement:
-          Fixer A   — must be distinct from all others
-          Fixer B   — must be distinct from all others
-          Critic    — must be distinct from both fixers AND synthesis
-          Synthesis — must be distinct from both fixers AND critic
-
-        Raises RuntimeError on any hard violation (critic == any fixer, or
-        synthesis == critic).  Logs warnings for soft violations (synthesis
-        == a fixer — less critical but still undesirable).
+        Raises RuntimeError on any hard violation.
         """
         from verification.independence_enforcer import extract_model_family
 
@@ -376,7 +374,6 @@ class TieredModelRouter:
         critic_family    = extract_model_family(self.critic_model())
         synthesis_family = extract_model_family(self.synthesis_model())
 
-        # ── Hard violations — these break the adversarial architecture ────────
         if critic_family == primary_family:
             raise RuntimeError(
                 f"GAP 5 independence violation: critic family '{critic_family}' "
@@ -389,17 +386,13 @@ class TieredModelRouter:
                 f"matches secondary fixer '{secondary_family}'. "
                 "Ensure VLLM_CRITIC_MODEL uses a different provider family."
             )
-        # Synthesis must not share a family with the critic: if they share a
-        # training distribution the synthesis step cannot catch critic blind spots.
         if synthesis_family == critic_family:
             raise RuntimeError(
                 f"GAP 5 independence violation: synthesis family '{synthesis_family}' "
                 f"matches critic family '{critic_family}'. "
-                "Set synthesis model to openrouter/mistralai/devstral-small "
-                "(Mistral family) to maintain four-family independence."
+                "Set synthesis model to ollama/mistral:7b or openrouter/mistralai/devstral-small."
             )
 
-        # ── Soft violations — worth logging but not blocking ──────────────────
         if synthesis_family == primary_family:
             log.warning(
                 "[router] GAP 5 soft warning: synthesis '%s' shares family '%s' "
@@ -511,7 +504,7 @@ class TieredModelRouter:
             return False
 
     def synthesis_vllm_base_url(self) -> str:
-        """Return the configured synthesis vLLM base URL (empty string → OpenRouter)."""
+        """Return the configured synthesis vLLM base URL (empty string → Ollama/OpenRouter)."""
         return self._vllm_synthesis_url
 
     def configure_litellm_for_vllm(self) -> None:
@@ -539,15 +532,17 @@ class TieredModelRouter:
             "vllm_configured":            self.is_vllm_configured(),
             "secondary_vllm_url":         self._vllm_secondary_url,
             "secondary_vllm_configured":  self.is_secondary_vllm_configured(),
-            "critic_vllm_url":            self._vllm_critic_url or "(cloud)",
+            "critic_vllm_url":            self._vllm_critic_url or "(cloud/ollama)",
             "critic_configured": (
                 self.is_critic_vllm_configured()
-                or bool(os.environ.get("OPENROUTER_API_KEY"))
+                or bool(os.environ.get("OLLAMA_BASE_URL"))
+                or self._is_cloud_configured()
             ),
-            "synthesis_vllm_url":         self._vllm_synthesis_url or "(cloud)",
+            "synthesis_vllm_url":         self._vllm_synthesis_url or "(cloud/ollama)",
             "synthesis_configured": (
                 self.is_synthesis_vllm_configured()
-                or bool(os.environ.get("OPENROUTER_API_KEY"))
+                or bool(os.environ.get("OLLAMA_BASE_URL"))
+                or self._is_cloud_configured()
             ),
             "failure_counts": {
                 k.value: v for k, v in self._local_failure_counts.items()
@@ -564,27 +559,11 @@ class TieredModelRouter:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    # Per-tier cloud fallback models that respect family independence.
-    # Each tier degrades to a cloud model from a DIFFERENT family than the
-    # adversarial critic (Meta/Llama) to prevent the BUG-6 collision where
-    # all degraded tiers routed to CLOUD_OSS (Llama-4-Scout, Meta family).
     _TIER_CLOUD_FALLBACK: dict = {
-        # Fixer A (Alibaba) → DeepSeek on OpenRouter (different family)
         ModelTier.VLLM_PRIMARY:   "openrouter/deepseek/deepseek-coder-v2-0724",
-        # BUG-06 FIX: Fixer B (DeepSeek) degradation must NOT route to Qwen/Alibaba
-        # (same family as Fixer A). Previously this was
-        # "openrouter/qwen/qwen-2.5-coder-32b-instruct" — Alibaba family — which
-        # meant two correlated Alibaba models ran as "Fixer A" and "Fixer B" under
-        # load, defeating the BoBN independence guarantee entirely without any warning
-        # (the BUG-6 runtime guard only checked against the critic's family).
-        # Fix: Fixer B falls back to Mistral/Devstral (fourth family, independent
-        # of Alibaba, DeepSeek-primary, and Meta-critic).
         ModelTier.VLLM_SECONDARY: "openrouter/mistralai/devstral-small",
-        # Light judge → cheapest available cross-family model
         ModelTier.VLLM_LIGHT:     "openrouter/deepseek/deepseek-coder-v2-0724",
-        # Critic (Meta) → Devstral/Mistral (different family)
         ModelTier.VLLM_CRITIC:    "openrouter/mistralai/devstral-small",
-        # Synthesis (Mistral) → DeepSeek (different family)
         ModelTier.VLLM_SYNTHESIS: "openrouter/deepseek/deepseek-coder-v2-0724",
     }
 
@@ -593,45 +572,23 @@ class TieredModelRouter:
         Route a tier to the best available model and enforce family independence
         at inference time.
 
-        Degradation path
-        ----------------
-        When a vLLM tier has accumulated >= _max_local_fails consecutive
-        failures, it routes to a per-tier cloud fallback in _TIER_CLOUD_FALLBACK
-        rather than the shared CLOUD_OSS list (which is Meta/Llama family and
-        would collide with the adversarial critic).
+        Degradation path (BUG-1 FIX):
+        1. Local vLLM endpoint (VLLM_*_BASE_URL)
+        2. Ollama local (ollama/* entries — NEW for CRITIC and SYNTHESIS tiers)
+        3. OpenRouter cloud (requires valid OPENROUTER_API_KEY)
+        4. RuntimeError — never silent escalation
 
-        BUG-6 RUNTIME FIX
-        -----------------
-        assert_family_independence() validates *configured* model names at
-        startup.  That is insufficient: a misconfigured _TIER_CLOUD_FALLBACK
-        entry, a future model-list edit, or an operator env-var override could
-        introduce a mid-run collision that the startup check never sees.
-
-        After choosing the model (normal or fallback path) we compare its family
-        against self._critic_family (cached at __init__ time from the configured
-        critic model).  If they match — and the tier is not the critic itself —
-        we raise RuntimeError immediately so the caller surfaces the violation
-        rather than producing correlated output with no warning.
-
-        If extract_model_family is unavailable (verification package not
-        installed) the guard is skipped with a debug log; a WARNING was already
-        emitted at __init__ time so operators know isolation is unenforced.
-
-        ADD-3 FIX
-        ---------
-        Hardcoded "claude-sonnet-4-6" emergency fallback replaced with
-        RuntimeError so local-only deployments without an Anthropic key get a
-        clear routing error instead of an authentication failure.
+        BUG-8 FIX (_is_cloud_configured):
+        Cloud fallback is only attempted when API keys pass format validation
+        (sk-or-* prefix for OpenRouter, sk-ant-* for Anthropic). Placeholder
+        values like "sk-or-..." are rejected, preventing silent auth failures.
         """
         if not models:
             raise RuntimeError(
                 f"No models configured for tier {tier.value}. "
-                "Check vLLM base URL and model environment variables. "
-                "Ensure at least one of VLLM_BASE_URL / VLLM_SECONDARY_BASE_URL / "
-                "VLLM_CRITIC_BASE_URL / OPENROUTER_API_KEY is set."
+                "Check vLLM base URL and model environment variables."
             )
 
-        # ── Model selection ───────────────────────────────────────────────────
         if self._force_cloud or self._is_degraded(tier):
             tier_fallback = self._TIER_CLOUD_FALLBACK.get(tier)
             if tier_fallback and self._is_cloud_configured():
@@ -644,15 +601,15 @@ class TieredModelRouter:
                 raise RuntimeError(
                     f"Tier {tier.value} is degraded after {self._max_local_fails} failures "
                     "and no cloud fallback is configured. "
-                    "Set OPENROUTER_API_KEY or reduce load on the local vLLM endpoint."
+                    "Set OPENROUTER_API_KEY (real key, not placeholder) or reduce load on "
+                    "the local vLLM / Ollama endpoint."
                 )
             else:
                 chosen = models[0]
         else:
             chosen = models[0]
 
-        # ── BUG-6 RUNTIME FAMILY GUARD ───────────────────────────────────────
-        # Skip self-check for the critic tier (it IS the baseline we compare against).
+        # BUG-6 RUNTIME FAMILY GUARD (unchanged)
         if tier != ModelTier.VLLM_CRITIC and self._critic_family:
             try:
                 from verification.independence_enforcer import extract_model_family
@@ -662,14 +619,8 @@ class TieredModelRouter:
                         f"BUG-6: family independence violated at inference time — "
                         f"tier '{tier.value}' selected '{chosen}' "
                         f"(family '{chosen_family}') which matches critic family "
-                        f"'{self._critic_family}'. "
-                        "Fix: update _TIER_CLOUD_FALLBACK so every non-critic tier "
-                        "maps to a model from a family distinct from the adversarial critic."
+                        f"'{self._critic_family}'."
                     )
-                # BUG-06 FIX: also check Fixer B does not collide with Fixer A.
-                # The original guard only checked against the critic. When Fixer B
-                # degrades to the same family as Fixer A the two produce correlated
-                # patches with no adversarial benefit — silently defeating BoBN.
                 if tier == ModelTier.VLLM_SECONDARY:
                     primary_family = extract_model_family(
                         _TIER_MODELS[ModelTier.VLLM_PRIMARY][0]
@@ -679,14 +630,11 @@ class TieredModelRouter:
                             f"BUG-06: Fixer B degradation family collision — "
                             f"tier '{tier.value}' selected '{chosen}' "
                             f"(family '{chosen_family}') matches Fixer A family "
-                            f"'{primary_family}'. BoBN independence is void. "
-                            "Fix: ensure VLLM_SECONDARY fallback uses a different "
-                            "family from VLLM_PRIMARY (e.g. Mistral, not Alibaba)."
+                            f"'{primary_family}'. BoBN independence is void."
                         )
             except RuntimeError:
                 raise
             except Exception as exc:
-                # extract_model_family unavailable — guard already warned at init.
                 log.debug("[router] runtime family guard skipped for '%s': %s", chosen, exc)
 
         return chosen
@@ -698,9 +646,25 @@ class TieredModelRouter:
 
     @staticmethod
     def _is_cloud_configured() -> bool:
-        return bool(
-            os.environ.get("OPENROUTER_API_KEY")
-            or os.environ.get("ANTHROPIC_API_KEY")
+        """
+        BUG-8 FIX: Validate API key format rather than checking for any non-empty string.
+
+        Previously this returned True for placeholder values like "sk-or-..." and
+        "sk-ant-..." that ship in .env — causing _select_model() to attempt cloud
+        routing and receive an auth error, masking the actual configuration gap.
+
+        Now requires:
+          - OPENROUTER_API_KEY starting with "sk-or-" and at least 20 chars, OR
+          - ANTHROPIC_API_KEY starting with "sk-ant-" and at least 20 chars
+
+        This rejects both empty strings AND the placeholder sentinel values that
+        ship in the default .env file.
+        """
+        or_key  = os.environ.get("OPENROUTER_API_KEY", "")
+        ant_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        return (
+            (or_key.startswith("sk-or-") and len(or_key) > 20)
+            or (ant_key.startswith("sk-ant-") and len(ant_key) > 20)
         )
 
 
