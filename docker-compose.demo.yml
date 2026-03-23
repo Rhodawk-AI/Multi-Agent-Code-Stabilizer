@@ -1,0 +1,93 @@
+version: "3.9"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rhodawk AI Code Stabilizer — DEMO Compose
+#
+# DEMO-01 FIX: The production docker-compose.yml requires 7 services and
+# ~73 GB of Ollama models (qwen2.5-coder:32b 19 GB, deepseek-coder-v2 8 GB,
+# llama3.3:70b 42 GB, mistral:7b 4 GB) plus a 30–60 minute Joern CPG build
+# for any non-trivial repo. A live accelerator demo slot is 10 minutes. This
+# file eliminates every heavy dependency:
+#
+#   ✗ Ollama         — replaced by OpenRouter cloud LLMs (no local GPU needed)
+#   ✗ Joern          — CPG_ENABLED=false, vector-similarity context fallback
+#   ✗ Qdrant         — HELIX_USE_LOCAL_QDRANT=1 (in-memory, no server)
+#   ✗ PostgreSQL     — SQLite (RHODAWK_PG_DSN not set)
+#   ✗ Celery/Redis   — API runs synchronously via background asyncio task
+#   ✗ Prometheus/Grafana — removed from demo profile
+#
+# Result: `docker-compose -f docker-compose.demo.yml up` starts in < 3 minutes
+# on any laptop with Docker and an OpenRouter API key.
+#
+# Prerequisites:
+#   1. Set OPENROUTER_API_KEY in your environment or .env.demo
+#   2. docker-compose -f docker-compose.demo.yml up
+#   3. Open http://localhost:8000/docs and POST /runs with a public repo URL
+#
+# For a quick smoke-test against a small repo:
+#   curl -X POST http://localhost:8000/runs \
+#     -H "Authorization: Bearer $(python -c 'import os; print(os.environ[\"DEMO_JWT\"])')" \
+#     -H "Content-Type: application/json" \
+#     -d '{"repo_url":"https://github.com/psf/requests","repo_root":"/tmp/requests","max_cycles":3}'
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  rhodawk-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example          # safe placeholder values from the repo
+    environment:
+      # ── Demo mode flags ─────────────────────────────────────────────────
+      RHODAWK_ENV:              "development"   # enables RHODAWK_DEV_AUTH=1 below
+      RHODAWK_DEV_AUTH:         "1"             # skip JWT for demo convenience
+      RHODAWK_FORCE_CLOUD:      "1"             # skip all local Ollama calls
+      RHODAWK_GAP5_ENABLED:     "false"         # disable BoBN (needs 4 vLLM servers)
+      CPG_ENABLED:              "0"             # disable Joern (30-60 min startup)
+      HELIX_USE_LOCAL_QDRANT:   "1"             # in-memory vector store, no server
+      TOOLHIVE_DISABLE:         "1"             # skip MCP tool startup
+      # ── Storage: SQLite (no postgres required) ───────────────────────────
+      # RHODAWK_PG_DSN is intentionally absent — controller falls back to SQLite.
+      # ── LLM routing: OpenRouter only ────────────────────────────────────
+      OPENROUTER_API_KEY:       "${OPENROUTER_API_KEY}"
+      # Route all tiers through OpenRouter cheap models for demo speed/cost:
+      VLLM_PRIMARY_BASE_URL:    ""
+      VLLM_SECONDARY_BASE_URL:  ""
+      VLLM_CRITIC_BASE_URL:     ""
+      VLLM_SYNTHESIS_BASE_URL:  ""
+      # ── Demo cost guard ──────────────────────────────────────────────────
+      # Cap spend at $5 so a live demo with a large repo can't surprise you.
+      RHODAWK_COST_CEILING:     "5.0"
+    command: >
+      uvicorn api.app:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --log-level info
+    # SEC-03: No Docker socket in demo API container — test sandbox disabled.
+    # Demo mode does not run BoBN or mutation testing so the socket is not needed.
+    volumes:
+      - demo_data:/app/.stabilizer
+    restart: "no"             # don't loop-restart on demo machine
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Redis is kept for the task queue even in demo mode, but with no password
+  # since this is a local-only demo environment. Do NOT use this config in prod.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --loglevel warning
+    restart: "no"
+
+volumes:
+  demo_data:
+    # SQLite brain.db and generated files persist across demo restarts
+    # so you can stop/start without losing audit state mid-demo.

@@ -116,11 +116,10 @@ def _parse() -> argparse.Namespace:
                    choices=["GENERAL","MILITARY","AEROSPACE","MEDICAL","FINANCE",
                              "EMBEDDED","NUCLEAR"],
                    help="Domain mode")
-    # ADD-2 FIX: Default raised from 50 to 200. Repos with interdependent issues
-    # routinely require >50 cycles to converge. At 50 the run exits with
-    # MAX_CYCLES_REACHED, leaving in-progress fixes uncommitted. 200 accommodates
-    # the Linux kernel and other large multi-subsystem codebases without artificially
-    # truncating a run. Operators who need a hard cap can set --max-cycles explicitly.
+    # DEMO-02 FIX: default unified to 200 across run.py, StabilizerConfig, and
+    # config/default.toml. Previously this was an override of the class default
+    # (which was 50), creating silent divergence between CLI and API deployments.
+    # Now all three sources agree on 200 — no override needed, no divergence possible.
     p.add_argument("--max-cycles", default=200,  type=int,
                    help="Maximum stabilization cycles (default: 200)")
     p.add_argument("--resume",     default=None, help="Resume from run ID")

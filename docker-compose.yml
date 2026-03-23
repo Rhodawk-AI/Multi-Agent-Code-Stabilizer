@@ -36,18 +36,17 @@ services:
       redis:
         condition: service_started
     command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --workers 2
-    # SEC-2 FIX: added Docker socket mount to rhodawk-api.
-    # Previously the socket was only present on rhodawk-worker.  The API service
-    # runs FastAPI background tasks that invoke the full pipeline including test
-    # execution (POST /api/upload → _run_audit_task).  Without the socket,
-    # shutil.which("docker") returns the CLI path (installed via apt-get) but
-    # docker run fails with FileNotFoundError because the daemon socket is absent.
-    # The SEC-1 fix correctly returns returncode=-1 instead of falling through to
-    # unsandboxed execution, but ALL test correctness signals are lost for every
-    # zip-upload mode user — BoBN composite collapses to 0.3×robust + 0.1×minimal.
-    # Same socket threat model applies as rhodawk-worker (see comment there).
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+    # SEC-03 FIX: Docker socket removed from rhodawk-api.
+    # The API service does not directly spin up test containers — that is the
+    # worker's responsibility. Mounting the socket here meant any code path
+    # reaching docker.from_env() in the API process (e.g. via an adversarial
+    # repository submitted through the upload endpoint) had near-root host
+    # privileges and could escape the container entirely:
+    #   docker run -v /:/host -it alpine chroot /host
+    # Combined with the exec() SEC-01 vector this was a full host compromise path.
+    # The worker retains the socket because it genuinely needs it for sandboxed
+    # test execution. See rhodawk-worker volumes comment for threat model and
+    # recommended mitigations (rootless Docker / gVisor).
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
