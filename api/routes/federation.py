@@ -70,6 +70,23 @@ def inject_fed_store(store: Any) -> None:
 _FED_TOKEN = os.environ.get("RHODAWK_FED_TOKEN", "")
 _IS_DEV    = os.environ.get("RHODAWK_ENV", "production").lower() == "development"
 
+# SEC-1 FIX: treat well-known placeholder values as "unset" so a deployment
+# that ships env.txt unchanged does not accidentally accept the publicly-known
+# placeholder as a valid Bearer token.  Any caller who has read this public
+# repo could otherwise authenticate federation endpoints by sending:
+#   Authorization: Bearer CHANGE_ME_generate_with_python_secrets_token_hex_32
+# which would allow arbitrary pattern poisoning of the fix memory store.
+_KNOWN_PLACEHOLDERS = ("CHANGE_ME", "changeme", "placeholder", "PLACEHOLDER")
+if _FED_TOKEN and any(
+    _FED_TOKEN.lower().startswith(p.lower()) for p in _KNOWN_PLACEHOLDERS
+):
+    log.warning(
+        "[federation] RHODAWK_FED_TOKEN contains a known placeholder prefix — "
+        "treating as unset.  Generate a real token with: "
+        "python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+    _FED_TOKEN = ""  # force 503 guard in production
+
 
 def _check_fed_auth(request: Request) -> None:
     """
