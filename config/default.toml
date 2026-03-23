@@ -16,7 +16,13 @@ fallbacks             = ["ollama/qwen2.5-coder:7b", "ollama/deepseek-coder-v2"]
 cross_validate_critical = true
 
 [loop]
-max_cycles             = 50
+# DEMO-02 FIX: max_cycles unified to 200 across all deployment paths.
+# Previously: default.toml=50, StabilizerConfig.max_cycles=50, run.py CLI=200.
+# Operators using the Python API got 50 cycles and hit MAX_CYCLES_REACHED on
+# complex codebases while the CLI path succeeded with 200. 200 is the correct
+# default for the stated goal of handling large codebases to convergence.
+# The run.py override has been removed since it now matches this value.
+max_cycles             = 200
 cost_ceiling_usd       = 50.0
 concurrency            = 4
 chunk_concurrency      = 4
