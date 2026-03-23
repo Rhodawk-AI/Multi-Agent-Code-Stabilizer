@@ -1,0 +1,5 @@
+language = "python3"
+run = "pytest tests/unit/ -v"
+
+[nix]
+channel = "stable-25_05"
