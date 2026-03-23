@@ -106,7 +106,10 @@ class StabilizerConfig(BaseModel):
     ])
     vllm_base_url:       str           = "http://localhost:8000/v1"
     # Run limits
-    max_cycles:          int           = 50
+    # DEMO-02 FIX: max_cycles unified to 200. Was 50 here while run.py defaulted
+    # to 200, meaning API-path deployments silently got 4× fewer cycles than
+    # CLI-path deployments. 200 is the authoritative default across all paths.
+    max_cycles:          int           = 200
     cost_ceiling_usd:    float         = 50.0
     # Concurrency
     concurrency:         int           = 4
