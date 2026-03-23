@@ -106,7 +106,7 @@ async def get_file_chunks(
         chunks = await storage.get_chunks(file_path)
         return [
             {
-                "chunk_id": c.chunk_id,
+                "chunk_id": c.id,
                 "chunk_index": c.chunk_index,
                 "total_chunks": c.total_chunks,
                 "line_start": c.line_start,
@@ -114,7 +114,6 @@ async def get_file_chunks(
                 "summary": c.summary,
                 "symbols_defined": c.symbols_defined,
                 "raw_observations": c.raw_observations,
-                "token_count": c.token_count,
             }
             for c in chunks
         ]

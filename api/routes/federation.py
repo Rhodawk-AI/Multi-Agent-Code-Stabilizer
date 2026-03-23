@@ -98,18 +98,19 @@ def _check_fed_auth(request: Request) -> None:
     In development mode the token is still optional for local testing.
     """
     if not _FED_TOKEN:
-        if not _IS_DEV:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "RHODAWK_FED_TOKEN is not configured on this deployment. "
-                    "Federation endpoints require authentication in production. "
-                    "Generate a token with: python -c \"import secrets; print(secrets.token_hex(32))\" "
-                    "and set RHODAWK_FED_TOKEN in your environment."
-                ),
-            )
-        # Dev mode with no token: accept but log warning once.
-        return
+        # SEC-04 FIX: Dev mode no longer bypasses federation authentication.
+        # An unset RHODAWK_FED_TOKEN means no auth is possible — reject in all
+        # environments. A misconfigured dev deployment should fail loudly, not
+        # silently accept all federation traffic with no credentials.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "RHODAWK_FED_TOKEN is not configured on this deployment. "
+                "Federation endpoints require authentication in all environments. "
+                "Generate a token with: python -c \"import secrets; print(secrets.token_hex(32))\" "
+                "and set RHODAWK_FED_TOKEN in your environment."
+            ),
+        )
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")

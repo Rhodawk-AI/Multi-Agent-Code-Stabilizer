@@ -76,6 +76,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
+from auth.jwt_middleware import get_current_user, TokenData
 
 log = logging.getLogger(__name__)
 
@@ -567,7 +568,10 @@ async def upload_status(run_id: str):
 
 
 @router.get("/{run_id}/download")
-async def download_fixed_files(run_id: str):
+async def download_fixed_files(
+    run_id: str,
+    _user: TokenData = Depends(get_current_user),
+):
     """
     Download a zip containing only the files that were modified by Rhodawk.
 
