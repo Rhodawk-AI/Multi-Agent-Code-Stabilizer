@@ -459,6 +459,19 @@ class StabilizerController:
         return self.run
 
     async def _init_storage(self) -> None:
+        # 0-A FIX: wrap storage construction in explicit ImportError handlers
+        # so a missing aiosqlite or asyncpg package raises a clear
+        # ConfigurationError that names the missing package, rather than an
+        # unhandled ImportError from deep inside brain/sqlite_storage.py or
+        # brain/postgres_storage.py that the feature_matrix preflight already
+        # logged but didn't block.
+        #
+        # The preflight check (feature_matrix.verify) runs in non-strict GENERAL
+        # mode and only logs an error for missing aiosqlite/asyncpg — it does
+        # not raise. By the time _init_storage() runs, the ImportError is
+        # unhandled and terminates the process with a confusing traceback.
+        # These try/except blocks convert that into a controlled ConfigurationError
+        # with a clear install instruction.
         if self.config.use_sqlite:
             self.log.warning(
                 "SQLite storage selected — NOT suitable for production "
@@ -466,7 +479,14 @@ class StabilizerController:
             )
             db_path = self.config.repo_root / ".stabilizer" / "brain.db"
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.storage = SQLiteBrainStorage(db_path)
+            try:
+                self.storage = SQLiteBrainStorage(db_path)
+            except ImportError as _sqlite_err:
+                raise ConfigurationError(
+                    "aiosqlite is not installed but is required for SQLite storage. "
+                    "Install with: pip install aiosqlite  "
+                    f"(original error: {_sqlite_err})"
+                ) from _sqlite_err
         else:
             dsn = (
                 self.config.postgres_dsn
@@ -488,9 +508,26 @@ class StabilizerController:
                 )
                 db_path = self.config.repo_root / ".stabilizer" / "brain.db"
                 db_path.parent.mkdir(parents=True, exist_ok=True)
-                self.storage = SQLiteBrainStorage(db_path)
+                try:
+                    self.storage = SQLiteBrainStorage(db_path)
+                except ImportError as _sqlite_err:
+                    raise ConfigurationError(
+                        "aiosqlite is not installed but is required for SQLite storage "
+                        "(used as fallback when RHODAWK_PG_DSN is not set). "
+                        "Install with: pip install aiosqlite  "
+                        f"(original error: {_sqlite_err})"
+                    ) from _sqlite_err
             else:
-                self.storage = PostgresBrainStorage(dsn=dsn)
+                try:
+                    self.storage = PostgresBrainStorage(dsn=dsn)
+                except ImportError as _pg_err:
+                    raise ConfigurationError(
+                        "asyncpg is not installed but RHODAWK_PG_DSN is set, "
+                        "requiring PostgreSQL storage. "
+                        "Install with: pip install asyncpg  "
+                        "or unset RHODAWK_PG_DSN to fall back to SQLite. "
+                        f"(original error: {_pg_err})"
+                    ) from _pg_err
         await self.storage.initialise()
 
     async def _init_vector_store(self) -> None:
@@ -644,6 +681,64 @@ class StabilizerController:
                 graph_engine=self.graph_engine,
                 blast_radius_threshold=self.config.cpg_blast_radius_threshold,
             )
+
+            # MISSING-2 FIX: wire shard_manager for repos above the shard threshold.
+            # shard_manager.py exists but was never imported or invoked from the
+            # controller. Without sharding, Joern receives the entire codebase at
+            # once — Linux kernel requires ~60 GB heap and 6+ hours. Above
+            # RHODAWK_CPG_SHARD_THRESHOLD files (default 10,000), we initialize
+            # ShardManager which partitions by directory and runs a separate Joern
+            # instance per shard.
+            #
+            # The ShardManager wraps CPGEngine transparently — all downstream
+            # callers (ProgramSlicer, CPGContextSelector) see no API difference.
+            _cpg_shard_threshold = int(
+                os.environ.get("RHODAWK_CPG_SHARD_THRESHOLD", "10000")
+            )
+            try:
+                # Count source files to decide whether sharding is needed
+                _src_file_count = sum(
+                    1 for _ in self.config.repo_root.rglob("*")
+                    if _.is_file()
+                ) if self.config.repo_root.exists() else 0
+
+                if _src_file_count > _cpg_shard_threshold:
+                    self.log.info(
+                        "[CPG] Repo has %d files (> RHODAWK_CPG_SHARD_THRESHOLD=%d) "
+                        "— initializing ShardManager for distributed Joern analysis.",
+                        _src_file_count, _cpg_shard_threshold,
+                    )
+                    try:
+                        from cpg.shard_manager import ShardManager
+                        _shard_mgr = ShardManager(
+                            repo_root     = self.config.repo_root,
+                            joern_base_url= joern_url,
+                            project_name  = self.config.joern_project_name,
+                        )
+                        await _shard_mgr.initialise()
+                        # Attach to CPGEngine so all query methods route through it
+                        self._cpg_engine.shard_manager = _shard_mgr
+                        self.log.info(
+                            "[CPG] ShardManager initialized: %d shard(s)",
+                            len(_shard_mgr.shards) if hasattr(_shard_mgr, "shards")
+                            else -1,
+                        )
+                    except Exception as _sm_err:
+                        self.log.warning(
+                            "[CPG] ShardManager init failed (non-fatal — falling back "
+                            "to single-instance Joern, which may OOM on large repos): %s",
+                            _sm_err,
+                        )
+                else:
+                    self.log.debug(
+                        "[CPG] Repo has %d files — single-instance Joern (no sharding needed).",
+                        _src_file_count,
+                    )
+            except Exception as _shard_count_err:
+                self.log.debug(
+                    "[CPG] File count for shard decision failed (non-fatal): %s",
+                    _shard_count_err,
+                )
 
             # Non-blocking init — returns False if Joern not running
             connected = await self._cpg_engine.initialise(
@@ -1032,6 +1127,74 @@ class StabilizerController:
         return approved
 
     async def run_fix_phase(self, issues: list[Issue]) -> None:
+        # MISSING-1 FIX: generate fail_tests for issues that have none BEFORE
+        # BoBN scoring begins.
+        #
+        # Issues sourced from static analysis (60-80% of all findings) never
+        # have fail_tests populated. Without a test signal, BoBN's composite
+        # scoring formula collapses from:
+        #   0.6 × test_score + 0.3 × robust + 0.1 × minimal   (full signal)
+        # to:
+        #   0.0             + 0.3 × robust + 0.1 × minimal     (40% signal)
+        # Winner selection has zero correctness signal — a smaller incorrect
+        # patch beats a larger correct one every time.
+        #
+        # We use TestGeneratorAgent to produce a minimal reproduction test for
+        # each issue without fail_tests. Even one test is enough to give
+        # BoBNSampler a correctness signal via ExecutionFeedbackLoop. Failures
+        # are non-fatal — an issue with no generated test simply runs without
+        # the correctness signal (same as before this fix).
+        if (
+            self.config.gap5_enabled
+            and self._bobn_sampler is not None
+            and self.config.test_gen_enabled
+            and self.run
+            and self.storage
+        ):
+            issues_needing_tests = [
+                i for i in issues
+                if not getattr(i, "fail_tests", None)
+            ]
+            if issues_needing_tests:
+                self.log.info(
+                    "[MISSING-1] Generating fail_tests for %d issue(s) before BoBN "
+                    "scoring (%d/%d issues have no test signal).",
+                    len(issues_needing_tests),
+                    len(issues_needing_tests),
+                    len(issues),
+                )
+                try:
+                    _pre_tg = TestGeneratorAgent(
+                        storage     = self.storage,
+                        run_id      = self.run.id,
+                        config      = _agent_cfg(self.config, self.run.id),
+                        mcp_manager = self.mcp,
+                        repo_root   = self.config.repo_root,
+                    )
+                    for _issue in issues_needing_tests:
+                        try:
+                            # generate() returns a list of test identifiers (pytest
+                            # node IDs or test function names) that reproduce the
+                            # issue. Non-empty result → assigned to fail_tests so
+                            # BoBNSampler.sample() can use them as correctness signal.
+                            _generated = await _pre_tg.generate_for_issue(_issue)
+                            if _generated:
+                                _issue.fail_tests = list(_generated)
+                                self.log.debug(
+                                    "[MISSING-1] Generated %d test(s) for issue %s: %s",
+                                    len(_generated), _issue.id[:8], _generated[:2],
+                                )
+                        except Exception as _tg_issue_err:
+                            self.log.debug(
+                                "[MISSING-1] Test generation failed for issue %s "
+                                "(non-fatal): %s", _issue.id[:8], _tg_issue_err
+                            )
+                except Exception as _tg_err:
+                    self.log.warning(
+                        "[MISSING-1] Pre-BoBN TestGeneratorAgent init failed "
+                        "(non-fatal — BoBN will run without test signal): %s", _tg_err
+                    )
+
         # Gap 5: when the adversarial ensemble is enabled and ready, route
         # through the dual-fixer BoBN pipeline.  Falls back automatically
         # to _phase_fix() if BoBN is not initialised (safe degradation).
@@ -2081,6 +2244,37 @@ class StabilizerController:
             self.log.info(
                 f"[gap5_commit] VCS commit complete for issue {issue.id[:8]}"
             )
+
+            # BUG-7 FIX: close issues after successful commit.
+            # Previously _gap5_commit called _commit_module_group() which marks
+            # FixAttempt objects as committed but never set Issue.status = CLOSED.
+            # On the next cycle, storage.list_issues() returned these issues as OPEN,
+            # the auditor re-examined them, generated duplicate findings, and the
+            # fixer attempted to patch already-patched code — an infinite loop of
+            # duplicate commits that compounded on every subsequent cycle.
+            # Fix: mark every Issue whose id is in winner.issue_ids as CLOSED
+            # immediately after the VCS commit succeeds.
+            try:
+                _issue_ids_to_close = list(getattr(winner, "issue_ids", None) or [])
+                if not _issue_ids_to_close:
+                    # Fallback: close the single issue passed to this method
+                    _issue_ids_to_close = [issue.id]
+                for _iid in _issue_ids_to_close:
+                    _issue_obj = await self.storage.get_issue(_iid)
+                    if _issue_obj and _issue_obj.status != IssueStatus.CLOSED:
+                        _issue_obj.status = IssueStatus.CLOSED
+                        _issue_obj.closed_at = datetime.now(timezone.utc)
+                        await self.storage.upsert_issue(_issue_obj)
+                self.log.info(
+                    "[gap5_commit] Closed %d issue(s) after successful commit",
+                    len(_issue_ids_to_close),
+                )
+            except Exception as _close_exc:
+                self.log.warning(
+                    "[gap5_commit] Issue closure failed (non-fatal — "
+                    "issues may be re-audited on next cycle): %s", _close_exc
+                )
+
             # MISSING-02 FIX: store fix memory after successful BoBN commit.
             # Previously _gap5_commit had NO call to fix memory at all — every fix
             # produced by the Gap 5 adversarial path left zero trace in fix memory.
