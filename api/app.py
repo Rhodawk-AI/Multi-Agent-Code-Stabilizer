@@ -128,14 +128,14 @@ def _enforce_production_security() -> None:
 
     # Check 3: JWT secret must not be the placeholder value.
     jwt_secret = os.environ.get("RHODAWK_JWT_SECRET", "")
-    if jwt_secret in ("", "CHANGE_ME_generate_with_python"):
-        msg = (
-            "FATAL: RHODAWK_JWT_SECRET is not set or is still the placeholder value. "
-            "Generate a real secret with: python -c \"import secrets; print(secrets.token_hex(32))\" "
-            "and set RHODAWK_JWT_SECRET in your environment."
-        )
-        log.critical(msg)
-        sys.exit(msg)
+    if os.environ.get("RHODAWK_JWT_ALGORITHM", "RS256").upper() == "HS256":
+        if not jwt_secret or jwt_secret.startswith("CHANGE_ME"):
+            msg = (
+                "FATAL: RHODAWK_JWT_SECRET is not set or is still the placeholder value. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+            log.critical(msg)
+            sys.exit(msg)
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -149,6 +149,18 @@ async def lifespan(app: FastAPI):
     # BUG-2 FIX: enforce production security at startup — raises SystemExit on
     # policy violations instead of continuing with degraded security.
     _enforce_production_security()
+
+    # Bug #3 fix: call _init_config() eagerly so JWT misconfiguration raises
+    # at startup rather than as HTTP 500 on the first protected request.
+    try:
+        from auth.jwt_middleware import _init_config
+        _init_config()
+    except RuntimeError as _jwt_err:
+        log.critical("JWT configuration failed — startup aborted: %s", _jwt_err)
+        import os as _os
+        import logging as _logging
+        _logging.shutdown()
+        _os._exit(1)
 
     # MISSING-2 FIX: replay any commits that arrived while the API was down,
     # the webhook timed out, or the repo does not support push webhooks.
