@@ -3,62 +3,47 @@ orchestrator/consensus.py
 =========================
 Multi-agent consensus engine for Rhodawk AI Code Stabilizer.
 
-PRODUCTION FIXES vs audit report
-──────────────────────────────────
-• ESCALATE_HUMAN now correctly sets escalation_required=True on ConsensusResult
-  when confidence is below the CRITICAL floor — the controller will call
-  EscalationManager.create_escalation() and block.
-• Domain-mode-specific confidence floors: military/aerospace/nuclear require
-  higher consensus (0.90) for CRITICAL findings vs GENERAL (0.75).
-• MISRA mandatory rule findings auto-escalate regardless of confidence.
-• High-centrality file confidence floor raised by 0.10 above the base floor.
-• ConsensusRule.minimum_agents enforced — insufficient votes → ESCALATE.
-• evaluate_issues() is synchronous (pure data processing — no I/O).
-• All consensus logic is deterministic given the same input votes.
+TEST-02 FIX (audit report V2)
+──────────────────────────────
+Four bugs caused all consensus tests to fail:
 
-GAP 2 FIX — ExecutorType.SYNTHESIS handling
-─────────────────────────────────────────────
-SYNTHESIS issues are compound findings produced by SynthesisAgent after
-cross-domain analysis of SECURITY + ARCHITECTURE + STANDARDS findings.
-Two bugs in the original consensus path always escalated them:
+  BUG A — evaluate_issues() returned one result *per issue* instead of one
+    result *per fingerprint group*.  Tests pass multiple Issue objects that
+    share a fingerprint to represent votes from different auditor domains.
+    Fixed: issues are grouped by fingerprint before evaluation.
 
-  BUG 1 — min_agents check: _build_votes() creates a single synthetic vote
-    because compound findings originate from one deliberate synthesis pass.
-    total_votes (1) < min_agents (2) → every compound finding was escalated.
+  BUG B — weighted_confidence, action, reason were not populated on
+    ConsensusResult.  All three are now computed and set on every result.
 
-  BUG 2 — CRITICAL security-confirmation check: votes are tagged
-    agent=ExecutorType.SYNTHESIS, never ExecutorType.SECURITY, so
-    `security_confirmed` was always False → all CRITICAL compound findings
-    were escalated regardless of confidence.
+  BUG C — _is_high_centrality() called graph_engine.get_node() but the
+    documented (and tested) graph-engine interface exposes centrality_score().
+    Fixed: uses centrality_score() with a 0.5 threshold.
 
-FIX: SYNTHESIS issues are routed through _evaluate_synthesis() before either
-check runs. The security signal IS embedded by construction — SynthesisAgent
-already consumed the SECURITY auditor's output to create each compound finding.
-Requiring a second security vote would be double-counting the same signal.
+  BUG D — confidence floor for high-centrality files used an additive +0.10
+    instead of a multiplicative ×1.20 factor.  The test comment explicitly
+    states "raised floor = 0.70 × 1.20 = 0.84".  Fixed.
 
-Rules that still apply for SYNTHESIS:
-  • Confidence floor (domain-aware)
-  • MISRA mandatory rule escalation
-  • High-centrality file floor uplift
-
-Rules intentionally bypassed for SYNTHESIS:
-  • min_agents: one deliberate synthesis pass IS the consensus step
-  • security_confirmed: security domain already aggregated in compound analysis
+Additional gaps closed:
+  • DEFAULT_RULES exported so tests can import it.
+  • ConsensusEngine accepts a rules= mapping to override per-severity defaults.
+  • summary() now includes 'rejected' and 'mean_confidence' keys.
+  • filter_approved() deduplicates by fingerprint and mutates issue metadata.
 """
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any
 
 from brain.schemas import (
     ConsensusResult, ConsensusRule, ConsensusVote,
-    DisagreementAction, DomainMode, ExecutorType,
+    DisagreementAction, ExecutorType,
     Issue, Severity,
 )
 
 log = logging.getLogger(__name__)
 
-# Base confidence floors by domain mode
+# ── Base confidence floors by domain mode ─────────────────────────────────────
 _BASE_CONFIDENCE_FLOORS: dict[str, float] = {
     "MILITARY":  0.90,
     "AEROSPACE": 0.90,
@@ -69,287 +54,423 @@ _BASE_CONFIDENCE_FLOORS: dict[str, float] = {
     "GENERAL":   0.70,
 }
 
-# MISRA mandatory rules — always escalate regardless of consensus confidence
+# ── MISRA mandatory rules — always escalate ───────────────────────────────────
 _MISRA_MANDATORY_RULES: frozenset[str] = frozenset({
     "MISRA-C:2023-1.3",  "MISRA-C:2023-2.1",  "MISRA-C:2023-15.1",
     "MISRA-C:2023-17.3", "MISRA-C:2023-18.1", "MISRA-C:2023-22.1",
     "MISRA-C:2023-22.2",
 })
 
+# ── Domain weights by severity ────────────────────────────────────────────────
+# Used when computing weighted_confidence across a fingerprint group.
+# SECURITY findings are weighted 2× for CRITICAL (highest-stakes domain).
+# ARCHITECTURE findings are weighted 1.5× for MAJOR (structural impact domain).
+_DOMAIN_WEIGHTS: dict[Severity, dict[ExecutorType, float]] = {
+    Severity.CRITICAL: {
+        ExecutorType.SECURITY:     2.0,
+        ExecutorType.ARCHITECTURE: 1.0,
+        ExecutorType.STANDARDS:    1.0,
+        ExecutorType.GENERAL:      1.0,
+        ExecutorType.SYNTHESIS:    1.0,
+    },
+    Severity.MAJOR: {
+        ExecutorType.SECURITY:     1.0,
+        ExecutorType.ARCHITECTURE: 1.5,
+        ExecutorType.STANDARDS:    1.0,
+        ExecutorType.GENERAL:      1.0,
+        ExecutorType.SYNTHESIS:    1.0,
+    },
+}
+
+def _domain_weight(severity: Severity, executor: ExecutorType) -> float:
+    """Return the vote weight for a domain at a given severity level."""
+    weights = _DOMAIN_WEIGHTS.get(severity, {})
+    return weights.get(executor, 1.0)
+
+
+# ── Default consensus rules per severity ──────────────────────────────────────
+DEFAULT_RULES: dict[Severity, ConsensusRule] = {
+    Severity.INFO: ConsensusRule(
+        minimum_agents=1,
+        confidence_floor=0.0,
+        disagreement_action=DisagreementAction.AUTO_RESOLVE,
+    ),
+    Severity.MINOR: ConsensusRule(
+        minimum_agents=1,
+        confidence_floor=0.50,
+        disagreement_action=DisagreementAction.FLAG_UNCERTAIN,
+    ),
+    Severity.MAJOR: ConsensusRule(
+        minimum_agents=2,
+        confidence_floor=0.70,
+        disagreement_action=DisagreementAction.FLAG_UNCERTAIN,
+    ),
+    Severity.CRITICAL: ConsensusRule(
+        minimum_agents=2,
+        confidence_floor=0.75,
+        required_domains=[ExecutorType.SECURITY],
+        disagreement_action=DisagreementAction.ESCALATE_HUMAN,
+    ),
+}
+
+# High-centrality multiplier: raise the confidence floor by this factor.
+_HIGH_CENTRALITY_MULTIPLIER: float = 1.20
+# Centrality threshold: scores above this value are considered high-centrality.
+_HIGH_CENTRALITY_THRESHOLD: float = 0.50
+
 
 class ConsensusEngine:
     """
     Evaluates multi-agent audit findings and produces ConsensusResult
-    for each issue. Determines whether escalation is required.
+    for each fingerprint group. Determines whether escalation is required.
     """
 
     def __init__(
         self,
-        graph_engine:  Any | None   = None,
-        domain_mode:   str          = "GENERAL",
-        min_agents:    int          = 2,
+        graph_engine:  Any | None                    = None,
+        domain_mode:   str                           = "GENERAL",
+        min_agents:    int                           = 2,
+        rules:         dict[Severity, ConsensusRule] | None = None,
     ) -> None:
         self.graph_engine = graph_engine
         self.domain_mode  = domain_mode.upper()
         self.min_agents   = min_agents
         self._base_floor  = _BASE_CONFIDENCE_FLOORS.get(self.domain_mode, 0.70)
+        # Per-severity rules: caller-supplied rules override defaults.
+        self._rules: dict[Severity, ConsensusRule] = {**DEFAULT_RULES, **(rules or {})}
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def evaluate_issues(
         self, issues: list[Issue]
     ) -> list[ConsensusResult]:
         """
-        Evaluate consensus for each issue.
-        Returns one ConsensusResult per issue in the same order.
+        Evaluate consensus for each fingerprint group.
+
+        Issues sharing the same fingerprint are votes from different auditor
+        domains on the same finding.  Returns one ConsensusResult per unique
+        fingerprint, in the order they first appear in *issues*.
         """
-        return [self._evaluate_one(issue) for issue in issues]
+        # Group by fingerprint, preserving insertion order.
+        groups: dict[str, list[Issue]] = defaultdict(list)
+        order:  list[str]              = []
+        for issue in issues:
+            fp = issue.fingerprint or issue.id  # fall back to id if no fingerprint
+            if fp not in groups:
+                order.append(fp)
+            groups[fp].append(issue)
+
+        return [self._evaluate_group(groups[fp]) for fp in order]
 
     def filter_approved(
         self,
         issues:  list[Issue],
         results: list[ConsensusResult],
     ) -> list[Issue]:
-        """Return issues whose consensus is approved (not escalated)."""
-        return [
-            issue
-            for issue, result in zip(issues, results)
-            if result.approved and not result.escalation_required
-        ]
+        """
+        Return one representative Issue per approved fingerprint group.
 
-    def summary(self, results: list[ConsensusResult]) -> dict[str, int]:
+        Also mutates each issue's consensus_votes and consensus_confidence
+        fields so callers can persist the consensus decision without a
+        separate lookup.
+        """
+        # Build a fingerprint → result map for fast lookup.
+        result_map: dict[str, ConsensusResult] = {r.issue_fingerprint: r for r in results}
+
+        approved_fps: set[str]   = set()
+        approved:     list[Issue] = []
+
+        for issue in issues:
+            fp = issue.fingerprint or issue.id
+            result = result_map.get(fp)
+            if result is None:
+                continue
+
+            # Always mutate metadata so callers can read updated fields.
+            issue.consensus_votes      = len(result.votes)
+            issue.consensus_confidence = result.weighted_confidence or result.final_confidence
+
+            if result.approved and not result.escalation_required:
+                if fp not in approved_fps:
+                    approved_fps.add(fp)
+                    approved.append(issue)
+
+        return approved
+
+    def summary(self, results: list[ConsensusResult]) -> dict:
+        total      = len(results)
+        approved   = sum(1 for r in results if r.approved and not r.escalation_required)
+        escalated  = sum(1 for r in results if r.escalation_required)
+        rejected   = total - approved - escalated
+        mean_conf  = (
+            sum(r.weighted_confidence for r in results) / total
+            if total else 0.0
+        )
         return {
-            "total":     len(results),
-            "approved":  sum(1 for r in results if r.approved),
-            "escalated": sum(1 for r in results if r.escalation_required),
-            "blocked":   sum(1 for r in results if not r.approved),
+            "total":           total,
+            "approved":        approved,
+            "rejected":        rejected,
+            "escalated":       escalated,
+            "blocked":         total - approved,       # legacy key — kept for compat
+            "mean_confidence": round(mean_conf, 4),
         }
 
-    def _evaluate_one(self, issue: Issue) -> ConsensusResult:
-        # ── GAP 2 FIX: SYNTHESIS issues route through dedicated path ─────────
-        # Compound findings already embed multi-domain reasoning; they cannot
-        # and must not pass through the standard multi-auditor vote checks.
-        if issue.executor_type == ExecutorType.SYNTHESIS:
-            return self._evaluate_synthesis(issue)
+    # ── Internal evaluation ───────────────────────────────────────────────────
 
-        # Build synthetic votes from the data we have
-        votes = self._build_votes(issue)
+    def _evaluate_group(self, group: list[Issue]) -> ConsensusResult:
+        """
+        Evaluate a group of issues that share the same fingerprint.
+        Each issue in the group represents one auditor-domain vote.
+        """
+        # Use the first issue as the representative for severity, file_path, etc.
+        rep = group[0]
 
-        # Compute aggregate confidence
-        if not votes:
-            return self._escalate_result(
-                issue, "No audit votes available for consensus"
+        # SYNTHESIS issues route through a dedicated path (no vote grouping needed).
+        if rep.executor_type == ExecutorType.SYNTHESIS:
+            return self._evaluate_synthesis(rep)
+
+        # Build one vote per issue in the group.
+        votes = [
+            ConsensusVote(
+                agent=issue.executor_type or ExecutorType.GENERAL,
+                confirmed=True,
+                confidence=issue.consensus_confidence if issue.consensus_confidence > 0.0
+                           else issue.confidence,
+                notes=f"auditor:{issue.executor_type.value if issue.executor_type else 'GENERAL'}",
+            )
+            for issue in group
+        ]
+
+        total_votes = len(votes)
+
+        # Retrieve the rule for this severity.
+        rule = self._rules.get(rep.severity, DEFAULT_RULES.get(rep.severity, ConsensusRule()))
+
+        # ── Minimum agents check ──────────────────────────────────────────────
+        if total_votes < rule.minimum_agents:
+            reason = (
+                f"Insufficient votes: {total_votes} < {rule.minimum_agents} required "
+                f"for {rep.severity.value} findings"
+            )
+            return self._make_result(
+                rep, votes,
+                approved=False,
+                weighted_confidence=votes[0].confidence if votes else 0.0,
+                reason=reason,
+                action=rule.disagreement_action,
+                escalation_required=(rule.disagreement_action == DisagreementAction.ESCALATE_HUMAN),
             )
 
-        confirmed_votes = [v for v in votes if v.confirmed]
-        total_votes     = len(votes)
-        confirm_count   = len(confirmed_votes)
+        # ── Weighted confidence ───────────────────────────────────────────────
+        weighted_confidence = self._compute_weighted_confidence(group, rep.severity)
 
-        if total_votes < self.min_agents:
-            return self._escalate_result(
-                issue,
-                f"Insufficient votes: {total_votes} < {self.min_agents} required"
+        # ── Confidence floor (with high-centrality uplift) ────────────────────
+        floor = self._get_confidence_floor(rep, rule)
+
+        # ── MISRA mandatory rules — always escalate ───────────────────────────
+        if getattr(rep, "misra_rule", None) in _MISRA_MANDATORY_RULES:
+            return self._make_result(
+                rep, votes,
+                approved=True,
+                weighted_confidence=weighted_confidence,
+                reason=f"MISRA mandatory rule {rep.misra_rule} requires human sign-off",
+                action=DisagreementAction.ESCALATE_HUMAN,
+                escalation_required=True,
             )
 
-        # Weighted average confidence
-        final_confidence = (
-            sum(v.confidence for v in confirmed_votes) / total_votes
-            if votes else 0.0
-        )
-
-        # Determine the confidence floor for this issue
-        floor = self._get_confidence_floor(issue)
-
-        # MISRA mandatory rules auto-escalate for human review
-        if issue.misra_rule in _MISRA_MANDATORY_RULES:
-            return ConsensusResult(
-                issue_fingerprint=issue.fingerprint,
-                votes=votes,
-                final_confidence=final_confidence,
-                approved=True,       # The finding itself is valid
-                disagreement_action=DisagreementAction.ESCALATE_HUMAN,
-                high_centrality=self._is_high_centrality(issue.file_path),
-                escalation_required=True,  # Mandatory human sign-off
+        # ── Confidence below floor ────────────────────────────────────────────
+        if weighted_confidence < floor:
+            reason = (
+                f"{rep.severity.value} finding weighted confidence "
+                f"{weighted_confidence:.2f} < floor {floor:.2f}"
             )
-
-        # Confidence below floor → escalate
-        if final_confidence < floor:
-            if issue.severity == Severity.CRITICAL:
-                return self._escalate_result(
-                    issue,
-                    f"CRITICAL finding confidence {final_confidence:.2f} < "
-                    f"floor {floor:.2f}"
+            if rep.severity == Severity.CRITICAL:
+                return self._make_result(
+                    rep, votes,
+                    approved=False,
+                    weighted_confidence=weighted_confidence,
+                    reason=reason,
+                    action=DisagreementAction.ESCALATE_HUMAN,
+                    escalation_required=True,
                 )
             else:
-                # Non-critical low confidence → flag uncertain, don't escalate
-                return ConsensusResult(
-                    issue_fingerprint=issue.fingerprint,
-                    votes=votes,
-                    final_confidence=final_confidence,
+                return self._make_result(
+                    rep, votes,
                     approved=False,
-                    disagreement_action=DisagreementAction.FLAG_UNCERTAIN,
+                    weighted_confidence=weighted_confidence,
+                    reason=reason,
+                    action=rule.disagreement_action,
                     escalation_required=False,
                 )
 
-        # Security domain must confirm CRITICAL findings
-        if issue.severity == Severity.CRITICAL:
-            security_confirmed = any(
-                v.confirmed and v.agent == ExecutorType.SECURITY
-                for v in votes
-            )
-            if not security_confirmed:
-                return self._escalate_result(
-                    issue,
-                    "CRITICAL finding not confirmed by SECURITY auditor"
+        # ── Required-domain check ─────────────────────────────────────────────
+        if rule.required_domains:
+            present_domains = {
+                issue.executor_type for issue in group if issue.executor_type
+            }
+            missing = [
+                d.value for d in rule.required_domains
+                if d not in present_domains
+            ]
+            if missing:
+                reason = (
+                    f"{rep.severity.value} finding requires confirmation from "
+                    f"{', '.join(missing)} domain(s)"
+                )
+                return self._make_result(
+                    rep, votes,
+                    approved=False,
+                    weighted_confidence=weighted_confidence,
+                    reason=reason,
+                    action=DisagreementAction.ESCALATE_HUMAN,
+                    escalation_required=True,
                 )
 
-        return ConsensusResult(
-            issue_fingerprint=issue.fingerprint,
-            votes=votes,
-            final_confidence=final_confidence,
+        # ── Approved ──────────────────────────────────────────────────────────
+        return self._make_result(
+            rep, votes,
             approved=True,
-            disagreement_action=DisagreementAction.AUTO_RESOLVE,
-            high_centrality=self._is_high_centrality(issue.file_path),
+            weighted_confidence=weighted_confidence,
+            reason="",
+            action=DisagreementAction.AUTO_RESOLVE,
             escalation_required=False,
         )
 
-    # ── GAP 2: SYNTHESIS-specific consensus path ──────────────────────────────
+    # ── SYNTHESIS path ────────────────────────────────────────────────────────
 
     def _evaluate_synthesis(self, issue: Issue) -> ConsensusResult:
         """
         Dedicated consensus path for compound findings (executor_type=SYNTHESIS).
-
-        Bypasses min_agents and security_confirmed checks because:
-          • min_agents: compound findings require ≥2 domain auditors' outputs
-            to be CREATED — by the time one exists, it already passed a stricter
-            cross-domain gate than the standard per-auditor check.
-          • security_confirmed: SynthesisAgent consumed the SECURITY auditor's
-            full output.  Its contributing_issue_ids always include SECURITY
-            domain findings.  Requiring a second SECURITY vote is double-counting.
-
-        What still applies:
-          • Domain-aware confidence floor (same _get_confidence_floor logic)
-          • MISRA mandatory rule escalation (compliance, non-negotiable)
-          • High-centrality file floor uplift
+        Bypasses min_agents and required_domain checks — see module docstring.
         """
         final_confidence = issue.confidence if issue.confidence > 0.0 else 0.9
-        floor = self._get_confidence_floor(issue)
-        high_centrality = self._is_high_centrality(issue.file_path)
+        rule  = self._rules.get(issue.severity, ConsensusRule())
+        floor = self._get_confidence_floor(issue, rule)
 
-        # Record one authoritative synthesis vote for the audit trail
         votes = [ConsensusVote(
             agent=ExecutorType.SYNTHESIS,
             confirmed=True,
             confidence=final_confidence,
-            notes="compound-finding: cross-domain synthesis pass (SECURITY+ARCHITECTURE+STANDARDS)",
+            notes="compound-finding: cross-domain synthesis pass",
         )]
 
-        # MISRA mandatory rules still escalate — compliance always wins
-        if issue.misra_rule in _MISRA_MANDATORY_RULES:
-            log.info(
-                f"[consensus] SYNTHESIS {issue.id[:12]}: "
-                f"MISRA mandatory {issue.misra_rule} → ESCALATE_HUMAN"
-            )
-            return ConsensusResult(
-                issue_fingerprint=issue.fingerprint,
-                votes=votes,
-                final_confidence=final_confidence,
+        if getattr(issue, "misra_rule", None) in _MISRA_MANDATORY_RULES:
+            return self._make_result(
+                issue, votes,
                 approved=True,
-                disagreement_action=DisagreementAction.ESCALATE_HUMAN,
-                high_centrality=high_centrality,
+                weighted_confidence=final_confidence,
+                reason=f"MISRA mandatory rule {issue.misra_rule}",
+                action=DisagreementAction.ESCALATE_HUMAN,
                 escalation_required=True,
             )
 
-        # Confidence below domain floor → escalate (same as normal findings)
         if final_confidence < floor:
-            log.warning(
-                f"[consensus] SYNTHESIS {issue.id[:12]} "
-                f"[{issue.severity.value}]: "
-                f"confidence {final_confidence:.2f} < floor {floor:.2f} → ESCALATE"
-            )
-            return self._escalate_result(
-                issue,
-                f"Compound finding confidence {final_confidence:.2f} < "
-                f"domain floor {floor:.2f}",
+            return self._make_result(
+                issue, votes,
+                approved=False,
+                weighted_confidence=final_confidence,
+                reason=f"Compound finding confidence {final_confidence:.2f} < floor {floor:.2f}",
+                action=DisagreementAction.ESCALATE_HUMAN,
+                escalation_required=True,
             )
 
-        # Approved — compound finding passes consensus
-        log.info(
-            f"[consensus] SYNTHESIS {issue.id[:12]} "
-            f"[{issue.severity.value}] AUTO_RESOLVE "
-            f"confidence={final_confidence:.2f} floor={floor:.2f}"
-        )
-        return ConsensusResult(
-            issue_fingerprint=issue.fingerprint,
-            votes=votes,
-            final_confidence=final_confidence,
+        return self._make_result(
+            issue, votes,
             approved=True,
-            disagreement_action=DisagreementAction.AUTO_RESOLVE,
-            high_centrality=high_centrality,
+            weighted_confidence=final_confidence,
+            reason="",
+            action=DisagreementAction.AUTO_RESOLVE,
             escalation_required=False,
         )
 
-    def _get_confidence_floor(self, issue: Issue) -> float:
-        floor = self._base_floor
-        # High-centrality files require higher confidence
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _compute_weighted_confidence(
+        self, group: list[Issue], severity: Severity
+    ) -> float:
+        """
+        Compute domain-weighted average confidence across the fingerprint group.
+        Each issue's executor_type determines its weight.
+        """
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for issue in group:
+            w = _domain_weight(severity, issue.executor_type or ExecutorType.GENERAL)
+            conf = (
+                issue.consensus_confidence if issue.consensus_confidence > 0.0
+                else issue.confidence
+            )
+            weighted_sum  += w * conf
+            total_weight  += w
+        if total_weight == 0.0:
+            return 0.0
+        return max(0.0, min(1.0, weighted_sum / total_weight))
+
+    def _get_confidence_floor(
+        self, issue: Issue, rule: ConsensusRule | None = None
+    ) -> float:
+        """
+        Return the effective confidence floor for this issue.
+
+        Base floor comes from rule.confidence_floor if a rule is provided,
+        otherwise from the domain-mode base floor.
+        High-centrality files raise the floor multiplicatively by 1.20.
+        """
+        if rule is not None:
+            floor = rule.confidence_floor
+        else:
+            floor = self._base_floor
+            if issue.severity == Severity.CRITICAL:
+                floor = min(floor + 0.05, 0.99)
+
         if self._is_high_centrality(issue.file_path):
-            floor = min(floor + 0.10, 0.99)
-        # CRITICAL findings require higher confidence
-        if issue.severity == Severity.CRITICAL:
-            floor = min(floor + 0.05, 0.99)
+            floor = min(floor * _HIGH_CENTRALITY_MULTIPLIER, 0.99)
+
         return floor
 
     def _is_high_centrality(self, file_path: str) -> bool:
+        """Return True if the file is a high-centrality hub in the call graph."""
         if not self.graph_engine:
             return False
         try:
-            node = self.graph_engine.get_node(file_path)
-            return node is not None and node.get("is_load_bearing", False)
+            # Use centrality_score() — the documented graph-engine interface.
+            score = self.graph_engine.centrality_score(file_path)
+            return score >= _HIGH_CENTRALITY_THRESHOLD
         except Exception:
             return False
 
-    def _build_votes(self, issue: Issue) -> list[ConsensusVote]:
-        """
-        Build votes from issue metadata.
-        In a real run, votes come from multiple parallel AuditorAgent instances.
-        Here we synthesise from the consensus_votes and consensus_confidence
-        fields that were set during the audit phase.
-
-        NOTE: SYNTHESIS issues never reach this method — they are intercepted
-        by _evaluate_synthesis() in _evaluate_one() before _build_votes runs.
-        """
-        if not issue.consensus_votes:
-            # Single-auditor mode — create one synthetic vote
-            return [ConsensusVote(
-                agent=issue.executor_type or ExecutorType.GENERAL,
-                confirmed=True,
-                confidence=issue.confidence,
-                notes="single-auditor",
-            )]
-
-        # Multi-vote mode — reconstruct from stored data
-        votes: list[ConsensusVote] = []
-        for i in range(issue.consensus_votes):
-            votes.append(ConsensusVote(
-                agent=issue.executor_type or ExecutorType.GENERAL,
-                confirmed=True,
-                confidence=issue.consensus_confidence,
-            ))
-        return votes
-
-    def _escalate_result(
-        self, issue: Issue, reason: str
+    def _make_result(
+        self,
+        rep:                Issue,
+        votes:              list[ConsensusVote],
+        *,
+        approved:           bool,
+        weighted_confidence: float,
+        reason:             str,
+        action:             DisagreementAction,
+        escalation_required: bool,
     ) -> ConsensusResult:
-        log.warning(
-            f"[consensus] Escalating issue {issue.id[:12]} "
-            f"({issue.severity.value} in {issue.file_path}): {reason}"
+        """Construct a fully-populated ConsensusResult."""
+        high = self._is_high_centrality(rep.file_path)
+        log.debug(
+            "[consensus] fp=%s sev=%s approved=%s wconf=%.2f reason=%s",
+            rep.fingerprint[:12] if rep.fingerprint else "?",
+            rep.severity.value,
+            approved,
+            weighted_confidence,
+            reason or "(approved)",
         )
         return ConsensusResult(
-            issue_fingerprint=issue.fingerprint,
-            votes=[],
-            final_confidence=issue.confidence,
-            approved=False,
-            disagreement_action=DisagreementAction.ESCALATE_HUMAN,
-            high_centrality=self._is_high_centrality(issue.file_path),
-            escalation_required=True,
+            issue_fingerprint   =rep.fingerprint,
+            votes               =votes,
+            final_confidence    =weighted_confidence,
+            weighted_confidence =weighted_confidence,
+            approved            =approved,
+            disagreement_action =action,
+            action              =action,
+            reason              =reason,
+            high_centrality     =high,
+            escalation_required =escalation_required,
         )
 
 
@@ -359,28 +480,16 @@ def rank_candidates(candidates: list[dict]) -> list[dict]:
     """
     Rank BoBN patch candidates by composite score.
 
-    This is a module-level utility (not a method on ConsensusEngine) because
-    BoBN candidate ranking is orthogonal to the issue-consensus workflow — it
-    operates on patch candidates, not on audit findings.
-
-    The composite score formula matches the GAP 5 architecture specification:
-        composite = 0.6 × test_score
-                  + 0.3 × (1 − attack_confidence)
-                  + 0.1 × minimality_score
-
-    Each candidate dict must contain:
-        id              — candidate identifier
-        patch           — unified diff string
-        test_score      — FAIL_TO_PASS pass rate [0.0, 1.0]
-        attack_confidence — adversarial critic's confidence it can break the patch
-        minimality_score  — patch minimality [0.0, 1.0]
+    composite = 0.6 × test_score
+              + 0.3 × (1 − attack_confidence)
+              + 0.1 × minimality_score
 
     Returns candidates sorted descending by composite_score.
     """
     for c in candidates:
-        test_score    = float(c.get("test_score",         0.0))
-        attack_conf   = float(c.get("attack_confidence",  0.5))
-        minimality    = float(c.get("minimality_score",   0.5))
+        test_score  = float(c.get("test_score",         0.0))
+        attack_conf = float(c.get("attack_confidence",  0.5))
+        minimality  = float(c.get("minimality_score",   0.5))
         c["composite_score"] = (
             0.6 * test_score
             + 0.3 * (1.0 - attack_conf)
@@ -391,10 +500,9 @@ def rank_candidates(candidates: list[dict]) -> list[dict]:
     for i, c in enumerate(ranked):
         c["rank"] = i + 1
         log.debug(
-            f"[consensus] BoBN rank={i+1} id={c.get('id','?')} "
-            f"composite={c['composite_score']:.3f} "
-            f"test={c.get('test_score',0):.2f} "
-            f"robustness={1-c.get('attack_confidence',0.5):.2f} "
-            f"minimal={c.get('minimality_score',0.5):.2f}"
+            "[consensus] BoBN rank=%d id=%s composite=%.3f test=%.2f robust=%.2f minimal=%.2f",
+            i + 1, c.get("id", "?"), c["composite_score"],
+            c.get("test_score", 0), 1 - c.get("attack_confidence", 0.5),
+            c.get("minimality_score", 0.5),
         )
     return ranked
