@@ -498,6 +498,18 @@ class SWEBenchEvaluator:
         start  = time.monotonic()
         result = EvalResult(instance_id=instance.instance_id)
 
+        # ADD-2 FIX: override max_cycles for SWE-bench evaluation.
+        # The default of 50 cycles truncates multi-file interdependent fixes.
+        # SWE-bench instances use 200 cycles so the pipeline has adequate budget.
+        # Override via RHODAWK_SWE_MAX_CYCLES env var for tuning.
+        import os as _eval_os
+        _swe_max_cycles = int(_eval_os.environ.get("RHODAWK_SWE_MAX_CYCLES", "200"))
+        if hasattr(self, "factory") and hasattr(self.factory, "config"):
+            try:
+                self.factory.config.max_cycles = _swe_max_cycles
+            except Exception:
+                pass
+
         log.info(f"[evaluator] GAP5: evaluating {instance.instance_id}")
 
         try:
@@ -547,6 +559,58 @@ class SWEBenchEvaluator:
             loc_context = loc_result.to_crew_context() if loc_result else ""
             meta["localization_used"] = bool(loc_result and loc_result.edit_files)
 
+        # ── Bug 5 FIX: Per-instance Joern CPGEngine initialization ───────────
+        # Previously self.joern_client was a single shared object passed to every
+        # instance. A Joern client initialized against instance A's repo produces
+        # completely wrong CPG context for instance B — callers/callees/data-flow
+        # from the wrong codebase. When joern_client=None (the default), every
+        # instance silently runs on vector fallback with no CPG context at all.
+        #
+        # Fix: for each instance, clone the repo at base_commit into a temp dir,
+        # initialize a fresh CPGEngine against that clone, and tear it down after
+        # the instance completes. RHODAWK_SWE_CPG_ENABLED=0 disables for fast runs.
+        import os as _os
+        import subprocess as _subprocess
+        import tempfile as _tempfile
+
+        _swe_cpg_enabled = _os.environ.get("RHODAWK_SWE_CPG_ENABLED", "1") != "0"
+        _instance_cpg = None
+
+        if _swe_cpg_enabled and instance.repo and instance.base_commit:
+            try:
+                from cpg.cpg_engine import CPGEngine
+                _joern_url = _os.environ.get("JOERN_URL", "http://localhost:8080")
+                _tmp_dir = _tempfile.mkdtemp(prefix=f"rhodawk_swe_{instance.instance_id[:12]}_")
+                _clone_result = _subprocess.run(
+                    ["git", "clone", "--depth=1", "--quiet", instance.repo, _tmp_dir],
+                    capture_output=True, timeout=120,
+                )
+                if _clone_result.returncode == 0:
+                    _subprocess.run(
+                        ["git", "checkout", "--quiet", instance.base_commit],
+                        cwd=_tmp_dir, capture_output=True, timeout=60,
+                    )
+                    _instance_cpg = CPGEngine(joern_url=_joern_url)
+                    await _instance_cpg.initialise(
+                        repo_path=_tmp_dir,
+                        project_name=f"swe_{instance.instance_id[:16].replace('/', '_')}",
+                    )
+                    log.info(
+                        "[evaluator] Per-instance CPG initialized for %s at %s",
+                        instance.instance_id, instance.base_commit[:8],
+                    )
+                else:
+                    log.debug(
+                        "[evaluator] git clone failed for %s — CPG disabled for this instance",
+                        instance.instance_id,
+                    )
+            except Exception as _cpg_init_err:
+                log.debug(
+                    "[evaluator] Per-instance CPG init failed for %s (non-fatal): %s",
+                    instance.instance_id, _cpg_init_err,
+                )
+                _instance_cpg = None
+
         # ── Phases 1-4: BoBN Sampling ─────────────────────────────────────────
         from swe_bench.bobn_sampler import BoBNSampler
         from agents.adversarial_critic import AdversarialCriticAgent
@@ -557,6 +621,9 @@ class SWEBenchEvaluator:
             critic               = critic,
             issue_text           = instance.problem_stmt,
             localization_context = loc_context,
+            # Bug 5: pass per-instance CPG engine so callers/callees come from
+            # the correct codebase at the correct commit, not a shared stale client
+            cpg_engine           = _instance_cpg,
         )
         bobn_result = await sampler.sample(
             instance_id = instance.instance_id,
@@ -568,6 +635,18 @@ class SWEBenchEvaluator:
         )
         meta["bobn_used"]      = True
         meta["n_candidates"]   = bobn_result.n_candidates
+
+        # Bug 5: tear down per-instance CPG engine after sampling completes
+        if _instance_cpg is not None:
+            try:
+                await _instance_cpg.close()
+            except Exception:
+                pass
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
         meta["winning_score"]  = bobn_result.winning_score
 
         winning_patch = bobn_result.winning_patch
