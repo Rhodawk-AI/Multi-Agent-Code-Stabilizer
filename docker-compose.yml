@@ -36,6 +36,18 @@ services:
       redis:
         condition: service_started
     command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --workers 2
+    # SEC-2 FIX: added Docker socket mount to rhodawk-api.
+    # Previously the socket was only present on rhodawk-worker.  The API service
+    # runs FastAPI background tasks that invoke the full pipeline including test
+    # execution (POST /api/upload → _run_audit_task).  Without the socket,
+    # shutil.which("docker") returns the CLI path (installed via apt-get) but
+    # docker run fails with FileNotFoundError because the daemon socket is absent.
+    # The SEC-1 fix correctly returns returncode=-1 instead of falling through to
+    # unsandboxed execution, but ALL test correctness signals are lost for every
+    # zip-upload mode user — BoBN composite collapses to 0.3×robust + 0.1×minimal.
+    # Same socket threat model applies as rhodawk-worker (see comment there).
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -141,7 +153,15 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: redis-server --save 60 1 --loglevel warning
+    # ADD-2 FIX: Redis previously ran with no authentication — any process on
+    # the Docker network could read/write the Celery task queue, injecting
+    # arbitrary tasks or reading task payloads (which include file contents and
+    # fix diffs).  Added --requirepass so the queue requires a password.
+    # Set REDIS_PASSWORD in .env before first run:
+    #   python -c "import secrets; print(secrets.token_hex(16))"
+    # Update REDIS_URL in .env to:
+    #   REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env} --save 60 1 --loglevel warning
     restart: unless-stopped
 
   ollama:
