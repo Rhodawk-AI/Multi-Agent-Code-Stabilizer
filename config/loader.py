@@ -245,6 +245,28 @@ _ENV_MAP: dict[str, tuple[str, str]] = {
     "RHODAWK_FED_MIN_COMPLEXITY": ("gap6_min_complexity",         "float"),
 }
 
+# ADD-5 NOTE — environment-variable-only settings:
+# The following variables are read directly from os.environ at their use-sites
+# and are NOT present in _ENV_MAP.  They cannot be set via config.toml because
+# they are not fields on StabilizerConfig.  They must be set as environment
+# variables (in .env, docker-compose environment block, or shell export).
+#
+# Variable                       Default    Used in
+# ─────────────────────────────────────────────────────────────────────────────
+# RHODAWK_MAX_FILE_BYTES         1_048_576  api/routes/upload.py — max upload
+# RHODAWK_MAX_FILES              50         api/routes/upload.py — max file count
+# RHODAWK_MAX_CONCURRENT_UPLOADS 3          api/routes/upload.py — semaphore
+# RHODAWK_BOBN_CANDIDATES        10         models/router.py     — BoBN N
+# CPG_ENABLED                    (bool)     orchestrator (also in _ENV_MAP above)
+# HELIX_USE_LOCAL_QDRANT         (bool)     memory/helixdb.py    — Qdrant routing
+# TOOLHIVE_DISABLE               (bool)     tools/toolhive.py    — disable ToolHive
+# RHODAWK_BOBN_CONCURRENCY       4          orchestrator/controller.py — semaphore
+# REDIS_PASSWORD                 (required) docker-compose.yml  — Redis auth
+#
+# To make any of these configurable via TOML, add a field to StabilizerConfig
+# in config/loader.py and add an entry to _ENV_MAP above.
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _apply_env(data: dict) -> None:
     for env_key, (field, kind) in _ENV_MAP.items():
