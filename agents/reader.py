@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -115,12 +116,57 @@ class ReaderAgent(BaseAgent):
         return processed
 
     def _collect_files(self) -> list[Path]:
+        """
+        BUG-3 FIX: replaced self.repo_root.rglob("*") with os.walk(followlinks=False).
+        rglob() follows symbolic links by default in Python's pathlib. A repo with
+        a symlink cycle causes rglob() to recurse indefinitely — the thread running
+        in run_in_executor() hangs permanently with no timeout.
+        os.walk(followlinks=False) never follows symlinks, eliminating the hang.
+
+        ARCH-1 FIX: added RHODAWK_MAX_FILES cap (default 50 000). Above this limit
+        the most recently modified files are prioritised and the rest skipped with a WARNING.
+
+        ADD-4: warn when concurrency x max_file_bytes would stress RAM.
+        """
+        _max_files = int(os.environ.get("RHODAWK_MAX_FILES", "50000"))
+        _max_file_bytes = int(os.environ.get(
+            "RHODAWK_MAX_FILE_BYTES", str(5 * 1024 * 1024)))
+        _peak_mb = (self.concurrency * _max_file_bytes) // (1024 * 1024)
+        if _peak_mb > 500:
+            log.warning(
+                "[reader] Peak RAM estimate: %d MB (concurrency=%d x "
+                "max_file_bytes=%d MB). Consider reducing concurrency or "
+                "RHODAWK_MAX_FILE_BYTES to stay under 500 MB.",
+                _peak_mb, self.concurrency, _max_file_bytes // (1024 * 1024),
+            )
+
         files: list[Path] = []
-        for p in self.repo_root.rglob("*"):
-            if any(part in SKIP_DIRS for part in p.parts):
-                continue
-            if p.is_file() and p.suffix.lower() in AUDIT_EXTENSIONS:
-                files.append(p)
+        for dirpath, dirs, filenames in os.walk(
+            self.repo_root, followlinks=False
+        ):
+            # Prune skip-dirs in-place so os.walk never descends into them
+            dirs[:] = [
+                d for d in dirs
+                if d not in SKIP_DIRS and not d.startswith(".")
+            ]
+            for fname in filenames:
+                p = Path(dirpath) / fname
+                if p.suffix.lower() in AUDIT_EXTENSIONS:
+                    files.append(p)
+
+        if len(files) > _max_files:
+            log.warning(
+                "[reader] %d matching files found — capping at RHODAWK_MAX_FILES=%d. "
+                "Sorting by modification time (most-recent first) to prioritise "
+                "recently changed files. Set RHODAWK_MAX_FILES to raise the limit.",
+                len(files), _max_files,
+            )
+            try:
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            files = files[:_max_files]
+
         return sorted(files)
 
     async def _process_file(
@@ -131,6 +177,31 @@ class ReaderAgent(BaseAgent):
     ) -> FileRecord:
         rel_path = str(path.relative_to(self.repo_root))
         async with sem:
+            # BUG-2 FIX: per-file byte-size limit before loading into RAM.
+            # A single 50 MB minified JS bundle or 30 MB proto dump would
+            # load completely into RAM during read. At Chromium scale with
+            # concurrency=4, four such files simultaneously = 200+ MB before
+            # chunking reduces storage footprint. Skip files above the limit.
+            _max_file_bytes = int(os.environ.get(
+                "RHODAWK_MAX_FILE_BYTES", str(5 * 1024 * 1024)))  # 5 MB default
+            try:
+                _file_size = path.stat().st_size
+            except OSError:
+                _file_size = 0
+            if _file_size > _max_file_bytes:
+                self.log.warning(
+                    "[reader] Skipping %s: %d bytes exceeds "
+                    "RHODAWK_MAX_FILE_BYTES=%d. Set env var to raise limit.",
+                    path, _file_size, _max_file_bytes,
+                )
+                return FileRecord(
+                    path=rel_path,
+                    language=self._detect_language(path),
+                    status=FileStatus.SKIPPED if hasattr(FileStatus, "SKIPPED")
+                           else FileStatus.READ,
+                    run_id=self.run_id,
+                )
+
             content = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: path.read_text(encoding="utf-8", errors="replace")
             )

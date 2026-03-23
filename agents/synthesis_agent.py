@@ -631,6 +631,68 @@ class SynthesisAgent(BaseAgent):
             "[synthesis] Compound detection complete: %d unique findings across batches",
             len(all_compounds),
         )
+
+        # ARCH-4 FIX: final cross-domain pass on top-5-per-domain findings.
+        #
+        # The sliding-window approach above caps batches at _COMPOUND_BATCH_SIZE=40.
+        # Issue pairs more than 40 positions apart are NEVER co-examined — exactly
+        # the highest-value cross-domain interactions (e.g. issue #1 SECURITY +
+        # issue #301 ARCHITECTURE) that only appear in large codebases.
+        #
+        # One additional LLM call covers the top 5 by severity from each of the
+        # three auditor domains (15 issues total — well within context limits),
+        # guaranteeing the highest-severity cross-domain interactions are always
+        # examined regardless of total issue count or issue ordering.
+        try:
+            from brain.schemas import ExecutorType as _ET
+            _domain_keys = ["SECURITY", "ARCHITECTURE", "STANDARDS"]
+            _top_per_domain: list = []
+            for _dk in _domain_keys:
+                _domain_issues = [
+                    i for i in issues
+                    if str(getattr(i, "executor_type", "") or
+                           getattr(i, "domain", "") or "").upper() == _dk
+                ]
+                _domain_issues.sort(
+                    key=lambda x: float(getattr(x, "severity_score", 0) or 0),
+                    reverse=True,
+                )
+                _top_per_domain.extend(_domain_issues[:5])
+
+            # Only run if we have findings from at least 2 domains AND the curated
+            # set is not a subset of an already-examined batch (would be redundant
+            # when issue count <= _COMPOUND_BATCH_SIZE).
+            _curated_ids = {getattr(i, "id", None) for i in _top_per_domain}
+            _already_covered = len(issues) <= self._COMPOUND_BATCH_SIZE
+            if (
+                len({str(getattr(i, "executor_type", "") or
+                         getattr(i, "domain", "")).upper()
+                     for i in _top_per_domain}) >= 2
+                and not _already_covered
+                and _top_per_domain
+            ):
+                self.log.info(
+                    "[synthesis] ARCH-4 final cross-domain pass: "
+                    "%d curated issues (top-5 per domain)", len(_top_per_domain)
+                )
+                _final_compounds = await self._detect_compound_findings_batch(
+                    _top_per_domain
+                )
+                for cf in _final_compounds:
+                    key = f"{cf.title.lower()[:60]}"
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        all_compounds.append(cf)
+                self.log.info(
+                    "[synthesis] ARCH-4 cross-domain pass added %d new compound finding(s)",
+                    len(_final_compounds),
+                )
+        except Exception as _arch4_exc:
+            self.log.warning(
+                "[synthesis] ARCH-4 final cross-domain pass failed (non-fatal): %s",
+                _arch4_exc,
+            )
+
         return all_compounds[:self.max_compound_findings]
 
     async def _detect_compound_findings_batch(
