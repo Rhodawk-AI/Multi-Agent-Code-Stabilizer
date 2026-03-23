@@ -57,6 +57,16 @@ class GateResult(BaseModel):
     tools_run:        list[str]         = Field(default_factory=list)
     skipped_tools:    list[str]         = Field(default_factory=list)
 
+    def approve(self) -> None:
+        """Set this result as approved."""
+        self.approved = True
+        self.rejection_reason = ""
+
+    def reject(self, reason: str) -> None:
+        """Set this result as rejected with the given reason."""
+        self.approved = False
+        self.rejection_reason = reason
+
 
 def validate_path_within_root(file_path: str, repo_root: Path) -> Path:
     """
