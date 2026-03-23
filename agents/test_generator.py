@@ -323,7 +323,7 @@ class TestGeneratorAgent(BaseAgent):
             "5. Return ONLY the test code as a Python code block.\n"
         )
         try:
-            resp = await self.call_llm(
+            resp = await self.call_llm_raw(
                 prompt=prompt,
                 system=(
                     "You are a test engineer specialising in property-based "

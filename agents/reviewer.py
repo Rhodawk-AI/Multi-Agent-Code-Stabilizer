@@ -135,8 +135,7 @@ class ReviewerAgent(BaseAgent):
             verdict = ReviewVerdict.REJECTED
 
         fix.reviewer_verdict = verdict
-        fix.reviewer_notes   = resp.notes
-        fix.reviewer_model   = self._reviewer_model or self.config.reviewer_model
+        fix.reviewer_reason  = resp.notes
         await self.storage.upsert_fix(fix)
 
         if verdict == ReviewVerdict.APPROVED or verdict == ReviewVerdict.APPROVED_WARNING:
