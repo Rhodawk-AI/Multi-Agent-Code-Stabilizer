@@ -7,7 +7,7 @@ Usage:
     python run.py --help
 """
 from __future__ import annotations
-import argparse, asyncio, logging, os, sys
+import argparse, asyncio, logging, os, signal, sys
 from pathlib import Path
 
 logging.basicConfig(
@@ -15,6 +15,29 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 log = logging.getLogger("rhodawk")
+
+# ── ADD-3 FIX: Graceful SIGTERM handler ───────────────────────────────────────
+# docker-compose restart: unless-stopped sends SIGTERM with a 10-second grace
+# window before SIGKILL. Without a handler, a fix mid-write receives SIGTERM,
+# leaves a partially written source file on disk, never sets committed_at, and
+# causes an infinite corrupt-patch loop on restart.
+#
+# _SHUTDOWN_REQUESTED is a module-level flag checked between pipeline phases
+# inside stabilize(). Setting it on SIGTERM allows the current phase to finish
+# cleanly before the process exits, preventing mid-write corruption.
+_SHUTDOWN_REQUESTED: bool = False
+
+
+def _graceful_sigterm_handler(signum: int, frame: object) -> None:
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    log.info(
+        "SIGTERM received — completing current pipeline phase before exit. "
+        "Send SIGKILL if immediate shutdown is required."
+    )
+
+
+signal.signal(signal.SIGTERM, _graceful_sigterm_handler)
 
 
 async def main(args: argparse.Namespace) -> int:
@@ -48,6 +71,10 @@ async def main(args: argparse.Namespace) -> int:
 
     controller = StabilizerController(cfg)
 
+    # Expose the shutdown flag to the controller so stabilize() can poll it
+    # between phases and exit cleanly without aborting mid-write.
+    controller._shutdown_requested = lambda: _SHUTDOWN_REQUESTED
+
     try:
         run = await controller.initialise(resume_run_id=args.resume)
         log.info(f"Run {run.id[:8]} started [domain={domain}]")
@@ -60,6 +87,10 @@ async def main(args: argparse.Namespace) -> int:
                 "✅ Stabilization complete. "
                 f"Promote to baseline: POST /api/baselines with run_id={run.id}"
             )
+            return 0
+        # ADD-3: distinguish SIGTERM-initiated clean exit from a real failure
+        if _SHUTDOWN_REQUESTED:
+            log.info("Run terminated cleanly on SIGTERM after phase boundary.")
             return 0
         return 1
 
@@ -82,7 +113,13 @@ def _parse() -> argparse.Namespace:
                    choices=["GENERAL","MILITARY","AEROSPACE","MEDICAL","FINANCE",
                              "EMBEDDED","NUCLEAR"],
                    help="Domain mode")
-    p.add_argument("--max-cycles", default=50,   type=int, help="Maximum cycles")
+    # ADD-2 FIX: Default raised from 50 to 200. Repos with interdependent issues
+    # routinely require >50 cycles to converge. At 50 the run exits with
+    # MAX_CYCLES_REACHED, leaving in-progress fixes uncommitted. 200 accommodates
+    # the Linux kernel and other large multi-subsystem codebases without artificially
+    # truncating a run. Operators who need a hard cap can set --max-cycles explicitly.
+    p.add_argument("--max-cycles", default=200,  type=int,
+                   help="Maximum stabilization cycles (default: 200)")
     p.add_argument("--resume",     default=None, help="Resume from run ID")
     p.add_argument("--sqlite",     action="store_true",
                    help="Use SQLite storage (dev mode only)")
