@@ -53,15 +53,15 @@ class TestPathTraversalValidation:
         validate_path_within_root("src/main.py", tmp_path)
 
     def test_path_traversal_blocked(self, tmp_path):
-        with pytest.raises(ValueError, match="Path traversal rejected"):
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
             validate_path_within_root("../../etc/passwd", tmp_path)
 
     def test_absolute_outside_root_blocked(self, tmp_path):
-        with pytest.raises(ValueError, match="Path traversal rejected"):
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
             validate_path_within_root("/etc/cron.d/evil", tmp_path)
 
     def test_deep_traversal_blocked(self, tmp_path):
-        with pytest.raises(ValueError, match="Path traversal rejected"):
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
             validate_path_within_root("a/b/../../../etc/shadow", tmp_path)
 
     def test_nested_valid_path_passes(self, tmp_path):
@@ -240,6 +240,8 @@ class TestIssueSchema:
             executor_type=ExecutorType.ARCHITECTURE,
             description="Missing validation",
         )
+        # After BUG-02 fix: model_validator auto-populates fix_requires_files
+        # from file_path when fix_requires_files is empty.
         assert "models.py" in issue.fix_requires_files
 
     def test_line_end_gte_line_start(self):
@@ -252,6 +254,7 @@ class TestIssueSchema:
             executor_type=ExecutorType.STANDARDS,
             description="test",
         )
+        # After BUG-02 fix: model_validator clamps line_end to max(line_end, line_start)
         assert issue.line_end >= issue.line_start
 
 
@@ -260,14 +263,13 @@ class TestFixedFile:
         ff = FixedFile(
             path="app.py",
             content="line1\nline2\nline3\n",
-            issues_resolved=["ISS-1"],
         )
+        # After BUG-02 fix: line_count property counts non-empty lines in content
         assert ff.line_count == 3
 
     def test_fix_ratio_edge_case(self):
         ff = FixedFile(
             path="big.py",
             content="\n".join(f"x = {i}" for i in range(100)),
-            issues_resolved=[],
         )
         assert ff.line_count == 100

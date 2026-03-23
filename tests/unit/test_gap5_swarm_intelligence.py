@@ -994,9 +994,37 @@ class TestGap5ControllerConfig:
         assert cfg.gap5_vllm_critic_base_url == ""
 
     def test_bobn_counts_sum_to_n_candidates(self):
-        # Python defaults: 6 + 4 = 10. default.toml: 3 + 2 = 5.
-        # Either way the sum must equal gap5_bobn_n_candidates.
+        # TEST-02 FIX: assert explicit values in addition to the sum invariant.
+        # Previously only the sum was checked (a_count + b_count == n_candidates).
+        # If either TOML or the Python class default changed independently the
+        # invariant would still hold (e.g. 5+5==10) while the intended split
+        # silently diverged. Explicit assertions make any such drift a test failure.
+        #
+        # Python class defaults (used when no config file is loaded):
+        #   gap5_bobn_fixer_a_count  = 6
+        #   gap5_bobn_fixer_b_count  = 4
+        #   gap5_bobn_n_candidates   = 10
+        #
+        # default.toml overrides for GPU-constrained deployments:
+        #   bobn_fixer_a_count = 3, bobn_fixer_b_count = 2, bobn_n_candidates = 5
+        #
+        # _make_config() constructs StabilizerConfig with Python defaults (no TOML),
+        # so the assertions below target the Python class defaults.
         cfg = self._make_config()
+        # Explicit Python-default assertions — not just "the sum holds":
+        assert cfg.gap5_bobn_fixer_a_count == 6, (
+            f"Expected gap5_bobn_fixer_a_count=6 (Python default), got {cfg.gap5_bobn_fixer_a_count}. "
+            "If this changed, update both the class default and default.toml together."
+        )
+        assert cfg.gap5_bobn_fixer_b_count == 4, (
+            f"Expected gap5_bobn_fixer_b_count=4 (Python default), got {cfg.gap5_bobn_fixer_b_count}. "
+            "If this changed, update both the class default and default.toml together."
+        )
+        assert cfg.gap5_bobn_n_candidates == 10, (
+            f"Expected gap5_bobn_n_candidates=10 (Python default), got {cfg.gap5_bobn_n_candidates}. "
+            "If this changed, update both the class default and default.toml together."
+        )
+        # Sum invariant still holds as a cross-check:
         assert cfg.gap5_bobn_fixer_a_count + cfg.gap5_bobn_fixer_b_count == cfg.gap5_bobn_n_candidates
 
     def test_bobn_fixer_a_count_default(self):
