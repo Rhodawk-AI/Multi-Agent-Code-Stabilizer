@@ -83,12 +83,12 @@ except ImportError:
 
 
 def _inc(counter) -> None:
-    """Increment a Prometheus counter if available; no-op otherwise."""
+    """Increment a Prometheus counter if available; log on failure."""
     try:
         if counter is not None:
             counter.inc()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("[formal_verifier] Prometheus counter increment failed: %s", exc)
 
 # Military domain properties to verify
 _MILITARY_PROPERTIES: list[dict[str, str]] = [

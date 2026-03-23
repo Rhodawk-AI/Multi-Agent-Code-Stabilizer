@@ -138,6 +138,66 @@ class TestGeneratorAgent(BaseAgent):
         )
         return generated
 
+    async def generate_for_issue(self, issue: Any) -> list[str]:
+        """
+        Generate a minimal reproduction test for an Issue that has no fail_tests.
+
+        Called by the controller before BoBN scoring so every issue gets at least
+        one correctness signal regardless of how it was sourced.
+
+        Returns a list of pytest node IDs / test function names, or [] on failure.
+        """
+        file_path = getattr(issue, "file_path", "") or ""
+        description = getattr(issue, "description", "") or ""
+        line_start = getattr(issue, "line_start", 0) or 0
+
+        if not file_path:
+            return []
+
+        lang = self._detect_language(file_path)
+
+        # Read source file content if repo_root is available
+        content = ""
+        if self.repo_root:
+            abs_path = self.repo_root / file_path
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+                # Trim to a window around the issue line
+                lines = content.splitlines()
+                start = max(0, line_start - 20)
+                end   = min(len(lines), line_start + 40)
+                content = "\n".join(lines[start:end])
+            except OSError:
+                content = ""
+
+        prompt = (
+            f"## Issue\n{description}\n\n"
+            f"## File\nPath: {file_path}  Language: {lang}  Line: {line_start}\n"
+            + (f"```\n{content}\n```\n\n" if content else "")
+            + "## Task\n"
+            "Write the minimal pytest test(s) that would FAIL on the buggy code "
+            "and PASS after a correct fix. Return only test function names (one per line), "
+            "no code. Format: test_<description>"
+        )
+
+        class _TestNames(BaseModel):
+            names: list[str] = Field(default_factory=list)
+
+        try:
+            result = await self.call_llm_structured(
+                prompt=prompt,
+                response_model=_TestNames,
+                system=(
+                    "You are a test engineer. Return only a JSON object with "
+                    "a 'names' list of pytest function names that reproduce the issue."
+                ),
+            )
+            names = [n.strip() for n in result.names if n.strip().startswith("test_")]
+            return names[:5]  # cap at 5 test names per issue
+        except Exception as exc:
+            self.log.debug("[TestGenerator] generate_for_issue failed for %s: %s", file_path, exc)
+            return []
+
     # ── Per-file dispatch ─────────────────────────────────────────────────────
 
     async def _generate_for_file(
