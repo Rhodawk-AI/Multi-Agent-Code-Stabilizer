@@ -249,6 +249,39 @@ _CAPABILITIES: list[Capability] = [
         required_for={"MILITARY", "AEROSPACE", "NUCLEAR"},
         degraded_fallback="MCP tools run in-process — NO ISOLATION",
     ),
+    # SEC-4 FIX: validate RHODAWK_AUDIT_SECRET entropy and placeholder rejection.
+    # An empty or placeholder audit secret (e.g. "CHANGE_ME_generate_with_python")
+    # produces HMAC-SHA256 signatures that anyone who knows the key can forge,
+    # invalidating the audit trail as tamper-evident evidence. Required for all
+    # domains so this is caught before AuditTrailSigner is constructed.
+    Capability(
+        name="audit_secret",
+        description="RHODAWK_AUDIT_SECRET entropy validation (non-empty, non-placeholder, ≥32 chars)",
+        check_type="subprocess",
+        check_target=(
+            "python3 -c \"import os,sys; "
+            "s=os.environ.get('RHODAWK_AUDIT_SECRET',''); "
+            "bad=not s or len(s)<32 or s.startswith('CHANGE_ME') or s.startswith('changeme'); "
+            "sys.exit(1 if bad else 0)\""
+        ),
+        required_for={"GENERAL", "MILITARY", "AEROSPACE", "NUCLEAR", "MEDICAL", "FINANCE", "EMBEDDED"},
+        degraded_fallback="NONE — audit trail integrity cannot be guaranteed; "
+                          "set RHODAWK_AUDIT_SECRET to a 32+ char random hex string",
+    ),
+    # 0-A FIX: qdrant-client absence causes an unhandled ImportError crash at
+    # _init_vector_store() even though the preflight check reports it as UNAVAILABLE
+    # without blocking startup. Making it GENERAL-required surfaces the gap before
+    # the controller crashes with a confusing traceback deep in the init sequence.
+    # Operators who genuinely want in-memory-only mode can set CPG_ENABLED=0 and
+    # HELIX_USE_LOCAL_QDRANT=1 (or equivalent) to skip vector store init entirely.
+    Capability(
+        name="qdrant_client",
+        description="Qdrant vector database client (required for semantic search and context retrieval)",
+        check_type="import", check_target="qdrant_client",
+        required_for={"GENERAL", "MILITARY", "AEROSPACE", "NUCLEAR", "MEDICAL", "FINANCE", "EMBEDDED"},
+        degraded_fallback="Vector similarity search unavailable — set HELIX_USE_LOCAL_QDRANT=1 "
+                          "to use in-memory fallback, or start the Qdrant container",
+    ),
 ]
 
 
