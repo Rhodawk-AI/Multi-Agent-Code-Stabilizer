@@ -228,8 +228,19 @@ class ExecutionFeedbackLoop:
     ) -> dict | None:
         """
         Run the SWE-bench Docker harness for this patch.
+
+        BLOCK-03 FIX: The previous implementation used --patch, --tests_file,
+        and --output_json flags that do not exist in the official
+        swebench.harness.run_evaluation CLI. Those flags caused the harness to
+        exit with "unrecognized arguments", the Docker SDK raised an exception
+        caught silently, and every candidate fell through to the heuristic scorer.
+
+        The correct protocol (ported from evaluator.py::evaluate_patch_docker())
+        is to write a predictions.jsonl file and pass --predictions_path. The
+        harness writes a results JSON that we parse for resolved: true/false.
+
         Returns dict with keys: passed, failed, stderr, all_passed.
-        Returns None if Docker is unavailable.
+        Returns None if Docker is unavailable or the harness errors.
         """
         try:
             import docker  # type: ignore[import]
@@ -239,12 +250,24 @@ class ExecutionFeedbackLoop:
         try:
             client = docker.from_env()
             with tempfile.TemporaryDirectory() as tmpdir:
-                patch_file = Path(tmpdir) / "patch.diff"
-                patch_file.write_text(patch, encoding="utf-8")
+                tmp = Path(tmpdir)
 
-                # Write test list to file for the harness
-                tests_file = Path(tmpdir) / "fail_tests.txt"
-                tests_file.write_text("\n".join(self.fail_tests), encoding="utf-8")
+                # Write patch as a predictions.jsonl entry — the format the
+                # official SWE-bench harness expects via --predictions_path.
+                predictions_file = tmp / "predictions.jsonl"
+                import json as _json
+                predictions_file.write_text(
+                    _json.dumps({
+                        "instance_id":        self.instance_id,
+                        "model_patch":        patch,
+                        "model_name_or_path": "rhodawk",
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+
+                # Output directory for harness results JSON.
+                output_dir = tmp / "results"
+                output_dir.mkdir()
 
                 try:
                     container_output = await asyncio.to_thread(
@@ -252,10 +275,10 @@ class ExecutionFeedbackLoop:
                         image=_SWE_EVAL_IMAGE,
                         command=[
                             "python", "-m", "swebench.harness.run_evaluation",
-                            "--instance_id", self.instance_id,
-                            "--patch",       "/workspace/patch.diff",
-                            "--tests_file",  "/workspace/fail_tests.txt",
-                            "--output_json",
+                            "--predictions_path", "/workspace/predictions.jsonl",
+                            "--swe_bench_tasks", "princeton-nlp/SWE-bench_Verified",
+                            "--instance_ids",    self.instance_id,
+                            "--log_dir",         "/workspace/results",
                         ],
                         volumes={tmpdir: {"bind": "/workspace", "mode": "rw"}},
                         remove=True,
@@ -264,7 +287,27 @@ class ExecutionFeedbackLoop:
                         timeout=TEST_TIMEOUT_S,
                     )
                     raw = container_output.decode(errors="replace")
+
+                    # Try to parse harness results JSON first (most accurate).
+                    for result_file in output_dir.glob("*.json"):
+                        try:
+                            data = _json.loads(result_file.read_text())
+                            resolved = bool(
+                                data.get("resolved")
+                                or data.get(self.instance_id, {}).get("resolved")
+                            )
+                            return {
+                                "passed":     int(resolved),
+                                "failed":     int(not resolved),
+                                "all_passed": resolved,
+                                "stderr":     self._extract_failure_context(raw),
+                            }
+                        except Exception:
+                            continue
+
+                    # Fall back to stdout parsing if no structured JSON found.
                     return self._parse_harness_output(raw)
+
                 except Exception as exc:
                     log.debug(f"[exec_loop] Docker run failed: {exc}")
                     return None

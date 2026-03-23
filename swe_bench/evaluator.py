@@ -126,6 +126,43 @@ class SWEInstance:
     pass_tests:   list[str] = field(default_factory=list)
 
 
+def _heuristic_eval(patch: str, instance: "SWEInstance") -> bool:
+    """
+    BUG-01 FIX: Module-level heuristic evaluation function.
+
+    Previously two test methods in TestGap5EvaluatorIntegration imported
+    `_heuristic_eval` from this module but only `_heuristic_score` existed
+    (as an instance method on ExecutionFeedbackLoop in execution_loop.py).
+    The ImportError at pytest collection time caused all 80+ tests in
+    test_gap5_swarm_intelligence.py to be marked ERROR with zero passing.
+
+    This module-level function wraps the logic from
+    ExecutionFeedbackLoop._heuristic_score() in a standalone callable so
+    the evaluator test suite can import it directly.
+
+    A patch is considered a plausible fix (True) when:
+    - It is at least 20 characters long, AND
+    - At least 30% of the words extracted from fail_tests appear in the patch.
+
+    Returns False for empty or trivially short patches.
+    """
+    import re as _re
+    if not patch or len(patch) < 20:
+        return False
+    words_in_tests: set[str] = set(
+        w.lower()
+        for t in instance.fail_tests
+        for w in _re.findall(r"\w+", t)
+        if len(w) > 3
+    )
+    patch_words = set(_re.findall(r"\w+", patch.lower()))
+    if not words_in_tests:
+        # No test IDs to check against — consider plausible if patch is non-trivial.
+        return len(patch) >= 50
+    overlap = len(words_in_tests & patch_words) / len(words_in_tests)
+    return overlap >= 0.3
+
+
 @dataclass
 class EvalResult:
     instance_id:     str   = ""
@@ -1411,8 +1448,12 @@ async def _generate_tests_via_llm(
         raw = resp.choices[0].message.content or ""
         # Strip accidental markdown fences
         raw = re.sub(r"```(?:python)?\s*", "", raw).strip()
-        # Sanity check: must look like Python test code
-        if "def test_" not in raw and "import pytest" not in raw:
+        # Sanity check: must look like Python test code.
+        # ARCH-04 FIX: the original check required "def test_" which rejected
+        # valid test files that use pytest fixtures or parametrize decorators
+        # without a bare def test_ line. Broaden to accept any file containing
+        # "test_" (function names, IDs) or "pytest.mark" (decorator usage).
+        if "test_" not in raw and "pytest.mark" not in raw:
             log.debug(
                 f"[mutation_gate] {instance_id}: LLM output for {src_path} "
                 "doesn't look like a test file — discarding"
