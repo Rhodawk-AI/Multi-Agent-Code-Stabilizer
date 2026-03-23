@@ -61,7 +61,12 @@ _DOMAIN_THRESHOLDS: dict[str, float] = {
     DomainMode.AEROSPACE.value:  90.0,
     DomainMode.NUCLEAR.value:    90.0,
     DomainMode.EMBEDDED.value:   80.0,
-    DomainMode.AUTOMOTIVE.value: 80.0,
+    # BUG-1 FIX: DomainMode.AUTOMOTIVE does not exist in brain/schemas.py.
+    # The enum contains: GENERAL, FINANCE, MEDICAL, MILITARY, EMBEDDED,
+    # AEROSPACE, NUCLEAR.  Referencing a non-existent member at module load
+    # time raised AttributeError, which bobn_sampler.py caught silently —
+    # completely disabling the mutation gate on every deployment.
+    # EMBEDDED at 80% already covers automotive use cases.
     DomainMode.MEDICAL.value:    85.0,
     DomainMode.GENERAL.value:    60.0,
 }
