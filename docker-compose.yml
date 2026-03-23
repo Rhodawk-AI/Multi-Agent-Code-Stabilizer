@@ -64,11 +64,32 @@ services:
     # self._use_sandbox to be set False and all test execution to run
     # unsandboxed on the host — silently bypassing SEC-03.
     #
-    # SECURITY NOTE: Docker socket access grants near-root privileges to the
-    # container. The rhodawk user (non-root) is used inside the container, but
-    # the socket itself allows starting new containers as any user. This is an
-    # accepted trade-off for the test sandbox capability. In higher-security
-    # environments use rootless Docker or a gVisor runtime instead.
+    # SECURITY — Docker socket threat model (SEC-5)
+    # /var/run/docker.sock grants near-root host privileges. Any process inside
+    # the container with socket access can run:
+    #   docker run -v /:/host -it alpine chroot /host
+    # and obtain full root filesystem access on the host.
+    #
+    # Mitigations in this deployment:
+    #   • rhodawk runs as non-root user (rhodawk) inside the container
+    #   • The sandbox image runs --user nobody --read-only --network none
+    #   • test_runner.py aborts (CRITICAL log, returncode=-1) rather than
+    #     falling back to unsandboxed execution if docker run fails
+    #
+    # For higher-security environments, choose one of:
+    #   A. Rootless Docker (recommended):
+    #      https://docs.docker.com/engine/security/rootless/
+    #      Replace the volume mount with the rootless socket path:
+    #        - ${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock
+    #
+    #   B. gVisor runtime (strongest isolation):
+    #      Add to daemon.json: {"runtimes": {"runsc": {"path": "/usr/bin/runsc"}}}
+    #      Add to this service: runtime: runsc
+    #
+    #   C. Disable test sandbox entirely (loses SEC-03 protection):
+    #      Add to environment: RHODAWK_TEST_SANDBOX_DISABLED=1
+    #      test_runner.py will log WARNING and skip test execution rather
+    #      than run LLM-generated code unsandboxed.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

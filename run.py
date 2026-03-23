@@ -26,6 +26,9 @@ log = logging.getLogger("rhodawk")
 # inside stabilize(). Setting it on SIGTERM allows the current phase to finish
 # cleanly before the process exits, preventing mid-write corruption.
 _SHUTDOWN_REQUESTED: bool = False
+# NOTE: this flag is per-process. When running via uvicorn --workers N,
+# each worker has its own copy. Use docker stop (SIGTERM to PID 1) or
+# uvicorn --graceful-timeout to coordinate shutdown across workers.
 
 
 def _graceful_sigterm_handler(signum: int, frame: object) -> None:
