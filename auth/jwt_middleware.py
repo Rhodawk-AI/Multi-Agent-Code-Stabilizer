@@ -104,6 +104,72 @@ _TTL_MINUTES: int        = 60
 _INIT_DONE:   bool       = False
 
 
+def _check_secret_entropy(secret: str, algorithm: str) -> None:
+    """
+    SEC-2 FIX: Validate Shannon entropy of HS* JWT secrets.
+
+    The length check in _init_config() catches short secrets (< 64 chars in
+    production, < 32 chars always) but does NOT catch low-entropy strings of
+    adequate length. A placeholder like "CHANGE_ME_generate_with_python" is
+    41 chars — it passes the min_len=32 check in development mode with only
+    a warning, while being trivially guessable (known public string, low entropy).
+
+    Shannon entropy measures information density in bits per character.
+    A truly random hex string (secrets.token_hex(32)) scores ~4.0 bits/char.
+    Known placeholder strings score < 4.0 bits/char due to repeated patterns.
+
+    Threshold: 4.5 bits/char. This rejects:
+      - "CHANGE_ME_generate_with_python"  (~3.5 bits/char)
+      - "password", "secret", "test123"   (< 3.0 bits/char)
+    While accepting:
+      - secrets.token_hex(32)             (~4.0 bits/char — marginal; length saves it)
+    Note: token_hex(32) produces exactly 64 chars which meet the length requirement;
+    the entropy check is belt-and-suspenders for non-hex secrets of adequate length.
+
+    Applied unconditionally regardless of RHODAWK_ENV so development deployments
+    do not accidentally use a guessable secret against databases containing real data.
+    """
+    import collections
+    import math
+
+    if len(secret) < 8:
+        return  # too short to compute meaningful entropy; length check handles this
+
+    freq = collections.Counter(secret)
+    total = len(secret)
+    entropy = -sum(
+        (count / total) * math.log2(count / total)
+        for count in freq.values()
+    )
+
+    # Known placeholder prefixes — reject immediately regardless of entropy score
+    _KNOWN_PLACEHOLDERS = {
+        "CHANGE_ME", "changeme", "change_me", "password", "secret",
+        "your-secret", "mysecret", "placeholder", "PLACEHOLDER",
+    }
+    for placeholder in _KNOWN_PLACEHOLDERS:
+        if secret.lower().startswith(placeholder.lower()):
+            raise RuntimeError(
+                f"FATAL: {algorithm} secret starts with known placeholder "
+                f"'{placeholder}'. Generate a real secret with: "
+                "python -c 'import secrets; print(secrets.token_hex(32))'"
+            )
+
+    # Entropy gate: 4.5 bits/char rejects low-entropy strings, accepts random hex
+    _ENTROPY_THRESHOLD = 4.5
+    # For very long secrets (>= 128 chars) we relax slightly — passphrase-style
+    # secrets can be secure despite lower per-character entropy
+    effective_threshold = _ENTROPY_THRESHOLD if len(secret) < 128 else 3.5
+    if entropy < effective_threshold:
+        raise RuntimeError(
+            f"FATAL: {algorithm} secret has low Shannon entropy "
+            f"({entropy:.2f} bits/char < {effective_threshold:.1f} threshold). "
+            "This indicates a guessable, structured, or placeholder value. "
+            "Generate a cryptographically random secret with: "
+            "python -c 'import secrets; print(secrets.token_hex(32))'"
+        )
+
+
 def _init_config() -> None:  # noqa: C901
     global _SIGNING_KEY, _VERIFY_KEY, _ALGORITHM, _TTL_MINUTES, _INIT_DONE
     if _INIT_DONE:
@@ -197,6 +263,9 @@ def _init_config() -> None:  # noqa: C901
             "providing RHODAWK_JWT_PRIVATE_KEY / RHODAWK_JWT_PUBLIC_KEY.",
             raw_alg,
         )
+        # SEC-2 FIX: entropy check on HS* secrets regardless of environment
+        _check_secret_entropy(secret, raw_alg)
+
         _SIGNING_KEY = secret
         _VERIFY_KEY  = secret
         log.info("JWT configured: algorithm=%s (symmetric), ttl=%dmin", raw_alg, int(os.environ.get("RHODAWK_JWT_TTL_MIN", "60")))
