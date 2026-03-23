@@ -359,6 +359,16 @@ class AuditorAgent(BaseAgent):
             )
 
             try:
+                # ARCH-05 FIX: check cost ceiling before each LLM call inside the
+                # audit step. Previously PatrolAgent polled get_total_cost() on a
+                # 30-second loop but only logged a warning — it did not signal the
+                # DeerFlow loop to abort. The per-cycle cost check in _run_deerflow()
+                # only fired between complete cycles, so a single large audit step
+                # on a big repo could blow through the ceiling with no interruption.
+                # Raising here propagates through _audit_chunk → gather → run() and
+                # is caught by the controller's cost-ceiling guard.
+                await self.check_cost_ceiling()
+
                 response = await self.call_llm_structured(
                     prompt=prompt,
                     response_model=AuditResponse,

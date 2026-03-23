@@ -105,11 +105,15 @@ class TestGeneratorAgent(BaseAgent):
         repo_root:        Path | None        = None,
         pynguin_timeout:  int                = _DEFAULT_TIMEOUT_S,
         use_hypothesis:   bool               = True,
+        # BUG-04 FIX: controller._run_test_mutation_gate() passes domain_mode
+        # but the parameter was absent, raising TypeError on every BoBN call.
+        domain_mode:      Any | None         = None,
     ) -> None:
         super().__init__(storage, run_id, config, mcp_manager)
         self.repo_root       = Path(repo_root) if repo_root else None
         self.pynguin_timeout = pynguin_timeout
         self.use_hypothesis  = use_hypothesis
+        self.domain_mode     = domain_mode
 
     async def run(self, fix: FixAttempt) -> list[str]:
         """
