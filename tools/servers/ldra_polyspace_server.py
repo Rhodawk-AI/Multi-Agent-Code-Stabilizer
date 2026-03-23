@@ -30,19 +30,68 @@ _LDRA_URL = os.environ.get("RHODAWK_LDRA_URL", "")
 _POLYSPACE_BIN = shutil.which("polyspace-code-prover") or shutil.which("polyspace")
 
 
-async def ldra_check(file_path: str, content: str, run_id: str = "") -> list[LdraFinding]:
+class LdraUnavailableError(RuntimeError):
+    """
+    COMP-02 FIX: Raised when LDRA/clang-tidy is unavailable in a
+    safety-critical domain mode (MILITARY, AEROSPACE, NUCLEAR).
+
+    Callers in the compliance gate should catch this and set
+    gate_passed=False rather than silently continuing. This makes the
+    absence of required DO-178C tool-qualification evidence a hard gate
+    failure rather than a silent skip.
+    """
+
+
+class PolyspaceUnavailableError(RuntimeError):
+    """
+    COMP-02 FIX: Same as LdraUnavailableError but for Polyspace Code Prover.
+    Raised only in safety-critical domain modes.
+    """
+
+
+async def ldra_check(file_path: str, content: str, run_id: str = "", domain_mode: str = "") -> list[LdraFinding]:
     """
     Run LDRA Testbed MISRA-C check on content.
     Falls back to clang-tidy MISRA rules when LDRA is not available.
+
+    COMP-02 FIX: When operating in MILITARY or AEROSPACE domain mode and neither
+    LDRA nor clang-tidy is available, this function raises LdraUnavailableError
+    so the compliance gate can set gate_passed=False rather than silently
+    continuing. Previously it logged at INFO level and returned [] — making the
+    DO-178C gate appear to pass when two of its three C/C++ verification layers
+    never fired.
+
+    In non-safety-critical modes (GENERAL, FINANCE, MEDICAL) unavailability is
+    still non-blocking: the function logs at WARNING and returns [].
     """
+    safety_critical = domain_mode.upper() in ("MILITARY", "AEROSPACE", "NUCLEAR")
+
     if _LDRA_URL:
         return await _ldra_api_check(file_path, content, run_id)
     if shutil.which("clang-tidy"):
         return await _clang_tidy_misra(file_path, content, run_id)
-    log.info(
-        "[ldra_server] Neither LDRA API nor clang-tidy available. "
-        "Set RHODAWK_LDRA_URL to enable LDRA integration."
-    )
+
+    # COMP-02 FIX: escalate severity based on domain mode.
+    if safety_critical:
+        log.error(
+            "[ldra_server] LDRA API and clang-tidy are both unavailable. "
+            "Domain mode is %s — this is a hard gate failure. "
+            "Set RHODAWK_LDRA_URL to a running LDRA server, or install "
+            "clang-tidy (apt install clang-tidy) before running in safety-critical mode. "
+            "The DO-178C compliance gate will set gate_passed=False for this finding.",
+            domain_mode,
+        )
+        raise LdraUnavailableError(
+            f"LDRA/clang-tidy unavailable in {domain_mode} mode — "
+            "DO-178C DAL compliance gate cannot be satisfied without tool qualification evidence."
+        )
+    else:
+        log.warning(
+            "[ldra_server] Neither LDRA API nor clang-tidy available. "
+            "MISRA-C checking is skipped for domain_mode=%s. "
+            "Set RHODAWK_LDRA_URL to enable LDRA integration.",
+            domain_mode or "general",
+        )
     return []
 
 
@@ -124,16 +173,36 @@ async def _clang_tidy_misra(file_path: str, content: str, run_id: str) -> list[L
 
 
 async def polyspace_verify(
-    file_path: str, content: str, run_id: str = ""
+    file_path: str, content: str, run_id: str = "", domain_mode: str = ""
 ) -> list[PolyspaceFinding]:
     """
     Run Polyspace Code Prover on content.
-    Returns empty list when Polyspace is not installed.
+
+    COMP-02 FIX: In safety-critical domain modes (MILITARY, AEROSPACE, NUCLEAR),
+    unavailability is a hard gate failure — raises PolyspaceUnavailableError so
+    the compliance gate can set gate_passed=False. In other modes, logs WARNING
+    and returns [] (non-blocking).
     """
+    safety_critical = domain_mode.upper() in ("MILITARY", "AEROSPACE", "NUCLEAR")
+
     if not _POLYSPACE_BIN:
-        log.info(
+        if safety_critical:
+            log.error(
+                "[polyspace_server] Polyspace Code Prover not found. "
+                "Domain mode is %s — this is a hard gate failure. "
+                "Install Polyspace and ensure it is in PATH before running "
+                "in safety-critical mode. gate_passed will be set to False.",
+                domain_mode,
+            )
+            raise PolyspaceUnavailableError(
+                f"Polyspace unavailable in {domain_mode} mode — "
+                "DO-178C DAL compliance gate cannot be satisfied without Polyspace."
+            )
+        log.warning(
             "[polyspace_server] Polyspace not found. "
-            "Install Polyspace Code Prover and ensure it is in PATH."
+            "Install Polyspace Code Prover and ensure it is in PATH. "
+            "domain_mode=%s",
+            domain_mode or "general",
         )
         return []
 
