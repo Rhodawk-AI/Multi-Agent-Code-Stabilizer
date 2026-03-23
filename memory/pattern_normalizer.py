@@ -323,31 +323,9 @@ class PatternNormalizer:
         #   [RESOURCE_CLOSE] — defer/finally/with resource cleanup patterns
         norm_text = _apply_cross_language_canonical(norm_text)
 
-        # ADD-2 FIX: Include the normalizer path in the fingerprint so
-        # deployments with different tree-sitter availability cannot produce
-        # colliding fingerprints for the same code fragment. Previously:
-        #   - tree-sitter path  → fingerprint A for null-guard pattern
-        #   - regex fallback    → fingerprint B for the same null-guard
-        # Both A and B would be stored under different fingerprints on different
-        # deployments, preventing cross-deployment deduplication from working.
-        # Including path in the prefix makes the fingerprint stable WITHIN a
-        # normalizer class while preventing false matches ACROSS classes.
-        #
-        # Prefix order: issue_type | normalizer_path | normalized_text
-        # This ensures:
-        #   - Different bug classes → different fingerprints (issue_type prefix)
-        #   - Different normalizer paths → different fingerprints (path prefix)
-        #   - Same bug class + same normalizer → same fingerprint (stable)
-        # BUG-03 FIX: do NOT include normalizer path in the fingerprint prefix.
-        # Previously: f"issue:{issue_type}|path:{path}\n{norm_text}"
-        # The path value ("tree_sitter", "pygments", "regex") varies across
-        # deployments depending on which grammar packages are installed. Two
-        # deployments producing the same structural pattern via different
-        # normalizer tiers would hash to different fingerprints, making
-        # cross-deployment deduplication impossible and the federation
-        # compounding advantage void.
-        # Fix: fingerprint only on issue_type + normalized_text. The normalizer
-        # path is retained in normalizer_path for diagnostics only.
+        # Fingerprint on issue_type + normalized_text only.
+        # Normalizer path (tree_sitter/regex) is excluded so fingerprints are
+        # stable across deployments with different grammar packages installed.
         prefixed = f"issue:{issue_type}\n{norm_text}"
         fingerprint = hashlib.sha256(prefixed.encode("utf-8")).hexdigest()
         complexity   = _compute_complexity(norm_text, id_count, lit_count)
