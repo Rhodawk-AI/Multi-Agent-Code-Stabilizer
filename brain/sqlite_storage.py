@@ -349,6 +349,175 @@ CREATE TABLE IF NOT EXISTS audit_trail (
 );
 
 CREATE INDEX IF NOT EXISTS idx_trail_run ON audit_trail(run_id);
+
+-- escalations (human escalation workflow, DO-178C compliance)
+CREATE TABLE IF NOT EXISTS escalations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    issue_ids TEXT,
+    fix_attempt_id TEXT,
+    escalation_type TEXT,
+    description TEXT,
+    severity TEXT,
+    mil882e_category TEXT,
+    status TEXT,
+    approved_by TEXT,
+    approved_at TEXT,
+    approval_rationale TEXT,
+    risk_acceptance TEXT,
+    notified_via TEXT,
+    notified_at TEXT,
+    timeout_at TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_escalations_run_id ON escalations(run_id);
+CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status);
+
+-- refactor_proposals (blast-radius-exceeding changes requiring human approval)
+CREATE TABLE IF NOT EXISTS refactor_proposals (
+    id TEXT PRIMARY KEY,
+    fix_attempt_id TEXT,
+    run_id TEXT,
+    issue_ids TEXT,
+    changed_functions TEXT,
+    affected_function_count INTEGER,
+    affected_file_count INTEGER,
+    test_files_affected TEXT,
+    blast_radius_score REAL,
+    importing_modules TEXT,
+    importing_module_count INTEGER,
+    affected_components TEXT,
+    proposed_refactoring TEXT,
+    migration_steps TEXT,
+    estimated_scope TEXT,
+    risks TEXT,
+    recommendation TEXT,
+    escalation_id TEXT,
+    requires_human_review INTEGER,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_refactor_run_id ON refactor_proposals(run_id);
+
+-- baselines (approved score snapshots for regression gating)
+CREATE TABLE IF NOT EXISTS baselines (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    baseline_name TEXT,
+    software_level TEXT,
+    commit_hash TEXT,
+    issue_count TEXT,
+    score_snapshot REAL,
+    file_hashes TEXT,
+    approved_by TEXT,
+    approved_at TEXT,
+    is_active INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_baselines_run_id    ON baselines(run_id);
+CREATE INDEX IF NOT EXISTS idx_baselines_is_active ON baselines(is_active);
+
+-- convergence_records (per-cycle convergence check audit trail)
+CREATE TABLE IF NOT EXISTS convergence_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    data TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_convergence_run_id ON convergence_records(run_id);
+
+-- synthesis_reports (Gap 2: per-cycle dedup and compound-finding metrics)
+CREATE TABLE IF NOT EXISTS synthesis_reports (
+    id      TEXT PRIMARY KEY,
+    run_id  TEXT NOT NULL,
+    cycle   INTEGER NOT NULL DEFAULT 0,
+    data    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_synthesis_reports_run ON synthesis_reports(run_id);
+
+-- ldra_findings (LDRA static analysis results, DO-178C toolchain)
+CREATE TABLE IF NOT EXISTS ldra_findings (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    fix_attempt_id TEXT,
+    file_path TEXT,
+    rule_id TEXT,
+    severity TEXT,
+    message TEXT,
+    line_number INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ldra_run_id ON ldra_findings(run_id);
+
+-- polyspace_findings (Polyspace Code Prover results)
+CREATE TABLE IF NOT EXISTS polyspace_findings (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    fix_attempt_id TEXT,
+    file_path TEXT,
+    check_name TEXT,
+    color TEXT,
+    message TEXT,
+    line_number INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_polyspace_run_id ON polyspace_findings(run_id);
+
+-- cbmc_results (CBMC bounded model checker results)
+CREATE TABLE IF NOT EXISTS cbmc_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    fix_attempt_id TEXT,
+    file_path TEXT,
+    function_name TEXT,
+    status TEXT,
+    counterexample TEXT,
+    elapsed_ms INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cbmc_run_id ON cbmc_results(run_id);
+
+-- rtm_entries (Requirements Traceability Matrix)
+CREATE TABLE IF NOT EXISTS rtm_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    requirement_id TEXT,
+    source_file TEXT,
+    coverage_status TEXT,
+    notes TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rtm_run_id ON rtm_entries(run_id);
+
+-- independence_records (DO-178C independence verification)
+CREATE TABLE IF NOT EXISTS independence_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    fix_attempt_id TEXT,
+    fixer_model TEXT,
+    reviewer_model TEXT,
+    same_family INTEGER DEFAULT 0,
+    violation_reason TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_independence_run_id ON independence_records(run_id);
+
+-- sas_records (Software Accomplishment Summary)
+CREATE TABLE IF NOT EXISTS sas_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    data TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sas_run_id ON sas_records(run_id);
+
+-- sci_records (Software Configuration Index)
+CREATE TABLE IF NOT EXISTS sci_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    data TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sci_run_id ON sci_records(run_id);
 """
 
                                                                                 
@@ -1301,7 +1470,7 @@ class SQLiteBrainStorage(BrainStorage):
                 ]
 
                                                                                 
-    async def store_test_run(self, result: TestRunResult) -> None:
+    async def upsert_test_result(self, result: TestRunResult) -> None:
         async with self._write() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO test_run_results
@@ -1343,7 +1512,7 @@ class SQLiteBrainStorage(BrainStorage):
                 )
 
                                                                                 
-    async def log_patrol_event(self, event: PatrolEvent) -> None:
+    async def append_patrol_event(self, event: PatrolEvent) -> None:
         async with self._write() as db:
             await db.execute("""
                 INSERT INTO patrol_log
@@ -1481,31 +1650,19 @@ class SQLiteBrainStorage(BrainStorage):
     async def list_audit_trail(self, run_id: str, limit: int = 1000) -> list[AuditTrailEntry]:
         return (await self.get_audit_trail(run_id))[:limit]
 
-    async def log_llm_session(self, session: dict) -> None:
-        """Store LLM call metadata for cost tracking."""
-        async with self._write() as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO llm_sessions
-                    (id, run_id, agent_type, model, prompt_tokens, completion_tokens,
-                     cost_usd, duration_ms, success, error, timestamp)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                __import__("uuid").uuid4().hex,
-                session.get("run_id", ""),
-                session.get("agent_type", ""),
-                session.get("model", ""),
-                session.get("prompt_tokens", 0),
-                session.get("completion_tokens", 0),
-                session.get("cost_usd", 0.0),
-                session.get("duration_ms", 0),
-                1 if session.get("success") else 0,
-                session.get("error", ""),
-                __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-            ))
-            await db.commit()
-
     async def upsert_escalation(self, esc) -> None:
         async with self._write() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT, issue_ids TEXT, fix_attempt_id TEXT,
+                    escalation_type TEXT, description TEXT,
+                    severity TEXT, mil882e_category TEXT, status TEXT,
+                    approved_by TEXT, approved_at TEXT, approval_rationale TEXT,
+                    risk_acceptance TEXT, notified_via TEXT, notified_at TEXT,
+                    timeout_at TEXT, created_at TEXT, updated_at TEXT
+                )
+            """)
             await db.execute("""
                 INSERT OR REPLACE INTO escalations
                     (id, run_id, issue_ids, fix_attempt_id, escalation_type,
@@ -1526,17 +1683,6 @@ class SQLiteBrainStorage(BrainStorage):
                 esc.timeout_at.isoformat() if esc.timeout_at else None,
                 esc.created_at.isoformat(), esc.updated_at.isoformat(),
             ))
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS escalations (
-                    id TEXT PRIMARY KEY,
-                    run_id TEXT, issue_ids TEXT, fix_attempt_id TEXT,
-                    escalation_type TEXT, description TEXT,
-                    severity TEXT, mil882e_category TEXT, status TEXT,
-                    approved_by TEXT, approved_at TEXT, approval_rationale TEXT,
-                    risk_acceptance TEXT, notified_via TEXT, notified_at TEXT,
-                    timeout_at TEXT, created_at TEXT, updated_at TEXT
-                )
-            """)
             await db.commit()
 
     async def get_escalation(self, escalation_id: str):
@@ -2156,15 +2302,6 @@ class SQLiteBrainStorage(BrainStorage):
             except Exception:
                 return []
 
-    async def update_issue_status(
-        self, issue_id: str, status: str, reason: str = ""
-    ) -> None:
-        async with self._write() as db:
-            await db.execute(
-                "UPDATE issues SET status=? WHERE id=?", (status, issue_id)
-            )
-            await db.commit()
-
                                                                                  
     async def upsert_convergence_record(self, record: "ConvergenceRecord") -> None:                          
         from brain.schemas import ConvergenceRecord as _CR
@@ -2181,7 +2318,7 @@ class SQLiteBrainStorage(BrainStorage):
 
     async def list_convergence_records(self, run_id: str) -> list["ConvergenceRecord"]:                          
         from brain.schemas import ConvergenceRecord as _CR
-        async with self._read() as db:
+        async with self._conn() as db:
             try:
                 await db.execute(
                     "CREATE TABLE IF NOT EXISTS convergence_records "

@@ -30,7 +30,8 @@ _DDL_MAIN = "\n-- Enable partitioning support\nCREATE EXTENSION IF NOT EXISTS pg
 
 class PostgresBrainStorage(BrainStorage):
 
-    def __init__(self, fallback_db_path: str='.stabilizer/brain.db') -> None:
+    def __init__(self, dsn: str = '', fallback_db_path: str='.stabilizer/brain.db') -> None:
+        self._dsn = dsn
         self._fallback_path = fallback_db_path
         self._engine: Any = None
         self._session_factory: Any = None
@@ -44,7 +45,7 @@ class PostgresBrainStorage(BrainStorage):
             await self._fallback.initialise()
             return
         try:
-            url = _require_database_url()
+            url = self._dsn or _require_database_url()
             self._engine = create_async_engine(url, pool_size=self._pool_size, max_overflow=10, echo=False)
             async with self._engine.begin() as conn:
                 for stmt in _DDL_MAIN.split(';'):

@@ -258,9 +258,9 @@ class FormalVerificationResult(BaseModel):
     property_name: str = ''
     status: FormalVerificationStatus = FormalVerificationStatus.UNKNOWN
     counterexample: str = ''
-    proof_script: str = ''
-    solver: str = 'z3'
-    elapsed_s: float = 0.0
+    proof_summary: str = ''
+    solver_used: str = 'z3'
+    elapsed_ms: float = 0.0
     verified_at: datetime = Field(default_factory=_utcnow)
     evidence_path: str = ''
 
@@ -707,6 +707,7 @@ class AuditScore(BaseModel):
     major_count: int = 0
     minor_count: int = 0
     info_count: int = 0
+    total_issues: int = 0
     score: float = 100.0
     misra_open: int = 0
     cert_open: int = 0
@@ -715,6 +716,7 @@ class AuditScore(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
     def compute_score(self) -> None:
+        self.total_issues = self.critical_count + self.major_count + self.minor_count + self.info_count
         c_pen = min(self.critical_count * 15, 60)
         m_pen = min(self.major_count * 5, 30)
         n_pen = min(self.minor_count * 1, 10)
@@ -730,8 +732,11 @@ class ConsensusResult(BaseModel):
     issue_fingerprint: str = ''
     votes: list[ConsensusVote] = Field(default_factory=list)
     final_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    weighted_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     approved: bool = False
     disagreement_action: DisagreementAction = DisagreementAction.FLAG_UNCERTAIN
+    action: DisagreementAction = DisagreementAction.FLAG_UNCERTAIN
+    reason: str = ''
     high_centrality: bool = False
     escalation_required: bool = False
 
@@ -760,6 +765,9 @@ class AuditRun(BaseModel):
     baseline_id: str = ''
     active_escalations: int = 0
     total_escalations: int = 0
+    files_total: int = 0
+    files_read: int = 0
+    metadata: dict = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=_utcnow)
     finished_at: datetime | None = None
 
