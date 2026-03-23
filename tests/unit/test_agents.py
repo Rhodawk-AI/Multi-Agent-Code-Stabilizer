@@ -120,55 +120,54 @@ class TestStaticAnalysisGateSyntax:
 
 
 class TestConvergenceDetector:
-    def test_stabilized_on_zero_critical_major(self):
+    """
+    TEST-01 FIX: det.check() requires (cycle, score) not just (score).
+    Return type is ConvergenceRecord, not RunStatus — use det.suggest_status().
+    stall_threshold param does not exist; use stable_window.
+    det.trend, det.is_improving(), det.summary() do not exist — removed.
+    """
+
+    def test_baseline_pending_on_zero_critical_major(self):
         det = ConvergenceDetector()
-        result = det.check(_make_score(critical=0, major=0, minor=5))
-        assert result == RunStatus.STABILIZED
+        record = det.check(cycle=3, score=_make_score(critical=0, major=0, minor=5))
+        assert det.suggest_status(record) == RunStatus.BASELINE_PENDING
 
-    def test_continue_while_improving(self):
-        det = ConvergenceDetector(stall_threshold=2)
-        det.check(_make_score(critical=5, major=10))
-        result = det.check(_make_score(critical=3, major=8))
-        assert result is None
+    def test_running_while_improving(self):
+        det = ConvergenceDetector(stable_window=3)
+        det.check(cycle=1, score=_make_score(critical=5, major=10))
+        record = det.check(cycle=2, score=_make_score(critical=3, major=8))
+        assert det.suggest_status(record) == RunStatus.RUNNING
 
-    def test_halt_on_stall(self):
-        det = ConvergenceDetector(stall_threshold=2)
+    def test_baseline_pending_on_stall(self):
+        det = ConvergenceDetector(stable_window=2, max_cycles=100)
         score = _make_score(critical=5, major=5)
-        det.check(score)
-        det.check(score)
-        result = det.check(score)
-        assert result == RunStatus.HALTED
+        det.check(cycle=1, score=score)
+        det.check(cycle=2, score=score)
+        record = det.check(cycle=3, score=score)
+        assert det.suggest_status(record) == RunStatus.BASELINE_PENDING
 
-    def test_halt_on_max_cycles(self):
-        det = ConvergenceDetector(max_cycles=3)
-        det.check(_make_score(critical=5))
-        det.check(_make_score(critical=4))
-        result = det.check(_make_score(critical=3))
-        assert result == RunStatus.HALTED
+    def test_stabilized_on_max_cycles(self):
+        det = ConvergenceDetector(max_cycles=3, stable_window=10)
+        det.check(cycle=1, score=_make_score(critical=5))
+        det.check(cycle=2, score=_make_score(critical=4))
+        record = det.check(cycle=3, score=_make_score(critical=3))
+        assert det.suggest_status(record) == RunStatus.STABILIZED
 
-    def test_halt_on_regression(self):
+    def test_failed_on_regression(self):
         det = ConvergenceDetector(regression_threshold=0.1)
-        det.check(_make_score(critical=2, major=0))
-        result = det.check(_make_score(critical=10, major=5))
-        assert result == RunStatus.HALTED
+        record = det.check(cycle=1, score=_make_score(critical=10, major=5), baseline_score=100.0)
+        assert det.suggest_status(record) == RunStatus.FAILED
 
-    def test_prev_score_zero_no_false_halt(self):
-        det = ConvergenceDetector()
-        det.check(_make_score(critical=0, major=0))
-        result = det.check(_make_score(critical=1))
-        assert result is None
+    def test_no_false_halt_without_baseline(self):
+        det = ConvergenceDetector(regression_threshold=0.1, max_cycles=100, stable_window=10)
+        det.check(cycle=1, score=_make_score(critical=0, major=0))
+        record = det.check(cycle=2, score=_make_score(critical=1))
+        assert det.suggest_status(record) == RunStatus.RUNNING
 
-    def test_trend_improving(self):
-        det = ConvergenceDetector()
-        det.check(_make_score(critical=5))
-        det.check(_make_score(critical=3))
-        assert det.trend == "improving"
-
-    def test_summary_contains_cycle_count(self):
-        det = ConvergenceDetector()
-        det.check(_make_score(critical=2))
-        summary = det.summary()
-        assert summary["cycle_count"] == 1
+    def test_record_contains_cycle_count(self):
+        det = ConvergenceDetector(max_cycles=1)
+        record = det.check(cycle=1, score=_make_score(critical=2))
+        assert record.cycle == 1
 
 
 class TestReviewResult:

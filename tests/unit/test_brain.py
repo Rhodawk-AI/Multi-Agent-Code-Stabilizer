@@ -107,9 +107,15 @@ class TestScores:
 
     @pytest.mark.asyncio
     async def test_score_compute(self, run_id):
+        # critical=2, major=3, minor=5
+        # c_pen = min(2*15, 60) = 30
+        # m_pen = min(3*5,  30) = 15
+        # n_pen = min(5*1,  10) = 5
+        # score = 100 - 30 - 15 - 5 = 50
+        # total_issues = 2 + 3 + 5 = 10
         s = AuditScore(run_id=run_id, critical_count=2, major_count=3, minor_count=5)
         s.compute_score()
-        assert s.score == 2 * 10 + 3 * 3 + 5 * 1
+        assert s.score == 50.0
         assert s.total_issues == 10
 
 
