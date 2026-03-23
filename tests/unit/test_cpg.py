@@ -1899,7 +1899,7 @@ class TestArch02BlastRadiusSmoke:
 
     These tests use lightweight mocks so they run without a real Joern server.
     The key assertion is that:
-      1.  get_callers() uses cpg.method.filter(_.fullName == "…") for FQNs
+      1.  get_callers() uses cpg.method.filter(_.fullName == "...") for FQNs
           (not cpg.method.name("…"), which matches bare names only and returns
           zero results for any FQN — the root cause of the silent blast-radius=0
           failure mode).
@@ -1911,7 +1911,7 @@ class TestArch02BlastRadiusSmoke:
     @pytest.mark.asyncio
     async def test_get_callers_uses_fullname_predicate_for_fqn(self):
         """
-        ARCH-02: get_callers() MUST use cpg.method.filter(_.fullName == "…")
+        ARCH-02: get_callers() MUST use cpg.method.filter(_.fullName == "...")
         when the supplied name is a Joern FQN (contains "::" or 2+ dots).
         Using cpg.method.name("…") on a FQN always returns zero results
         because Joern's .name field stores only the rightmost component.
@@ -1940,7 +1940,7 @@ class TestArch02BlastRadiusSmoke:
             f"ARCH-02: get_callers() used cpg.method.name() for FQN '{fqn}'. "
             f"Query was: {q!r}. "
             f"cpg.method.name() looks up the bare name field and returns nothing "
-            f"for FQNs. Must use cpg.method.filter(_.fullName == "…") instead."
+            f"for FQNs. Must use cpg.method.filter(_.fullName == "...") instead."
         )
         assert 'method.name(' not in q or fqn not in q, (
             f"ARCH-02: get_callers() passed FQN '{fqn}' to cpg.method.name() — "
