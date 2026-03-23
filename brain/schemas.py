@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator, model_validator
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
@@ -493,6 +493,21 @@ class Issue(BaseModel):
     pass_tests:   list[str]       = Field(default_factory=list)
     base_commit:  str             = ''
 
+    @model_validator(mode="after")
+    def _enforce_line_order_and_fix_files(self) -> "Issue":
+        # BUG-02 FIX: clamp line_end so it is never less than line_start.
+        # Previously an Issue(line_start=50, line_end=30) stored line_end=30,
+        # breaking every caller that assumed line_end >= line_start.
+        if self.line_end < self.line_start:
+            self.line_end = self.line_start
+        # BUG-02 FIX: auto-populate fix_requires_files from file_path when the
+        # caller leaves it empty. The fixer needs at least the primary file in
+        # scope; without this, fix_requires_files=[] caused the fixer to request
+        # zero file content on every new Issue.
+        if not self.fix_requires_files and self.file_path:
+            self.fix_requires_files = [self.file_path]
+        return self
+
 class FixedFile(BaseModel):
     path: str = ''
     content: str = ''
@@ -504,6 +519,15 @@ class FixedFile(BaseModel):
     original_hash: str = ''
     patched_hash: str = ''
     lines_changed: int = 0
+
+    @property
+    def line_count(self) -> int:
+        """BUG-02 FIX: computed line count from content.
+        Returns the number of non-empty lines in the stored content string.
+        Used by tests and the fixer to estimate patch scope without re-reading disk."""
+        if not self.content:
+            return 0
+        return sum(1 for line in self.content.splitlines() if line)
 
 class FixAttempt(BaseModel):
     id: str = Field(default_factory=_new_id)

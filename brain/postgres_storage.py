@@ -128,7 +128,7 @@ class PostgresBrainStorage(BrainStorage):
         return [self._row_to_issue(r) for r in rows]
 
     def _row_to_issue(self, r: dict) -> Issue:
-        return Issue(id=r['id'], run_id=r.get('run_id', ''), severity=Severity(r['severity']), file_path=r['file_path'], line_start=r.get('line_start', 0), line_end=r.get('line_end', 0), executor_type=ExecutorType(r['executor_type']), master_prompt_section=r.get('master_prompt_section', ''), description=r['description'], fix_requires_files=r.get('fix_requires_files') or [], status=IssueStatus(r['status']), fix_attempt_count=r.get('fix_attempt_count', 0), fingerprint=r.get('fingerprint', ''), consensus_votes=r.get('consensus_votes', 0), consensus_confidence=r.get('consensus_confidence', 0.0), created_at=r['created_at'])
+        return Issue(id=r['id'], run_id=r.get('run_id', ''), severity=Severity(r['severity']), file_path=r['file_path'], line_start=r.get('line_start', 0), line_end=r.get('line_end', 0), executor_type=ExecutorType(r['executor_type']), master_prompt_section=r.get('master_prompt_section', ''), description=r['description'], fix_requires_files=r.get('fix_requires_files') or [], status=IssueStatus(r['status']), fix_attempts=r.get('fix_attempt_count', 0), fingerprint=r.get('fingerprint', ''), consensus_votes=r.get('consensus_votes', 0), consensus_confidence=r.get('consensus_confidence', 0.0), created_at=r['created_at'])
 
     async def get_total_cost(self, run_id: str) -> float:
         if not self._is_pg():
@@ -317,8 +317,414 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             return await self._fallback.list_audit_trail(run_id, limit)
         return []
 
-    async def upsert_synthesis_report(self, report: 'SynthesisReport') -> None:
-        from brain.schemas import SynthesisReport as _SR
+    # ── Fix attempts ─────────────────────────────────────────────────────────
+
+    async def upsert_fix(self, fix: FixAttempt) -> None:
+        """BUG-03 / MISSING-03 FIX: native PostgreSQL upsert for fix_attempts."""
+        if not self._is_pg():
+            return await self._fallback.upsert_fix(fix)
+        pa = None if fix.planner_approved is None else bool(fix.planner_approved)
+        gp = None if fix.gate_passed is None else bool(fix.gate_passed)
+        await self._execute(
+            """
+            INSERT INTO fix_attempts
+                (id, run_id, issue_ids, fixed_files, reviewer_verdict,
+                 reviewer_reason, reviewer_confidence, planner_approved,
+                 planner_reason, gate_passed, gate_reason,
+                 test_run_id, formal_proofs, commit_sha, pr_url,
+                 created_at, committed_at)
+            VALUES (:id,:run_id,:issue_ids::jsonb,:fixed_files::jsonb,
+                    :rv,:rr,:rc,:pa,:pr,:gp,:gr,:trid,:fp,
+                    :csha,:purl,:created_at,:committed_at)
+            ON CONFLICT(id) DO UPDATE SET
+                reviewer_verdict   = EXCLUDED.reviewer_verdict,
+                reviewer_reason    = EXCLUDED.reviewer_reason,
+                planner_approved   = EXCLUDED.planner_approved,
+                planner_reason     = EXCLUDED.planner_reason,
+                gate_passed        = EXCLUDED.gate_passed,
+                gate_reason        = EXCLUDED.gate_reason,
+                test_run_id        = EXCLUDED.test_run_id,
+                formal_proofs      = EXCLUDED.formal_proofs,
+                commit_sha         = EXCLUDED.commit_sha,
+                pr_url             = EXCLUDED.pr_url,
+                committed_at       = EXCLUDED.committed_at
+            """,
+            {
+                "id": fix.id, "run_id": fix.run_id,
+                "issue_ids": json.dumps(fix.issue_ids),
+                "fixed_files": json.dumps([f.model_dump() for f in fix.fixed_files]),
+                "rv": fix.reviewer_verdict.value if fix.reviewer_verdict else None,
+                "rr": fix.reviewer_reason,
+                "rc": fix.reviewer_confidence,
+                "pa": pa, "pr": fix.planner_reason,
+                "gp": gp, "gr": fix.gate_reason,
+                "trid": fix.test_run_id,
+                "fp": json.dumps(fix.formal_proofs),
+                "csha": getattr(fix, "commit_sha", None),
+                "purl": fix.pr_url,
+                "created_at": fix.created_at,
+                "committed_at": fix.committed_at,
+            },
+        )
+
+    async def get_fix(self, fix_id: str) -> FixAttempt | None:
+        """BUG-03 FIX: native PostgreSQL get for a single fix attempt."""
+        if not self._is_pg():
+            return await self._fallback.get_fix(fix_id)
+        rows = await self._exec(
+            "SELECT * FROM fix_attempts WHERE id=:id", {"id": fix_id}
+        )
+        return self._row_to_fix(rows[0]) if rows else None
+
+    async def list_fixes(self, run_id: str = "", issue_id: str | None = None) -> list[FixAttempt]:
+        """
+        BUG-03 FIX: native PostgreSQL implementation of list_fixes.
+
+        Previously this method was entirely absent from PostgresBrainStorage.
+        __getattr__ delegated to self._fallback, which is None in a live
+        PostgreSQL deployment (no SQLite fallback), so every call to
+        _phase_gate() in the controller crashed with:
+            AttributeError: PostgresBrainStorage.list_fixes not implemented
+
+        This implementation mirrors the SQLite version using PostgreSQL's native
+        jsonb containment operator (@>) for efficient issue_id filtering.
+        """
+        if not self._is_pg():
+            return await self._fallback.list_fixes(
+                run_id=run_id, issue_id=issue_id
+            )
+        parts = ["SELECT * FROM fix_attempts WHERE 1=1"]
+        params: dict = {}
+        if run_id:
+            parts.append("AND run_id = :run_id")
+            params["run_id"] = run_id
+        if issue_id:
+            # jsonb @> operator: check that issue_ids array contains the value.
+            parts.append("AND issue_ids @> :issue_id_json::jsonb")
+            params["issue_id_json"] = json.dumps([issue_id])
+        parts.append("ORDER BY created_at")
+        rows = await self._exec(" ".join(parts), params)
+        return [self._row_to_fix(r) for r in rows]
+
+    def _row_to_fix(self, r: dict) -> FixAttempt:
+        """Convert a fix_attempts row dict to a FixAttempt schema object."""
+        files_raw = r.get("fixed_files") or []
+        if isinstance(files_raw, str):
+            import json as _j
+            files_raw = _j.loads(files_raw)
+        fixed_files = [FixedFile(**f) for f in files_raw]
+
+        pa_raw = r.get("planner_approved")
+        gp_raw = r.get("gate_passed")
+
+        proofs_raw = r.get("formal_proofs") or []
+        if isinstance(proofs_raw, str):
+            import json as _j
+            proofs_raw = _j.loads(proofs_raw)
+
+        issue_ids_raw = r.get("issue_ids") or []
+        if isinstance(issue_ids_raw, str):
+            import json as _j
+            issue_ids_raw = _j.loads(issue_ids_raw)
+
+        return FixAttempt(
+            id=r["id"],
+            run_id=r.get("run_id", ""),
+            issue_ids=issue_ids_raw,
+            fixed_files=fixed_files,
+            reviewer_verdict=ReviewVerdict(r["reviewer_verdict"]) if r.get("reviewer_verdict") else None,
+            reviewer_reason=r.get("reviewer_reason", ""),
+            reviewer_confidence=float(r.get("reviewer_confidence") or 0.0),
+            planner_approved=None if pa_raw is None else bool(pa_raw),
+            planner_reason=r.get("planner_reason", ""),
+            gate_passed=None if gp_raw is None else bool(gp_raw),
+            gate_reason=r.get("gate_reason", ""),
+            test_run_id=r.get("test_run_id"),
+            formal_proofs=proofs_raw,
+            commit_sha=r.get("commit_sha"),
+            pr_url=r.get("pr_url", ""),
+            created_at=r["created_at"],
+            committed_at=r.get("committed_at"),
+        )
+
+    # ── Compliance artifacts (MISSING-03 FIX) ─────────────────────────────────
+    # Previously every compliance method in PostgresBrainStorage delegated to
+    # self._fallback, which is None in a live PostgreSQL deployment. Any fix
+    # involving C/C++ code or any compliance export crashed with AttributeError.
+    # These native implementations use a simple JSON blob pattern (one row per
+    # artifact, keyed by id) consistent with the SQLite implementation.
+
+    async def upsert_ldra_finding(self, finding) -> None:
+        """MISSING-03 FIX: native PG upsert for LDRA findings."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_ldra_finding(finding)
+            return
+        await self._execute(
+            "INSERT INTO ldra_findings (id, run_id, fix_attempt_id, file_path, "
+            "rule_id, severity, message, line_number, created_at) "
+            "VALUES (:id,:rid,:faid,:fp,:rule,:sev,:msg,:line,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET message=EXCLUDED.message",
+            {
+                "id": finding.id, "rid": getattr(finding, "run_id", ""),
+                "faid": getattr(finding, "fix_attempt_id", ""),
+                "fp": finding.file_path,
+                "rule": finding.rule_id, "sev": str(finding.severity),
+                "msg": str(finding.message)[:500],
+                "line": getattr(finding, "line_number", 0),
+            },
+        )
+
+    async def list_ldra_findings(self, run_id: str = "", file_path: str = "") -> list:
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.list_ldra_findings(run_id=run_id, file_path=file_path)
+            return []
+        from brain.schemas import LdraFinding
+        parts = ["SELECT * FROM ldra_findings WHERE 1=1"]
+        params: dict = {}
+        if run_id:
+            parts.append("AND run_id=:run_id"); params["run_id"] = run_id
+        if file_path:
+            parts.append("AND file_path=:fp"); params["fp"] = file_path
+        try:
+            rows = await self._exec(" ".join(parts), params)
+            return [LdraFinding(**dict(r)) for r in rows]
+        except Exception:
+            return []
+
+    async def upsert_polyspace_finding(self, finding) -> None:
+        """MISSING-03 FIX: native PG upsert for Polyspace findings."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_polyspace_finding(finding)
+            return
+        await self._execute(
+            "INSERT INTO polyspace_findings (id, run_id, fix_attempt_id, file_path, "
+            "check_name, color, message, line_number, created_at) "
+            "VALUES (:id,:rid,:faid,:fp,:chk,:color,:msg,:line,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET message=EXCLUDED.message",
+            {
+                "id": finding.id, "rid": getattr(finding, "run_id", ""),
+                "faid": getattr(finding, "fix_attempt_id", ""),
+                "fp": finding.file_path,
+                "chk": finding.check_name,
+                "color": str(getattr(finding, "verdict", "orange")),
+                "msg": str(getattr(finding, "detail", ""))[:500],
+                "line": getattr(finding, "line_number", 0),
+            },
+        )
+
+    async def list_polyspace_findings(self, run_id: str = "") -> list:
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.list_polyspace_findings(run_id=run_id)
+            return []
+        from brain.schemas import PolyspaceFinding
+        parts = ["SELECT * FROM polyspace_findings WHERE 1=1"]
+        params: dict = {}
+        if run_id:
+            parts.append("AND run_id=:run_id"); params["run_id"] = run_id
+        try:
+            rows = await self._exec(" ".join(parts), params)
+            return [PolyspaceFinding(**dict(r)) for r in rows]
+        except Exception:
+            return []
+
+    async def upsert_cbmc_result(self, result) -> None:
+        """MISSING-03 FIX: native PG upsert for CBMC results."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_cbmc_result(result)
+            return
+        await self._execute(
+            "INSERT INTO cbmc_results (id, run_id, fix_attempt_id, file_path, "
+            "function_name, status, counterexample, elapsed_ms, created_at) "
+            "VALUES (:id,:rid,:faid,:fp,:fn,:status,:ce,:ms,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status",
+            {
+                "id": result.id, "rid": getattr(result, "run_id", ""),
+                "faid": getattr(result, "fix_attempt_id", ""),
+                "fp": getattr(result, "file_path", ""),
+                "fn": getattr(result, "function_name", ""),
+                "status": str(getattr(result, "status", "")),
+                "ce": getattr(result, "counterexample", "")[:2000],
+                "ms": getattr(result, "elapsed_ms", 0),
+            },
+        )
+
+    async def get_cbmc_result(self, result_id: str):
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.get_cbmc_result(result_id)
+            return None
+        from brain.schemas import CbmcVerificationResult
+        rows = await self._exec(
+            "SELECT * FROM cbmc_results WHERE id=:id", {"id": result_id}
+        )
+        if not rows:
+            return None
+        try:
+            return CbmcVerificationResult(**dict(rows[0]))
+        except Exception:
+            return None
+
+    async def upsert_rtm_entry(self, entry) -> None:
+        """MISSING-03 FIX: native PG upsert for RTM entries."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_rtm_entry(entry)
+            return
+        await self._execute(
+            "INSERT INTO rtm_entries (id, run_id, requirement_id, source_file, "
+            "coverage_status, notes, created_at) "
+            "VALUES (:id,:rid,:req,:src,:cov,:notes,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET coverage_status=EXCLUDED.coverage_status",
+            {
+                "id": entry.id, "rid": getattr(entry, "run_id", ""),
+                "req": getattr(entry, "requirement_id", ""),
+                "src": getattr(entry, "source_file", ""),
+                "cov": str(getattr(entry, "coverage_status", "")),
+                "notes": getattr(entry, "notes", "")[:500],
+            },
+        )
+
+    async def list_rtm_entries(self, run_id: str = "") -> list:
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.list_rtm_entries(run_id=run_id)
+            return []
+        from brain.schemas import RequirementTraceability
+        parts = ["SELECT * FROM rtm_entries WHERE 1=1"]
+        params: dict = {}
+        if run_id:
+            parts.append("AND run_id=:run_id"); params["run_id"] = run_id
+        try:
+            rows = await self._exec(" ".join(parts), params)
+            return [RequirementTraceability(**dict(r)) for r in rows]
+        except Exception:
+            return []
+
+    async def get_rtm_for_issue(self, issue_id: str):
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.get_rtm_for_issue(issue_id)
+            return None
+        from brain.schemas import RequirementTraceability
+        try:
+            rows = await self._exec(
+                "SELECT * FROM rtm_entries WHERE notes LIKE :pattern LIMIT 1",
+                {"pattern": f"%{issue_id}%"},
+            )
+            return RequirementTraceability(**dict(rows[0])) if rows else None
+        except Exception:
+            return None
+
+    async def upsert_independence_record(self, record) -> None:
+        """MISSING-03 FIX: native PG upsert for DO-178C independence records."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_independence_record(record)
+            return
+        await self._execute(
+            "INSERT INTO independence_records (id, run_id, fix_attempt_id, "
+            "fixer_model, reviewer_model, same_family, violation_reason, created_at) "
+            "VALUES (:id,:rid,:faid,:fm,:rm,:sf,:vr,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET same_family=EXCLUDED.same_family",
+            {
+                "id": record.id, "rid": getattr(record, "run_id", ""),
+                "faid": getattr(record, "fix_attempt_id", ""),
+                "fm": getattr(record, "fixer_model", ""),
+                "rm": getattr(record, "reviewer_model", ""),
+                "sf": bool(getattr(record, "same_family", False)),
+                "vr": getattr(record, "violation_reason", "")[:500],
+            },
+        )
+
+    async def get_independence_record(self, fix_attempt_id: str):
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.get_independence_record(fix_attempt_id)
+            return None
+        from brain.schemas import ReviewerIndependenceRecord
+        try:
+            rows = await self._exec(
+                "SELECT * FROM independence_records WHERE fix_attempt_id=:faid LIMIT 1",
+                {"faid": fix_attempt_id},
+            )
+            return ReviewerIndependenceRecord(**dict(rows[0])) if rows else None
+        except Exception:
+            return None
+
+    async def upsert_sas(self, sas) -> None:
+        """MISSING-03 FIX: native PG upsert for Software Accomplishment Summary."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_sas(sas)
+            return
+        await self._execute(
+            "INSERT INTO sas_records (id, run_id, data, created_at) "
+            "VALUES (:id,:rid,:data::jsonb,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data",
+            {"id": sas.id, "rid": getattr(sas, "run_id", ""),
+             "data": sas.model_dump_json()},
+        )
+
+    async def get_sas(self, run_id: str):
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.get_sas(run_id)
+            return None
+        from brain.schemas import SoftwareAccomplishmentSummary
+        try:
+            rows = await self._exec(
+                "SELECT data FROM sas_records WHERE run_id=:rid ORDER BY created_at DESC LIMIT 1",
+                {"rid": run_id},
+            )
+            if rows:
+                raw = rows[0]["data"]
+                return SoftwareAccomplishmentSummary.model_validate_json(
+                    raw if isinstance(raw, str) else json.dumps(raw)
+                )
+        except Exception:
+            pass
+        return None
+
+    async def upsert_sci(self, sci) -> None:
+        """MISSING-03 FIX: native PG upsert for Software Configuration Index."""
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.upsert_sci(sci)
+            return
+        await self._execute(
+            "INSERT INTO sci_records (id, run_id, data, created_at) "
+            "VALUES (:id,:rid,:data::jsonb,NOW()) "
+            "ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data",
+            {"id": sci.id, "rid": getattr(sci, "run_id", ""),
+             "data": sci.model_dump_json()},
+        )
+
+    async def get_sci(self, baseline_id: str):
+        if not self._is_pg():
+            if self._fallback:
+                return await self._fallback.get_sci(baseline_id)
+            return None
+        from brain.schemas import SoftwareConfigurationIndex
+        try:
+            rows = await self._exec(
+                "SELECT data FROM sci_records WHERE data::text LIKE :pattern LIMIT 1",
+                {"pattern": f"%{baseline_id}%"},
+            )
+            if rows:
+                raw = rows[0]["data"]
+                return SoftwareConfigurationIndex.model_validate_json(
+                    raw if isinstance(raw, str) else json.dumps(raw)
+                )
+        except Exception:
+            pass
+        return None
+
+    async def upsert_synthesis_report(self, report: 'SynthesisReport') -> None:        from brain.schemas import SynthesisReport as _SR
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.upsert_synthesis_report(report)
