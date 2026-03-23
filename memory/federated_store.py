@@ -103,12 +103,89 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import ipaddress
+import urllib.parse
 import aiohttp
 
 log = logging.getLogger(__name__)
 
 _FED_COLLECTION = "rhodawk_fed_patterns"
 _LOCAL_REGISTRY = "rhodawk_fed_registry"   # stores peer records
+
+# ── MISSING-3 / SEC-3 FIX: peer URL validation (SSRF prevention) ─────────────
+# Federation peer URLs must use HTTPS and must not target private IP ranges,
+# loopback addresses, or link-local ranges (e.g. AWS Instance Metadata Service).
+# Without this check an operator can set RHODAWK_FED_PEERS=http://169.254.169.254/
+# and cause the federation client to POST pattern payloads to the IMDS on every
+# sync cycle, exfiltrating IAM credentials in the HTTP response.
+#
+# Validated ranges:
+#   10.0.0.0/8        — RFC 1918 private
+#   172.16.0.0/12     — RFC 1918 private
+#   192.168.0.0/16    — RFC 1918 private
+#   127.0.0.0/8       — loopback
+#   169.254.0.0/16    — link-local / AWS IMDS
+#   ::1/128           — IPv6 loopback
+_SSRF_BLOCKED_RANGES: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+]
+
+
+def _validate_peer_url(url: str) -> None:
+    """
+    Validate a federation peer URL against SSRF risks.
+
+    Raises ValueError with a descriptive message on any violation so the
+    caller can log it and skip the invalid URL rather than attempting a
+    connection that could exfiltrate internal data.
+
+    Checks:
+      1. Scheme must be "https" (no http, ftp, file, etc.)
+      2. Hostname must not resolve to a private/loopback/link-local address
+         when expressed as a bare IP literal. DNS-resolved hostnames are not
+         checked here (that requires a blocking DNS call) — use a network
+         egress proxy or firewall rule to block private-range DNS targets.
+    """
+    if not url:
+        raise ValueError("Peer URL must not be empty")
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"Peer URL is not parseable: {exc}") from exc
+
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"Peer URL must use https://, got scheme={parsed.scheme!r}. "
+            "Unencrypted federation endpoints allow pattern tampering in transit."
+        )
+
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise ValueError("Peer URL has no hostname")
+
+    # Check if the hostname is a bare IP literal (not a DNS name)
+    try:
+        addr = ipaddress.ip_address(hostname)
+        for net in _SSRF_BLOCKED_RANGES:
+            if addr in net:
+                raise ValueError(
+                    f"Peer URL targets blocked IP range {net} (address={addr}). "
+                    "Federation peers must be public HTTPS endpoints."
+                )
+    except ValueError as exc:
+        # ip_address() raises ValueError for non-IP hostnames — that is fine.
+        # Re-raise only if it is our SSRF message, not the hostname parse error.
+        if "blocked IP range" in str(exc) or "https" in str(exc) or "empty" in str(exc):
+            raise
+
+
+
 _PUSH_TIMEOUT_S = 10.0
 _PULL_TIMEOUT_S = 15.0
 _MAX_PUSH_RETRIES = 2
@@ -200,9 +277,23 @@ class FederatedPatternStore:
         self.receive        = receive
         self.min_complexity = min_complexity
         self.data_dir       = data_dir
-        self.extra_peer_urls: list[str] = [
-            u.rstrip("/") for u in (extra_peer_urls or []) if u
-        ]
+        # MISSING-3 / SEC-3 FIX: validate each extra_peer_url before storing.
+        # Invalid URLs (private IPs, http scheme, IMDS endpoint) are logged and
+        # skipped rather than stored — preventing SSRF on every federation sync.
+        _validated_urls: list[str] = []
+        for _raw_url in (extra_peer_urls or []):
+            if not _raw_url:
+                continue
+            try:
+                _validate_peer_url(_raw_url.rstrip("/"))
+                _validated_urls.append(_raw_url.rstrip("/"))
+            except ValueError as _url_err:
+                import logging as _flog
+                _flog.getLogger(__name__).error(
+                    "FederatedPatternStore: rejecting invalid extra_peer_url %r: %s",
+                    _raw_url, _url_err,
+                )
+        self.extra_peer_urls: list[str] = _validated_urls
 
         self._qdrant_client: Any     = None
         self._backend:       str     = "none"

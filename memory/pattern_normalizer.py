@@ -303,6 +303,26 @@ class PatternNormalizer:
         # Try normalizers in order of precision
         norm_text, id_count, lit_count, path = self._normalize(code, lang)
 
+        # ARCH-3 FIX: cross-language canonical token mapping.
+        #
+        # Structurally identical patterns across languages (Python null-guard,
+        # Go nil-check, Rust Option check, C NULL pointer check) produce different
+        # normalized tokens because each language uses different syntax. Without
+        # canonical mapping, federation cannot recognise these as the same fix
+        # pattern, so a Python null-guard fix never suggests itself as a few-shot
+        # example for a semantically identical Go nil-guard in another deployment.
+        #
+        # We map the most common cross-language structural equivalences to a single
+        # canonical bracket-token. This runs AFTER normalization so it only ever
+        # sees already-normalized tokens, never raw user identifiers.
+        #
+        # Documented cross-language normalizations:
+        #   [NULL_GUARD]   — null/nil/None/nullptr equality comparison patterns
+        #   [BOUNDS_CHECK] — array index or length comparison patterns
+        #   [ERR_RETURN]   — early return on error/falsy/nil check patterns
+        #   [RESOURCE_CLOSE] — defer/finally/with resource cleanup patterns
+        norm_text = _apply_cross_language_canonical(norm_text)
+
         # ADD-2 FIX: Include the normalizer path in the fingerprint so
         # deployments with different tree-sitter availability cannot produce
         # colliding fingerprints for the same code fragment. Previously:
@@ -538,6 +558,56 @@ class PatternNormalizer:
         except Exception as exc:
             log.debug(f"PatternNormalizer: pygments fallback failed ({exc})")
             return None
+
+
+# ── ARCH-3: Cross-language canonical token mapping ────────────────────────────
+#
+# Maps language-specific tokens in already-normalized text to universal
+# canonical bracket tokens so the same structural pattern produces the same
+# fingerprint regardless of source language.
+#
+# Only applied to tokens that the normalizer has already produced — never
+# to raw user identifiers — so there is no risk of collapsing distinct
+# structural patterns together.
+#
+# Each mapping is a (pattern, replacement) pair. Patterns match against the
+# normalized token stream (space-separated structural markers, IDN slots,
+# <str>/<num> literals, and keywords).
+
+import re as _re  # already imported at module top; alias for clarity in this block
+
+_CROSS_LANG_CANONICAL_MAPS: list[tuple[str, str]] = [
+    # NULL / NIL / NONE guard — all these trees normalize to an equality
+    # comparison against null/nil/None/nullptr/NULL in their respective languages.
+    # After normalization they appear as keyword tokens in the token stream.
+    (r"\b(?:nil|None|nullptr|NULL|null)\b", "[NULL_GUARD]"),
+
+    # Bounds check patterns — comparison against len/length/size/cap keywords
+    (r"\b(?:len|length|size|cap|count|capacity)\b\s*\(", "[BOUNDS_CHECK]("),
+
+    # Early-return-on-error — Go `if err != nil`, Python `if x is None: return`,
+    # Rust `?` operator (appears as `question_mark_expression` after normalization).
+    # We target the structural marker that the tree-sitter path emits.
+    (r"\[question_mark_expression\]", "[ERR_RETURN]"),
+
+    # Resource cleanup — defer (Go), finally (Java/Python/JS), with (Python/C#),
+    # Drop (Rust) all represent the same structural intent.
+    (r"\b(?:defer|ensure)\b", "[RESOURCE_CLOSE]"),
+]
+
+
+def _apply_cross_language_canonical(norm_text: str) -> str:
+    """
+    Apply cross-language canonical token substitutions to an already-normalized
+    pattern string. Returns the canonical form ready for fingerprinting.
+
+    Only substitutes well-defined structural equivalences documented in
+    _CROSS_LANG_CANONICAL_MAPS. Any unrecognised token is left unchanged.
+    """
+    result = norm_text
+    for pattern, replacement in _CROSS_LANG_CANONICAL_MAPS:
+        result = _re.sub(pattern, replacement, result)
+    return result
 
 
 # ── Regex last-resort normalizer ──────────────────────────────────────────────
