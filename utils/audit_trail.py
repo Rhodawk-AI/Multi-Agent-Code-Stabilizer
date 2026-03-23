@@ -51,6 +51,13 @@ class AuditTrailSigner:
         Set to True for military/aerospace/nuclear domain modes.
     """
 
+    # Known placeholder prefixes that ship in default .env files.
+    # An audit trail signed with a publicly known key can be forged trivially.
+    _PLACEHOLDER_PREFIXES: tuple[str, ...] = (
+        "CHANGE_ME", "changeme", "change_me", "placeholder",
+        "your-secret", "mysecret", "PLACEHOLDER",
+    )
+
     def __init__(
         self,
         hmac_secret: str = "",
@@ -64,16 +71,47 @@ class AuditTrailSigner:
                 "RHODAWK_AUDIT_SECRET is not set. "
                 "The audit trail will not be cryptographically signed. "
                 "DO-178C SCM evidence will be rejected by certification authorities. "
-                "Set RHODAWK_AUDIT_SECRET to a cryptographically random 32+ byte value."
+                "Set RHODAWK_AUDIT_SECRET to a cryptographically random 32+ byte value: "
+                "python -c 'import secrets; print(secrets.token_hex(32))'"
             )
             if strict:
                 raise AuditSecretMissingError(msg)
-            # In dev mode: log at ERROR so it appears in every run's output
-            log.error(f"SECURITY WARNING: {msg}")
-            log.error(
-                "To generate a suitable secret: "
-                "python -c \"import secrets; print(secrets.token_hex(32))\""
+            log.error("SECURITY WARNING: %s", msg)
+            return
+
+        # SEC-4 FIX: reject placeholder secrets regardless of strict mode.
+        # A placeholder like "CHANGE_ME_generate_with_python" is a publicly
+        # known string. HMAC-SHA256 signed with a known key can be forged by
+        # anyone who knows the key — including anyone who has read .env in this
+        # repository. Reject immediately rather than silently producing forgeable
+        # audit trail entries.
+        _lower = self._secret.lower()
+        for _prefix in self._PLACEHOLDER_PREFIXES:
+            if _lower.startswith(_prefix.lower()):
+                msg = (
+                    f"RHODAWK_AUDIT_SECRET starts with known placeholder prefix "
+                    f"'{_prefix}'. Audit trail signatures are forgeable with a "
+                    "publicly known key. Generate a real secret: "
+                    "python -c 'import secrets; print(secrets.token_hex(32))'"
+                )
+                if strict:
+                    raise AuditSecretMissingError(msg)
+                log.error("SECURITY WARNING: %s", msg)
+                # Zero out the secret so sign() returns UNSIGNED: prefix
+                # rather than silently producing forgeable HMAC signatures.
+                self._secret = ""
+                return
+
+        if len(self._secret) < 32:
+            msg = (
+                f"RHODAWK_AUDIT_SECRET is only {len(self._secret)} chars — "
+                "minimum 32 required for adequate HMAC entropy. "
+                "Generate a real secret: "
+                "python -c 'import secrets; print(secrets.token_hex(32))'"
             )
+            if strict:
+                raise AuditSecretMissingError(msg)
+            log.warning("SECURITY WARNING: %s", msg)
 
     def sign(self, payload: str) -> str:
         """
