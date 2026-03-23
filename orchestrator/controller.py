@@ -365,10 +365,14 @@ class StabilizerController:
         if self.config.vector_store_enabled:
             await self._init_vector_store()
 
-        # 4. Audit trail signer
-        self._trail_signer = AuditTrailSigner(
-            hmac_secret=os.environ.get("RHODAWK_AUDIT_SECRET", "")
-        )
+        # 4. Audit trail signer — defence-in-depth secret validation
+        _audit_secret = os.environ.get("RHODAWK_AUDIT_SECRET", "")
+        if not _audit_secret or _audit_secret.startswith("CHANGE_ME") or len(_audit_secret) < 32:
+            raise ConfigurationError(
+                "RHODAWK_AUDIT_SECRET must be a 32+ char random hex string. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        self._trail_signer = AuditTrailSigner(hmac_secret=_audit_secret)
 
         # 5. Resume or create run
         if resume_run_id:
@@ -399,7 +403,7 @@ class StabilizerController:
         # 6. Aegis EDR
         self._aegis = AegisEDR(
             run_id=self.run.id,
-            hmac_secret=os.environ.get("RHODAWK_AUDIT_SECRET", ""),
+            hmac_secret=_audit_secret,
             strict_mode=(self.config.domain_mode != DomainMode.GENERAL),
         )
 
