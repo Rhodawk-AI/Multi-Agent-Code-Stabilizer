@@ -1,0 +1,69 @@
+# SEC-5 FIX: exclude .env and all environment files from the Docker build context.
+#
+# The Dockerfile uses COPY . . to copy application code. Without .dockerignore,
+# .env is copied into the image at /app/.env. Anyone with access to the built
+# image — Docker Hub, private registry, docker inspect, docker export — can
+# extract all secrets in plaintext:
+#
+#   docker run --rm --entrypoint cat <image> /app/.env
+#
+# Secrets must be injected at runtime via docker-compose env_file (already
+# configured in docker-compose.yml) or Kubernetes secrets. They must NEVER
+# be baked into the image layer.
+
+# ── Secrets and environment files ─────────────────────────────────────────────
+.env
+.env.*
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# ── Development tooling ────────────────────────────────────────────────────────
+.git/
+.github/
+.gitignore
+.gitattributes
+*.md
+docs/
+tests/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── Build artifacts ────────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+.eggs/
+node_modules/
+
+# ── Local data and logs ────────────────────────────────────────────────────────
+*.log
+*.db
+*.sqlite
+*.sqlite3
+brain.db
+fix_memory.json
+/tmp/
+
+# ── IDE and OS files ──────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# ── Allow example files that don't contain secrets ────────────────────────────
+!.env.example

@@ -10,6 +10,12 @@ version: "3.9"
 #     landmine in production deployments).
 #   • rhodawk-api and rhodawk-worker both depend on postgres with health check.
 #   • postgres data volume persists across restarts.
+#   • SEC-1 FIX: added /var/run/docker.sock volume mount to rhodawk-worker.
+#     Without this mount, shutil.which("docker") returns None inside the
+#     container (docker CLI not on PATH), test_runner._use_sandbox is False,
+#     and all LLM-generated test code runs unsandboxed on the host with full
+#     filesystem and network access — silently bypassing the SEC-03 sandbox.
+#   • SEC-5 FIX: .dockerignore now excludes .env from the build context.
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -50,6 +56,21 @@ services:
     command: >
       celery -A workers.celery_app worker
       --loglevel=info -Q read,fix,gate --concurrency=4
+    # SEC-1 FIX: mount Docker socket so test_runner.py can spin up sandboxed
+    # containers for LLM-generated test code. Without this mount,
+    # shutil.which("docker") returns None inside the container (the docker CLI
+    # binary is present from apt-get install docker.io in the Dockerfile, but
+    # it cannot communicate with the daemon without the socket), causing
+    # self._use_sandbox to be set False and all test execution to run
+    # unsandboxed on the host — silently bypassing SEC-03.
+    #
+    # SECURITY NOTE: Docker socket access grants near-root privileges to the
+    # container. The rhodawk user (non-root) is used inside the container, but
+    # the socket itself allows starting new containers as any user. This is an
+    # accepted trade-off for the test sandbox capability. In higher-security
+    # environments use rootless Docker or a gVisor runtime instead.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
   # FIX: PostgreSQL was entirely absent from the previous compose file.

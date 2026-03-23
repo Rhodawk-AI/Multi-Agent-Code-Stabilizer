@@ -3,8 +3,14 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # System deps
+# SEC-1 FIX: added docker.io to install the docker CLI binary alongside the
+# existing build tools. Without the CLI binary, shutil.which("docker") returns
+# None in test_runner.py, self._use_sandbox is set to False, and LLM-generated
+# test code runs directly on the host with full filesystem and network access —
+# defeating the SEC-03 sandbox entirely. The CLI is required for sandbox mode
+# even when the Python docker SDK is installed separately via pip.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl build-essential patch \
+    git curl build-essential patch docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust for mcp_server (optional)
@@ -23,6 +29,7 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir -e ".[dev]" || pip install --no-cache-dir \
     "python-jose[cryptography]>=3.3.0" \
     litellm \
+    instructor \
     pydantic \
     fastapi \
     uvicorn \
@@ -42,8 +49,24 @@ RUN pip install --no-cache-dir -e ".[dev]" || pip install --no-cache-dir \
     docker \
     qdrant-client
 
-# App
+# SEC-5 FIX: copy application code WITHOUT .env.
+# .dockerignore excludes .env and .env.* so secrets never enter the build
+# context. The COPY . . instruction here is safe only when .dockerignore is
+# present and correct. The RUN test below provides a build-time safety net
+# that fails the image build if .env somehow ends up in the image layer,
+# ensuring secrets cannot be extracted with `docker run --entrypoint cat`.
 COPY . .
+
+# SEC-5 BUILD-TIME GUARD: abort if .env was accidentally copied into the image.
+# This catches cases where .dockerignore is missing, misconfigured, or overridden
+# by a CI/CD system that ignores .dockerignore. A failed build is always better
+# than a shipped image containing plaintext secrets.
+RUN if [ -f "/app/.env" ]; then \
+        echo "FATAL: .env was copied into the Docker image." >&2; \
+        echo "Add .env to .dockerignore immediately." >&2; \
+        echo "Secrets in the image can be extracted with: docker run --entrypoint cat <image> /app/.env" >&2; \
+        exit 1; \
+    fi
 
 # BUG-2 FIX: Reject the image at build time if RHODAWK_DEV_AUTH has somehow
 # been baked into the build context. This is defence-in-depth — the primary
