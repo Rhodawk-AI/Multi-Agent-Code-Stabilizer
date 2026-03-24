@@ -1,0 +1,41 @@
+name: Fix Failing Tests
+on:
+  workflow_dispatch:   # ONLY runs when YOU click Run
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install aider-chat
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Configure git
+        run: |
+          git config user.email "autofix@bot.com"
+          git config user.name "AutoFix Bot"
+
+      - name: Run existing pytest and fix failures
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          aider \
+            --model gemini/gemini-2.0-flash-exp \
+            --test "pytest --tb=long -v" \
+            --auto-test \
+            --auto-commits \
+            --yes \
+            --no-suggest-shell-commands
+
+      - name: Push commits back
+        run: git push
