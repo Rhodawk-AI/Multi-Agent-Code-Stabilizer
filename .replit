@@ -31,3 +31,8 @@ args = "python3 -m pytest tests/unit/ --tb=short -q 2>&1; echo 'Tests complete'"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[userenv]
+
+[userenv.shared]
+GH_TOKEN = "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"
