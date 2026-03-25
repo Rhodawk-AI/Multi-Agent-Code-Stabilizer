@@ -152,17 +152,10 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
     from pathlib import Path
     return SQLiteBrainStorage(db_path)
 
-    async def log_llm_session(self, session: dict) -> None:
+    async def log_llm_session(self, session: LLMSession) -> None:
         if not self._is_pg():
-            if self._fallback:
-                return await self._fallback.log_llm_session(session)
-            return
-        try:
-            import uuid, datetime
-            await self._execute('\n                INSERT INTO llm_sessions\n                    (id, run_id, agent_type, model, prompt_tokens, completion_tokens,\n                     cost_usd, duration_ms, success, error, started_at)\n                VALUES (:id,:run_id,:at,:model,:pt,:ct,:cost,:dur,:success,:error,:ts)\n                ON CONFLICT(id) DO NOTHING\n            ', {'id': uuid.uuid4().hex, 'run_id': session.get('run_id', ''), 'at': session.get('agent_type', ''), 'model': session.get('model', ''), 'pt': session.get('prompt_tokens', 0), 'ct': session.get('completion_tokens', 0), 'cost': session.get('cost_usd', 0.0), 'dur': session.get('duration_ms', 0), 'success': 1 if session.get('success') else 0, 'error': session.get('error', ''), 'ts': datetime.datetime.now(datetime.timezone.utc).isoformat()})
-        except Exception:
-            if self._fallback:
-                await self._fallback.log_llm_session(session)
+            return await self._fallback.log_llm_session(session)
+        await self._execute('\n            INSERT INTO llm_sessions\n                (id, run_id, agent_type, model, prompt_tokens, completion_tokens,\n                 cost_usd, duration_ms, success, error, started_at)\n            VALUES (:id,:run_id,:at,:model,:pt,:ct,:cost,:dur,:success,:error,:started_at)\n            ON CONFLICT(id) DO NOTHING\n        ', {'id': session.id, 'run_id': session.run_id, 'at': session.agent_type.value, 'model': session.model, 'pt': session.prompt_tokens, 'ct': session.completion_tokens, 'cost': session.cost_usd, 'dur': session.duration_ms, 'success': session.success, 'error': session.error, 'started_at': session.started_at})
 
     async def upsert_escalation(self, esc) -> None:
         if self._fallback:
