@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +90,31 @@ class SwarmState:
     @classmethod
     def from_dict(cls, d: dict) -> "SwarmState":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class SwarmStateDict(TypedDict, total=False):
+    """TypedDict mirror of SwarmState — used as the LangGraph schema.
+
+    Using a TypedDict instead of a bare ``dict`` gives LangGraph a distinct
+    ``LastValue`` channel per field.  This avoids the
+    ``InvalidUpdateError: At key '__root__'`` that fires when newer LangGraph
+    versions try to assign two writes to the single ``__root__`` channel that
+    is created for an un-typed ``dict`` schema.
+    """
+    run_id:           str
+    phase:            str
+    cycle:            int
+    max_cycles:       int
+    issues_found:     int
+    issues_fixed:     int
+    issues_escalated: int
+    score:            float
+    stabilized:       bool
+    halted:           bool
+    error:            str
+    modified_files:   list
+    metadata:         dict
+    gap5_enabled:     bool
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -248,7 +273,7 @@ def build_stabilizer_graph(controller: Any) -> Any:
 
     # ── Graph construction ───────────────────────────────────────────────────
 
-    graph = StateGraph(dict)
+    graph = StateGraph(SwarmStateDict)
 
     graph.add_node("READ",      node_read)
     graph.add_node("AUDIT",     node_audit)
