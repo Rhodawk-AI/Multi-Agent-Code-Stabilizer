@@ -717,7 +717,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             pass
         return None
 
-    async def upsert_synthesis_report(self, report: 'SynthesisReport') -> None:        from brain.schemas import SynthesisReport as _SR
+    async def upsert_synthesis_report(self, report: 'SynthesisReport') -> None:
+        from brain.schemas import SynthesisReport as _SR
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.upsert_synthesis_report(report)
