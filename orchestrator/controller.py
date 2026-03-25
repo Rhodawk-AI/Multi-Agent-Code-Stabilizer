@@ -200,7 +200,7 @@ class StabilizerConfig(BaseModel):
     #
     # Override with: RHODAWK_SYNTHESIS_MODEL env var or synthesis_model in
     # the [synthesis] section of your config TOML.
-    synthesis_model:            str    = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
+    synthesis_model:            str    = ""
     synthesis_max_compound:     int    = 20
     # ── Gap 5: Multi-Intelligence / Adversarial Ensemble (BoBN pipeline) ─────
     # Master switch.  When False the existing single-fixer path is used unchanged.

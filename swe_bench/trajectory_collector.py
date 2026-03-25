@@ -119,6 +119,7 @@ class TrajectoryCollector:
         n_rounds:           int          = 1,
         composite_score:    float        = 0.0,
         is_winner:          bool         = False,
+        reward:             float | None = None,
     ) -> TrajectoryRecord:
         """
         Record one trajectory. Called for EVERY candidate, not just the winner.
@@ -128,7 +129,7 @@ class TrajectoryCollector:
             instance_id       = instance_id,
             prompt            = prompt,
             response          = patch,
-            reward            = 1.0 if resolved else 0.0,
+            reward            = reward if reward is not None else (1.0 if resolved else 0.0),
             model             = model,
             temperature       = temperature,
             test_score        = test_score,
@@ -196,6 +197,7 @@ class TrajectoryCollector:
                 n_rounds          = candidate.exec_rounds,
                 composite_score   = candidate.composite_score,
                 is_winner         = is_winner,
+                reward            = reward,
             )
             records.append(record)
 

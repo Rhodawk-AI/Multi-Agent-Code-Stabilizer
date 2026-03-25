@@ -18,7 +18,10 @@ FIXES vs previous version
 from __future__ import annotations
 
 import asyncio
+import gc
+import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -26,23 +29,61 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _patch_aiosqlite_daemon():
+    """Make aiosqlite background threads daemon threads so they don't block exit."""
+    try:
+        import aiosqlite.core as _core
+        _orig_init = _core.Connection.__init__
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            if hasattr(self, '_thread') and self._thread is not None:
+                self._thread.daemon = True
+        _core.Connection.__init__ = _patched_init
+    except Exception:
+        pass
+
+_patch_aiosqlite_daemon()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """
+    After all tests finish, mark every surviving non-daemon thread as daemon,
+    then schedule a forced os._exit() via a daemon timer so that residual
+    aiosqlite / gRPC / httpx worker threads cannot block process exit.
+    """
+    main = threading.main_thread()
+    for t in threading.enumerate():
+        if t is main or t.daemon:
+            continue
+        try:
+            t.daemon = True
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _force_exit():
+        os._exit(int(exitstatus))
+
+    timer = threading.Timer(2.0, _force_exit)
+    timer.daemon = True
+    timer.start()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Event loop
 # ──────────────────────────────────────────────────────────────────────────────
 # asyncio_mode="auto" is set in pyproject.toml [tool.pytest.ini_options].
-# The old `event_loop_policy` fixture approach is deprecated; just remove it.
-# If you need session-scoped async fixtures, override event_loop at that scope.
+# Each async test gets its own event loop; no custom event_loop fixture needed.
 
-@pytest.fixture(scope="session")
-def event_loop():
+@pytest.fixture(autouse=True)
+def _force_gc_after_test():
     """
-    Session-scoped event loop.
-    Required for session-scoped async fixtures (e.g. shared DB).
+    Force a full garbage collection after every test so that SQLiteBrainStorage
+    objects without explicit close() calls have their __del__ invoked while the
+    event loop is still alive.  Without this, aiosqlite background threads can
+    outlive the event loop and block pytest's teardown indefinitely.
     """
-    policy = asyncio.DefaultEventLoopPolicy()
-    loop   = policy.new_event_loop()
-    yield loop
-    loop.close()
+    yield
+    gc.collect()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

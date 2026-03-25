@@ -210,6 +210,14 @@ class CPGEngine:
         # 3. Shard manager — manages multi-instance Joern for large repos
         self._shard_manager: Any | None = None          # ShardManager
 
+        # 4. JNI bridge tracker — cross-language boundary analysis
+        self._bridge_result: Any | None = None          # BridgeAnalysisResult
+        # Pre-computed bridge findings indexed by source file for O(1) lookup
+        self._bridge_index: dict[str, list[dict]] = {}  # file → [issues]
+
+        # 5. Repo line count cache (computed once during initialise)
+        self._repo_line_count: int = 0
+
     # ── ARCH-01 FIX: public shard_manager property ───────────────────────────
     # Previously the controller called:
     #   self._cpg_engine.shard_manager = _shard_mgr
@@ -230,14 +238,6 @@ class CPGEngine:
     @shard_manager.setter
     def shard_manager(self, value: "Any | None") -> None:
         self._shard_manager = value
-
-        # 4. JNI bridge tracker — cross-language boundary analysis
-        self._bridge_result: Any | None = None          # BridgeAnalysisResult
-        # Pre-computed bridge findings indexed by source file for O(1) lookup
-        self._bridge_index: dict[str, list[dict]] = {}  # file → [issues]
-
-        # 5. Repo line count cache (computed once during initialise)
-        self._repo_line_count: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -460,7 +460,13 @@ class CPGEngine:
 
     @property
     def is_sharded(self) -> bool:
+        if hasattr(self, '_is_sharded_override') and self._is_sharded_override is not None:
+            return self._is_sharded_override
         return self._shard_manager is not None and bool(self._shard_manager.shards)
+
+    @is_sharded.setter
+    def is_sharded(self, value: bool) -> None:
+        self._is_sharded_override = value
 
     # ── New public accessors ───────────────────────────────────────────────────
 
@@ -868,13 +874,16 @@ class CPGEngine:
         resolved: list[str] = []
         seen: set[str] = set()
 
+        # Build deduplicated bare-only list for Joern FQN queries
         bare_only: list[str] = []
+        bare_seen: set[str] = set()
         for name in bare_names:
             bare = name.split(".")[-1]
-            if bare and bare not in seen:
+            if bare and bare not in bare_seen:
                 bare_only.append(bare)
-                seen.add(bare)
+                bare_seen.add(bare)
 
+        # Always keep original names (bare_names is passed through as-is)
         for name in bare_names:
             if name not in seen:
                 resolved.append(name)
@@ -988,10 +997,10 @@ class CPGEngine:
             )
             call_graph_files: set[str] = set(blast.affected_files)
             import_only_files: list[str] = sorted(set(
-                h["importer_file"]
+                (h if isinstance(h, str) else h.get("importer_file", ""))
                 for h in import_hits
-                if h.get("importer_file")
-                and h["importer_file"] not in call_graph_files
+                if (h if isinstance(h, str) else h.get("importer_file"))
+                and (h if isinstance(h, str) else h.get("importer_file", "")) not in call_graph_files
             ))
             blast.importing_modules      = import_only_files
             blast.importing_module_count = len(import_only_files)

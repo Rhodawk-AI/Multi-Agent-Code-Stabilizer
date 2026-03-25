@@ -243,7 +243,7 @@ class DependencyGraphEngine:
             [p for p in file_paths if self._G.has_node(p)]
         ).copy()
         try:
-            order = list(nx.topological_sort(sub))
+            order = list(reversed(list(nx.topological_sort(sub))))
             ordered = [p for p in order if p in file_paths]
             missing = [p for p in file_paths if p not in ordered]
             return ordered + missing

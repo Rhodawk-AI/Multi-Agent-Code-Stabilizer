@@ -156,3 +156,21 @@ docker>=7.0.0
 
 # ── Prompt testing ────────────────────────────────────────────────────────────
 pyyaml>=6.0.0
+pytest
+pytest-asyncio
+pydantic
+aiosqlite
+anthropic
+chromadb
+fastapi
+httpx
+instructor
+litellm
+openai
+pydantic
+pytest-asyncio
+python-dotenv
+rich
+sentence-transformers
+typer
+uvicorn

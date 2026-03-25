@@ -224,15 +224,8 @@ class SynthesisAgent(BaseAgent):
             f"from {len({i.executor_type for i in issues})} auditor domains"
         )
 
-        # ── Step 1: Fast fingerprint-based deduplication ──────────────────────
-        deduped = self._dedup_by_fingerprint(issues)
-        self.log.info(
-            f"[synthesis] Fingerprint dedup: "
-            f"{len(issues)} → {len(deduped)} "
-            f"(-{len(issues) - len(deduped)} exact duplicates)"
-        )
-
-        # ── Step 2: Semantic deduplication via LLM (batched) ──────────────────
+        # ── Step 1: Semantic deduplication via LLM (batched) — runs first on full list
+        deduped = list(issues)
         if self.dedup_enabled and len(deduped) > 1:
             try:
                 deduped = await self._dedup_semantic(deduped)
@@ -241,8 +234,17 @@ class SynthesisAgent(BaseAgent):
                 )
             except Exception as exc:
                 self.log.warning(
-                    f"[synthesis] Semantic dedup failed (using fingerprint result): {exc}"
+                    f"[synthesis] Semantic dedup failed (using original list): {exc}"
                 )
+
+        # ── Step 2: Fast fingerprint-based deduplication ──────────────────────
+        pre_fp = len(deduped)
+        deduped = self._dedup_by_fingerprint(deduped)
+        self.log.info(
+            f"[synthesis] Fingerprint dedup: "
+            f"{pre_fp} → {len(deduped)} "
+            f"(-{pre_fp - len(deduped)} exact duplicates)"
+        )
 
         # ── Step 3: Cross-domain compound finding detection ───────────────────
         compound_findings: list[CompoundFinding] = []

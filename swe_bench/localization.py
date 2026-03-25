@@ -281,10 +281,10 @@ class SWEBenchLocalizer:
         self, issue_text: str, files: list[str]
     ) -> list[tuple[str, float]]:
         """Simple keyword overlap when BM25 is unavailable."""
-        issue_words = set(re.findall(r"\w+", issue_text.lower()))
+        issue_words = set(re.findall(r"[a-zA-Z]+", issue_text.lower()))
         scored: list[tuple[str, float]] = []
         for f in files:
-            file_words = set(re.findall(r"\w+", f.lower()))
+            file_words = set(re.findall(r"[a-zA-Z]+", f.lower()))
             overlap = len(issue_words & file_words)
             if overlap > 0:
                 scored.append((f, overlap / max(len(issue_words), 1)))

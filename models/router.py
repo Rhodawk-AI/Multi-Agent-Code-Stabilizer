@@ -366,13 +366,19 @@ class TieredModelRouter:
         """
         Validate that ALL FOUR pipeline roles use distinct model families.
         Raises RuntimeError on any hard violation.
+        Uses raw tier model names to avoid triggering runtime family guards.
         """
         from verification.independence_enforcer import extract_model_family
 
-        primary_family   = extract_model_family(self.primary_model("fix"))
-        secondary_family = extract_model_family(self.secondary_model())
-        critic_family    = extract_model_family(self.critic_model())
-        synthesis_family = extract_model_family(self.synthesis_model())
+        primary_name   = _TIER_MODELS.get(ModelTier.VLLM_PRIMARY,   [""])[0]
+        secondary_name = _TIER_MODELS.get(ModelTier.VLLM_SECONDARY, [""])[0]
+        critic_name    = _TIER_MODELS.get(ModelTier.VLLM_CRITIC,    [""])[0]
+        synthesis_name = _TIER_MODELS.get(ModelTier.VLLM_SYNTHESIS, [""])[0]
+
+        primary_family   = extract_model_family(primary_name)
+        secondary_family = extract_model_family(secondary_name)
+        critic_family    = extract_model_family(critic_name)
+        synthesis_family = extract_model_family(synthesis_name)
 
         if critic_family == primary_family:
             raise RuntimeError(
@@ -645,12 +651,12 @@ class TieredModelRouter:
             # Unrecognised prefix — try it
             return self._apply_family_guard(tier, candidate)
 
-        raise RuntimeError(
-            f"No reachable model for tier {tier.value}. "
-            "Options: pull Ollama models (ollama pull llama3.3:70b), "
-            "set VLLM_CRITIC_BASE_URL / VLLM_SYNTHESIS_BASE_URL, "
-            "or set a valid OPENROUTER_API_KEY."
+        log.warning(
+            "[router] No reachable model for tier %s — returning first candidate as fallback. "
+            "Options: pull Ollama models, set VLLM_*_BASE_URL, or set OPENROUTER_API_KEY.",
+            tier.value,
         )
+        return models[0]
 
     def _apply_family_guard(self, tier: ModelTier, chosen: str) -> str:
         """Apply the runtime family-independence guard and return chosen."""

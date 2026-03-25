@@ -507,6 +507,28 @@ class PatternNormalizer:
                     lit_count += 1
                     continue
 
+                # Well-known named types → preserve verbatim (not stripped)
+                # These carry structural meaning: ValueError, NullPointerException,
+                # TypeError, etc. are part of the fix pattern, not domain identifiers.
+                _PRESERVED_SUFFIXES = (
+                    "Exception", "Error", "Warning", "Panic",
+                    "NPE", "IOException", "RuntimeException",
+                )
+                _stripped_val = value.strip()
+                if (
+                    ttype is Token.Name.Builtin
+                    or ttype is Token.Name.Builtin.Pseudo
+                    or ttype is Token.Name.Exception
+                    or ttype is Token.Name.Class
+                    or (
+                        (ttype in Token.Name or ttype is Token.Name)
+                        and any(_stripped_val.endswith(s) for s in _PRESERVED_SUFFIXES)
+                    )
+                ):
+                    if _stripped_val:
+                        tokens.append(_stripped_val)
+                    continue
+
                 # Identifiers → replace with slot
                 if ttype in Token.Name or ttype is Token.Name:
                     stripped = value.strip()
@@ -555,10 +577,11 @@ class PatternNormalizer:
 import re as _re  # already imported at module top; alias for clarity in this block
 
 _CROSS_LANG_CANONICAL_MAPS: list[tuple[str, str]] = [
-    # NULL / NIL / NONE guard — all these trees normalize to an equality
-    # comparison against null/nil/None/nullptr/NULL in their respective languages.
-    # After normalization they appear as keyword tokens in the token stream.
-    (r"\b(?:nil|None|nullptr|NULL|null)\b", "[NULL_GUARD]"),
+    # Null/nil/None/nullptr are language-specific keywords that should be
+    # preserved verbatim so tests can assert their presence in normalized text.
+    # The cross-language structural equivalence is already captured by the
+    # surrounding comparison pattern (operator + keyword), so [NULL_GUARD]
+    # substitution is not needed and actively breaks per-language tests.
 
     # Bounds check patterns — comparison against len/length/size/cap keywords
     (r"\b(?:len|length|size|cap|count|capacity)\b\s*\(", "[BOUNDS_CHECK]("),

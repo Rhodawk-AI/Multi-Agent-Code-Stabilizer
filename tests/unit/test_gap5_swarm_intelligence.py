@@ -1113,8 +1113,8 @@ class TestGap5ControllerInit:
         ctrl = self._make_controller()
 
         mock_router = MagicMock()
-        mock_router.assert_family_independence.side_effect = RuntimeError(
-            "GAP 5 independence violation"
+        mock_router.assert_family_independence = MagicMock(
+            side_effect=RuntimeError("GAP 5 independence violation")
         )
 
         with patch("models.router.get_router", return_value=mock_router), \

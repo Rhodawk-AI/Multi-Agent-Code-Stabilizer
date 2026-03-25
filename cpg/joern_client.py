@@ -973,7 +973,7 @@ class JoernClient:
         Returns all matching FQNs (may be more than one when overloaded), or
         an empty list when Joern is unavailable or the name is not in the CPG.
         """
-        if not self.is_ready:
+        if not self._ready:
             return []
         try:
             if file_path:

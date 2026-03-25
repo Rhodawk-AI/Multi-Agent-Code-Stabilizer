@@ -14,6 +14,7 @@ def _new_id() -> str:
 class Severity(str, Enum):
     CRITICAL = 'CRITICAL'
     MAJOR = 'MAJOR'
+    MEDIUM = 'MEDIUM'
     MINOR = 'MINOR'
     INFO = 'INFO'
 
@@ -23,7 +24,7 @@ class MilStd882eCategory(str, Enum):
     CAT_III = 'CAT_III'
     CAT_IV = 'CAT_IV'
     NONE = 'NONE'
-SEVERITY_TO_MIL882E: dict[Severity, MilStd882eCategory] = {Severity.CRITICAL: MilStd882eCategory.CAT_I, Severity.MAJOR: MilStd882eCategory.CAT_II, Severity.MINOR: MilStd882eCategory.CAT_III, Severity.INFO: MilStd882eCategory.CAT_IV}
+SEVERITY_TO_MIL882E: dict[Severity, MilStd882eCategory] = {Severity.CRITICAL: MilStd882eCategory.CAT_I, Severity.MAJOR: MilStd882eCategory.CAT_II, Severity.MEDIUM: MilStd882eCategory.CAT_II, Severity.MINOR: MilStd882eCategory.CAT_III, Severity.INFO: MilStd882eCategory.CAT_IV}
 
 class IssueStatus(str, Enum):
     OPEN = 'OPEN'
@@ -127,6 +128,7 @@ class DisagreementAction(str, Enum):
     ESCALATE_HUMAN = 'ESCALATE_HUMAN'
     BLOCK = 'BLOCK'
     AUTO_RESOLVE = 'AUTO_RESOLVE'
+    AUTO_REJECT = 'AUTO_REJECT'
 
 class FormalVerificationStatus(str, Enum):
     PROVED = 'PROVED'
@@ -399,8 +401,14 @@ class FileRecord(BaseModel):
     language: str = 'unknown'
     status: FileStatus = FileStatus.UNREAD
     hash: str = ''
+    content_hash: str = ''
     line_count: int = 0
+    size_lines: int = 0
+    size_bytes: int = 0
     chunk_count: int = 0
+    chunks_total: int = 0
+    chunks_read: int = 0
+    chunk_strategy: ChunkStrategy = ChunkStrategy.FULL
     summary: str = ''
     key_symbols: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -408,6 +416,8 @@ class FileRecord(BaseModel):
     is_load_bearing: bool = False
     run_id: str = ''
     last_read_at: datetime | None = None
+    last_hash_check: datetime | None = None
+    created_at: datetime = Field(default_factory=_utcnow)
     known_functions: list[str] = Field(default_factory=list)
     stale_functions: list[str] = Field(default_factory=list)
     in_safety_partition: bool = False
@@ -444,6 +454,11 @@ class IssueFingerprint(BaseModel):
     rule_key: str = ''
     line_start: int = 0
     description_hash: str = ''
+    fingerprint: str = ''
+    issue_id: str = ''
+    seen_count: int = 1
+    first_seen: datetime = Field(default_factory=_utcnow)
+    last_seen: datetime = Field(default_factory=_utcnow)
 
 class Issue(BaseModel):
     id: str = Field(default_factory=_new_id)
@@ -482,6 +497,8 @@ class Issue(BaseModel):
     closed_at: datetime | None = None
     last_updated: datetime = Field(default_factory=_utcnow)
     escalation_id: str = ''
+    escalated_reason: str = ''
+    regressed_from: str = ''
     # BoBN / SWE-bench integration fields.
     # fail_tests: test IDs that must be fixed by the patch (FAIL_TO_PASS signal).
     # pass_tests: test IDs that must remain green after the patch (PASS_TO_PASS signal).
@@ -492,6 +509,7 @@ class Issue(BaseModel):
     fail_tests:   list[str]       = Field(default_factory=list)
     pass_tests:   list[str]       = Field(default_factory=list)
     base_commit:  str             = ''
+    created_at: datetime = Field(default_factory=_utcnow)
 
     @model_validator(mode="after")
     def _enforce_line_order_and_fix_files(self) -> "Issue":
@@ -541,6 +559,8 @@ class FixAttempt(BaseModel):
     independence_record_id: str = ''
     reviewer_verdict: ReviewVerdict | None = None
     reviewer_notes: str = ''
+    reviewer_reason: str = ''
+    reviewer_confidence: float = 0.0
     gate_passed: bool | None = None
     gate_reason: str = ''
     planner_approved: bool | None = None
@@ -553,6 +573,7 @@ class FixAttempt(BaseModel):
     requirement_id: str = ''
     test_case_id: str = ''
     committed_at: datetime | None = None
+    commit_sha: str = ''
     pr_url: str = ''
     blast_radius_exceeded: bool = False
     refactor_proposal_id: str = ''
@@ -666,6 +687,7 @@ class PlannerRecord(BaseModel):
     reason: str = ''
     simulation_summary: str = ''
     formal_proof_available: bool = False
+    formal_proof_id: str = ''
     evaluated_at: datetime = Field(default_factory=_utcnow)
 
 class CompoundFindingCategory(str, Enum):
@@ -731,8 +753,10 @@ class AuditScore(BaseModel):
     major_count: int = 0
     minor_count: int = 0
     info_count: int = 0
+    escalated_count: int = 0
     total_issues: int = 0
     score: float = 100.0
+    scored_at: datetime = Field(default_factory=_utcnow)
     misra_open: int = 0
     cert_open: int = 0
     cwe_open: int = 0
@@ -794,6 +818,7 @@ class AuditRun(BaseModel):
     metadata: dict = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=_utcnow)
     finished_at: datetime | None = None
+    completed_at: datetime | None = None
 
 class AuditTrailEntry(BaseModel):
     id: str = Field(default_factory=_new_id)

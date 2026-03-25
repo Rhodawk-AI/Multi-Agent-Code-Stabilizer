@@ -326,8 +326,10 @@ class AdversarialCriticAgent:
             score = 0.6
         elif total_changes <= 100:
             score = 0.4
+        elif total_changes <= 150:
+            score = 0.3
         else:
-            score = max(0.1, 1.0 - (total_changes - 100) / 500)
+            score = max(0.1, 0.3 - (total_changes - 150) / 1000)
 
         return PatchMinimalityScore(
             lines_added   = added,

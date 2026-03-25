@@ -324,13 +324,28 @@ class ReaderAgent(BaseAgent):
             if is_available("tree_sitter_language_pack"):
                 strategy = ChunkStrategy.FUNCTION
 
-        return chunk_file(
+        raw_chunks = chunk_file(
             file_path=rel_path,
             content=content,
             language=language,
             run_id=self.run_id,
             strategy=strategy,
         )
+        return [
+            FileChunkRecord(
+                file_path=c.file_path or rel_path,
+                run_id=self.run_id,
+                chunk_index=c.index,
+                total_chunks=c.total,
+                line_start=c.line_start,
+                line_end=c.line_end,
+                language=language,
+                strategy=c.strategy,
+                content=c.content,
+                function_name=c.function_name,
+            )
+            for c in raw_chunks
+        ]
 
     async def _store_chunk(
         self, chunk: FileChunkRecord, sem: asyncio.Semaphore
@@ -409,9 +424,6 @@ class ReaderAgent(BaseAgent):
         was kept in ``known_functions`` (dict-key collision).
         """
         try:
-            from startup.feature_matrix import is_available
-            if not is_available("tree_sitter_language_pack"):
-                return []
             from tree_sitter_language_pack import get_parser  # type: ignore
             lang_map = {
                 "python": "python", "c": "c", "cpp": "cpp",

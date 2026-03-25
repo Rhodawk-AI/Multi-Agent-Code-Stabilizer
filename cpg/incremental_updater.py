@@ -402,8 +402,9 @@ def _find_changed_functions_in_diff(original: str, new_content: str, file_path: 
 
 
 def _ts_changed_functions(original: str, new_content: str, file_path: str) -> list[str]:
-    from startup.feature_matrix import is_available
-    if not is_available("tree_sitter_language_pack"):
+    try:
+        from tree_sitter_language_pack import get_parser as _check_get_parser  # noqa: F401
+    except ImportError:
         raise RuntimeError("tree-sitter unavailable")
 
     ext      = Path(file_path).suffix.lower()
@@ -481,9 +482,25 @@ def _ts_changed_functions(original: str, new_content: str, file_path: str) -> li
         _walk(tree.root_node)
         return bodies
 
+    def _normalize(body: str) -> str:
+        """Strip trailing inline comments and whitespace for stable comparison."""
+        normalized = []
+        for line in body.splitlines():
+            stripped = line.rstrip()
+            # Remove trailing Python/C/JS single-line comments
+            for marker in ("#",):
+                idx = stripped.find(marker)
+                if idx >= 0:
+                    stripped = stripped[:idx].rstrip()
+            normalized.append(stripped)
+        return "\n".join(normalized).rstrip()
+
     orig_bodies = _extract_fn_bodies(original) if original else {}
     new_bodies  = _extract_fn_bodies(new_content)
-    changed = [fn for fn, body in new_bodies.items() if orig_bodies.get(fn) != body]
+    changed = [
+        fn for fn, body in new_bodies.items()
+        if _normalize(orig_bodies.get(fn, "")) != _normalize(body)
+    ]
     changed.extend(fn for fn in new_bodies if fn not in orig_bodies)
     return list(set(changed))
 
@@ -572,7 +589,9 @@ def _parse_unified_diff(diff_output: str) -> CommitDiff:
         re.compile(r"^\+[a-zA-Z_][\w\s\*:<>]+\s+(\w+)\s*\([^)]*\)\s*(?:\{|;)"),
     ]
     _skip_kw = {"if", "else", "for", "while", "class", "struct",
-                "namespace", "return", "switch", "case", "do", "try"}
+                "namespace", "return", "switch", "case", "do", "try",
+                "def", "async", "fn", "pub", "function", "func",
+                "void", "int", "static", "const", "auto", "inline"}
 
     def _add_fn(fp: str, name: str) -> None:
         if not name or name in _skip_kw:
@@ -608,8 +627,10 @@ def _parse_unified_diff(diff_output: str) -> CommitDiff:
             ctx = (hm.group(1) or "").strip()
             if ctx:
                 tokens = _fn_clean_re.findall(ctx)
-                if tokens:
-                    _add_fn(current_file, tokens[0])
+                for tok in tokens:
+                    if tok not in _skip_kw:
+                        _add_fn(current_file, tok)
+                        break
             continue
 
         # Diff body — secondary extraction for files without hunk context

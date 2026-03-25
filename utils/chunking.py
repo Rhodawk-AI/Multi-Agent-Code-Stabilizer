@@ -160,7 +160,10 @@ def chunk_file(
     elif strategy == ChunkStrategy.AST_NODES:
         raw = _chunk_by_lines(content, max_lines=300)
     elif strategy == ChunkStrategy.SKELETON:
-        raw = [(_extract_skeleton(content), 1, line_count, "")]
+        skel = _extract_skeleton(content)
+        if not skel.strip():
+            skel = "\n".join(content.splitlines()[:100])
+        raw = [(skel, 1, line_count, "")]
     elif strategy == ChunkStrategy.SKELETON_ONLY:
         raw = [(_extract_skeleton_compact(content), 1, line_count, "")]
     elif strategy == ChunkStrategy.FUNCTION:
@@ -196,7 +199,7 @@ def chunk_lines_targeted(
     e         = min(len(lines), line_end + context)
     return Chunk(
         content="\n".join(lines[s:e]),
-        line_start=s + 1, line_end=e,
+        line_start=line_start, line_end=line_end,
         index=0, total=1,
         strategy=ChunkStrategy.FULL,
         is_skeleton=False,

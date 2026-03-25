@@ -1,5 +1,33 @@
 language = "python3"
 run = "pytest tests/unit/ -v"
+modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
+packages = ["cargo", "libiconv", "libxcrypt", "libyaml", "openssl", "pkg-config", "postgresql", "rustc"]
+
+[agent]
+expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 -m pytest tests/unit/ --tb=short -q 2>&1; echo 'Tests complete'"
+
+[workflows.workflow.metadata]
+outputType = "console"

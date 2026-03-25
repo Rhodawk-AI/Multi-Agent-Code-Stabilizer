@@ -42,12 +42,13 @@ class PathTraversalError(ValueError):
 
 
 class GateFinding(BaseModel):
-    tool:      str = ""
-    rule:      str = ""
-    file_path: str = ""
-    line:      int = 0
-    message:   str = ""
-    severity:  str = "error"
+    tool:      str       = ""
+    rule:      str       = ""
+    file_path: str       = ""
+    line:      int       = 0
+    message:   str       = ""
+    severity:  str       = "error"
+    warnings:  list[str] = Field(default_factory=list)
 
 
 class GateResult(BaseModel):
@@ -56,6 +57,11 @@ class GateResult(BaseModel):
     findings:         list[GateFinding] = Field(default_factory=list)
     tools_run:        list[str]         = Field(default_factory=list)
     skipped_tools:    list[str]         = Field(default_factory=list)
+
+    @property
+    def results(self) -> list[GateFinding]:
+        """Alias for findings — backwards-compatible accessor."""
+        return self.findings
 
     def approve(self) -> None:
         """Set this result as approved."""
@@ -66,6 +72,14 @@ class GateResult(BaseModel):
         """Set this result as rejected with the given reason."""
         self.approved = False
         self.rejection_reason = reason
+
+
+class BracketCheckResult:
+    """Result of heuristic bracket balancing check."""
+
+    def __init__(self) -> None:
+        self.passed: bool = True
+        self.warnings: list[str] = []
 
 
 def validate_path_within_root(file_path: str, repo_root: Path) -> Path:
@@ -135,6 +149,16 @@ class StaticAnalysisGate:
             "FULL_FILE" → validate the complete file content.
             "UNIFIED_DIFF" → validate diff syntax only (file not yet written).
         """
+        # Path traversal check — must be first
+        try:
+            validate_path_within_root(file_path, self.repo_root)
+        except (PathTraversalError, ValueError):
+            return GateResult(
+                approved=False,
+                rejection_reason=f"Path traversal attempt detected: {file_path}",
+                tools_run=[],
+            )
+
         if patch_mode == "UNIFIED_DIFF":
             return await self._validate_diff_syntax(file_path, content)
 
@@ -200,6 +224,108 @@ class StaticAnalysisGate:
         findings: list[GateFinding] = []
         tools_run: list[str]   = []
         skipped:   list[str]   = []
+
+        # ── Empty / whitespace-only check ─────────────────────────────────────
+        if not content.strip():
+            return GateResult(
+                approved=False,
+                rejection_reason="Empty file — no content to validate",
+                tools_run=["empty-check"],
+            )
+
+        # ── AST-based invariant checks ────────────────────────────────────────
+        try:
+            import ast as _ast
+            _tree = _ast.parse(content)
+
+            # Bare except check
+            for _node in _ast.walk(_tree):
+                if isinstance(_node, _ast.ExceptHandler) and _node.type is None:
+                    return GateResult(
+                        approved=False,
+                        rejection_reason=(
+                            "bare except: catches all exceptions without specifying a type — "
+                            "use 'except Exception:' or a specific exception"
+                        ),
+                        tools_run=["ast"],
+                    )
+
+            # Universal dangerous pattern detection (ignores comments automatically)
+            _DANGEROUS_NAMES = {"eval", "exec", "__import__"}
+            _DANGEROUS_ATTRS = {("os", "system"), ("pickle", "loads")}
+            for _node in _ast.walk(_tree):
+                if isinstance(_node, _ast.Call):
+                    _func = _node.func
+                    if isinstance(_func, _ast.Name) and _func.id in _DANGEROUS_NAMES:
+                        return GateResult(
+                            approved=False,
+                            rejection_reason=(
+                                f"Dangerous pattern: {_func.id}() is forbidden — "
+                                "use safe alternatives"
+                            ),
+                            tools_run=["ast"],
+                        )
+                    if isinstance(_func, _ast.Attribute) and isinstance(_func.value, _ast.Name):
+                        if (_func.value.id, _func.attr) in _DANGEROUS_ATTRS:
+                            return GateResult(
+                                approved=False,
+                                rejection_reason=(
+                                    f"Dangerous pattern: {_func.value.id}.{_func.attr}() "
+                                    "is forbidden"
+                                ),
+                                tools_run=["ast"],
+                            )
+
+            # Domain-specific checks (Python)
+            _domain = self.domain_mode.upper()
+            if _domain == "FINANCE":
+                for _node in _ast.walk(_tree):
+                    if isinstance(_node, _ast.Call):
+                        _func = _node.func
+                        if isinstance(_func, _ast.Name) and _func.id == "float":
+                            return GateResult(
+                                approved=False,
+                                rejection_reason=(
+                                    "float() usage forbidden in finance domain — "
+                                    "use Decimal for monetary values"
+                                ),
+                                tools_run=["ast"],
+                            )
+                    if isinstance(_node, _ast.Attribute) and _node.attr == "md5":
+                        return GateResult(
+                            approved=False,
+                            rejection_reason=(
+                                "md5 hash forbidden in finance domain — "
+                                "use SHA-256 or stronger"
+                            ),
+                            tools_run=["ast"],
+                        )
+
+            if _domain == "MEDICAL":
+                for _node in _ast.walk(_tree):
+                    if isinstance(_node, _ast.Call):
+                        _func = _node.func
+                        if isinstance(_func, _ast.Name):
+                            if _func.id == "float":
+                                return GateResult(
+                                    approved=False,
+                                    rejection_reason=(
+                                        "float() forbidden for dosage in medical domain — "
+                                        "use Decimal"
+                                    ),
+                                    tools_run=["ast"],
+                                )
+                            if _func.id == "disable_alarm":
+                                return GateResult(
+                                    approved=False,
+                                    rejection_reason=(
+                                        "disable_alarm() is forbidden in medical domain"
+                                    ),
+                                    tools_run=["ast"],
+                                )
+
+        except SyntaxError:
+            pass  # Syntax errors are caught again below with proper reporting
 
         with tempfile.NamedTemporaryFile(
             suffix=".py", mode="w", encoding="utf-8",
@@ -333,6 +459,27 @@ class StaticAnalysisGate:
         tools_run: list[str]   = []
         skipped:   list[str]   = []
         ext = Path(file_path).suffix
+
+        # ── Domain-specific C/C++ pattern checks ──────────────────────────────
+        _domain = self.domain_mode.upper()
+        if _domain in {"MILITARY", "AEROSPACE", "NUCLEAR"}:
+            _MILITARY_FORBIDDEN = [
+                ("malloc", "malloc() is forbidden in military/safety domain — use static allocation"),
+                ("goto ", "goto is forbidden in military/safety domain"),
+                ("printf(", "printf() is forbidden in military/safety domain — use secure I/O"),
+                ("gets(", "gets() is universally forbidden — use fgets() instead"),
+            ]
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                    continue  # skip comment lines
+                for _pattern, _reason in _MILITARY_FORBIDDEN:
+                    if _pattern in line:
+                        return GateResult(
+                            approved=False,
+                            rejection_reason=_reason,
+                            tools_run=["domain-check"],
+                        )
 
         with tempfile.NamedTemporaryFile(
             suffix=ext, mode="w", encoding="utf-8",
@@ -507,14 +654,12 @@ class StaticAnalysisGate:
             ".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp",
             ".js": "javascript", ".ts": "typescript",
             ".rs": "rust", ".go": "go",
+            ".java": "java",
         }
         lang = ext_to_lang.get(ext)
         if not lang:
             return True  # Cannot check — assume OK
         try:
-            from startup.feature_matrix import is_available
-            if not is_available("tree_sitter_language_pack"):
-                return True
             from tree_sitter_language_pack import get_parser  # type: ignore
             parser = get_parser(lang)
             tree   = parser.parse(content.encode())
@@ -525,6 +670,42 @@ class StaticAnalysisGate:
     def _clang_tidy_checks(self) -> str:
         """Build the clang-tidy check selection for the current domain."""
         base = "clang-analyzer-*,bugprone-*,cert-*,performance-*"
-        if self.domain_mode in {"MILITARY", "AEROSPACE", "NUCLEAR"}:
+        if self.domain_mode.upper() in {"MILITARY", "AEROSPACE", "NUCLEAR"}:
             base += ",readability-*,portability-*,hicpp-*"
         return base
+
+    def _heuristic_bracket_check(self, content: str, ext: str) -> BracketCheckResult:
+        """
+        Heuristic bracket balance check for languages without tree-sitter support.
+        Counts opening/closing bracket pairs and flags imbalances as warnings.
+        """
+        result = BracketCheckResult()
+        opens  = content.count("(") + content.count("{") + content.count("[")
+        closes = content.count(")") + content.count("}") + content.count("]")
+        if opens > closes:
+            result.passed = False
+            result.warnings.append(
+                f"Unbalanced brackets: {opens} opening > {closes} closing"
+            )
+        elif closes > opens:
+            result.passed = False
+            result.warnings.append(
+                f"Unbalanced brackets: {closes} closing > {opens} opening"
+            )
+        return result
+
+    async def validate_batch(
+        self,
+        files: list[tuple[str, str]],
+    ) -> dict[str, GateResult]:
+        """
+        Validate multiple (file_path, content) pairs in sequence.
+        Each file is validated independently; a failure in one does not
+        block others.  Returns a dict mapping file_path → GateResult.
+        """
+        if not files:
+            return {}
+        results: dict[str, GateResult] = {}
+        for file_path, content in files:
+            results[file_path] = await self.validate(file_path, content)
+        return results

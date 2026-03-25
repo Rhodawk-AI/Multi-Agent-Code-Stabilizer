@@ -142,8 +142,9 @@ class FixerAgent(BaseAgent):
 
     async def _extract_file_symbols(self, file_path: str) -> set[str]:
         try:
-            from startup.feature_matrix import is_available
-            if not is_available('tree_sitter_language_pack'):
+            try:
+                from tree_sitter_language_pack import get_parser as _ts_check  # noqa: F401
+            except ImportError:
                 return set()
             content = await self._load_file(file_path)
             if not content:
@@ -174,7 +175,7 @@ class FixerAgent(BaseAgent):
     async def _fix_group(self, file_key: frozenset[str], issues: list) -> FixAttempt:
         file_paths = list(file_key)
         has_critical = any((i.severity == Severity.CRITICAL for i in issues))
-        model = self.config.critical_fix_model if has_critical and self.config else self.config.primary_model if self.config else ''
+        model = self.config.critical_fix_model if has_critical and self.config else self.config.model if self.config else ''
         file_contents: dict[str, str] = {}
         patch_modes: dict[str, PatchMode] = {}
         for fp in file_paths:
@@ -213,15 +214,24 @@ class FixerAgent(BaseAgent):
 
             if stub_blast is None:
                 from cpg.cpg_engine import CPGBlastRadius
+                try:
+                    _cs = float(recurrence_signal.coupling_score)
+                except (TypeError, ValueError):
+                    _cs = -1.0
                 stub_blast = CPGBlastRadius(
                     changed_functions=all_symbols or file_paths,
-                    blast_radius_score=recurrence_signal.coupling_score
-                    if recurrence_signal.coupling_score >= 0 else 0.0,
+                    blast_radius_score=_cs if _cs >= 0 else 0.0,
                     requires_human_review=True,
                 )
 
-            has_recurrence = recurrence_signal.recurrence_count >= _RECURRENCE_ESCALATION_THRESHOLD
-            has_coupling   = recurrence_signal.distinct_caller_modules >= _COUPLING_MODULE_THRESHOLD
+            try:
+                has_recurrence = int(recurrence_signal.recurrence_count) >= _RECURRENCE_ESCALATION_THRESHOLD
+            except (TypeError, ValueError):
+                has_recurrence = False
+            try:
+                has_coupling = int(recurrence_signal.distinct_caller_modules) >= _COUPLING_MODULE_THRESHOLD
+            except (TypeError, ValueError):
+                has_coupling = False
             if has_recurrence and has_coupling:
                 trigger = 'combined'
             elif has_recurrence:
@@ -410,8 +420,10 @@ class FixerAgent(BaseAgent):
                     function_names=function_names,
                     coupling_module_threshold=_COUPLING_MODULE_THRESHOLD,
                 )
-                signal.coupling_score          = coupling.get('coupling_score', -1.0)
-                signal.distinct_caller_modules = coupling.get('distinct_caller_modules', 0)
+                if not isinstance(coupling, dict):
+                    raise TypeError(f"compute_coupling_smell returned non-dict: {type(coupling)}")
+                signal.coupling_score          = float(coupling.get('coupling_score', -1.0))
+                signal.distinct_caller_modules = int(coupling.get('distinct_caller_modules', 0))
 
                 if coupling.get('is_smell', False):
                     dominant = coupling.get('dominant_caller_module', '')
@@ -508,6 +520,8 @@ class FixerAgent(BaseAgent):
                                 bare_name=sym,
                                 file_path=fp,
                             )
+                            if not isinstance(fqns, (list, tuple)):
+                                fqns = []
                             for fqn in fqns:
                                 if fqn and fqn not in function_names:
                                     function_names.append(fqn)
@@ -526,6 +540,19 @@ class FixerAgent(BaseAgent):
                     Path(fp).with_suffix('').as_posix().replace('/', '.')
                     for fp in file_paths
                 ]
+            else:
+                # ARCH-02: always add module-qualified names alongside bare names so
+                # that both cpg.method.name(<bare>) and cpg.method.filter(_.fullName)
+                # lookup paths are covered, even when resolve_method_fqn() is
+                # unavailable.  Example: "process_payment" in
+                # "services/payment_service.py" → "services.payment_service.process_payment"
+                for fp in file_paths:
+                    module_prefix = Path(fp).with_suffix('').as_posix().replace('/', '.')
+                    syms = await self._extract_file_symbols(fp)
+                    for sym in sorted(syms)[:20]:
+                        qualified = f"{module_prefix}.{sym}"
+                        if qualified not in function_names:
+                            function_names.append(qualified)
 
             blast = await self.cpg_engine.compute_blast_radius(function_names=function_names, file_paths=file_paths, depth=3)
 

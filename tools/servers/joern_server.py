@@ -9,6 +9,12 @@ log = logging.getLogger(__name__)
 
 _JOERN_URL = os.environ.get("JOERN_URL", "http://localhost:8080")
 
+try:
+    from cpg.joern_client import get_joern_client
+except Exception:
+    def get_joern_client(base_url: str = _JOERN_URL):  # type: ignore[misc]
+        raise RuntimeError("cpg.joern_client not available")
+
 
 async def cpg_get_callers(function_name: str, depth: int = 1) -> dict:
     from cpg.joern_client import get_joern_client
@@ -163,7 +169,6 @@ async def cpg_type_flows(
         total           — len(all_callers)
         function        — the function queried
     """
-    from cpg.joern_client import get_joern_client
     client = get_joern_client(base_url=_JOERN_URL)
     if not client.is_ready:
         await client.connect()

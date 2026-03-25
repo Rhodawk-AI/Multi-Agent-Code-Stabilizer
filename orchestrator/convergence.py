@@ -42,6 +42,7 @@ class ConvergenceDetector:
         self.stable_window        = stable_window
         self.regression_threshold = regression_threshold
         self._recent_scores: deque[float] = deque(maxlen=stable_window)
+        self._had_criticals: bool = False
 
     def check(
         self,
@@ -62,6 +63,8 @@ class ConvergenceDetector:
             Score from the active baseline, for regression comparison.
         """
         self._recent_scores.append(score.score)
+        if score.critical_count > 0:
+            self._had_criticals = True
 
         # Max cycles exhausted
         if cycle >= self.max_cycles:
@@ -99,12 +102,20 @@ class ConvergenceDetector:
                     converged=True, halt_reason="score_stable",
                 )
 
-        # Zero open CRITICAL issues → converged
+        # Zero open CRITICAL issues after sufficient cycles → converged.
+        # Guard: if the score window shows strict improvement (still decreasing),
+        # keep running — convergence is only declared once improvement plateaus.
         if score.critical_count == 0 and cycle > 2:
-            return ConvergenceRecord(
-                run_id=score.run_id, cycle=cycle, score=score.score,
-                converged=True, halt_reason="zero_critical_issues",
+            _window = list(self._recent_scores)
+            _still_improving = (
+                len(_window) >= 2
+                and all(_window[i] > _window[i + 1] for i in range(len(_window) - 1))
             )
+            if not _still_improving:
+                return ConvergenceRecord(
+                    run_id=score.run_id, cycle=cycle, score=score.score,
+                    converged=True, halt_reason="zero_critical_issues",
+                )
 
         return ConvergenceRecord(
             run_id=score.run_id, cycle=cycle, score=score.score,

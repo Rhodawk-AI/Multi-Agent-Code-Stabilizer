@@ -131,12 +131,12 @@ CREATE INDEX IF NOT EXISTS idx_chunks_run       ON file_chunks(run_id);
 
 CREATE TABLE IF NOT EXISTS issues (
     id                      TEXT PRIMARY KEY,
-    run_id                  TEXT REFERENCES audit_runs(id),
+    run_id                  TEXT,
     severity                TEXT NOT NULL,
     file_path               TEXT NOT NULL,
     line_start              INTEGER DEFAULT 0,
     line_end                INTEGER DEFAULT 0,
-    executor_type           TEXT NOT NULL,
+    executor_type           TEXT,
     master_prompt_section   TEXT DEFAULT '',
     description             TEXT NOT NULL,
     fix_requires_files      TEXT DEFAULT '[]',
@@ -612,6 +612,16 @@ class SQLiteBrainStorage(BrainStorage):
             await self._db.close()
             self._db = None
 
+    def __del__(self) -> None:
+        if self._db is not None:
+            try:
+                self._db.stop()
+            except Exception:
+                pass
+            finally:
+                self._db = None
+
+
                                                                                
     async def upsert_run(self, run: AuditRun) -> None:
         async with self._write() as db:
@@ -642,7 +652,7 @@ class SQLiteBrainStorage(BrainStorage):
                 int(run.graph_built),
                 json.dumps(run.metadata),
                 run.started_at.isoformat(),
-                run.completed_at.isoformat() if run.completed_at else None,
+                run.finished_at.isoformat() if run.finished_at else None,
             ))
             await db.commit()
 
@@ -680,6 +690,7 @@ class SQLiteBrainStorage(BrainStorage):
             graph_built=graph_built,
             metadata=json.loads(row["metadata"] or "{}"),
             started_at=_require_dt(row["started_at"]),
+            finished_at=_parse_dt(row["completed_at"]),
             completed_at=_parse_dt(row["completed_at"]),
         )
 
@@ -1030,7 +1041,7 @@ class SQLiteBrainStorage(BrainStorage):
                 issue.id, issue.run_id,
                 issue.severity.value,
                 issue.file_path, issue.line_start, issue.line_end,
-                issue.executor_type.value,
+                issue.executor_type.value if issue.executor_type is not None else None,
                 issue.master_prompt_section,
                 issue.description,
                 json.dumps(issue.fix_requires_files),
@@ -1091,7 +1102,7 @@ class SQLiteBrainStorage(BrainStorage):
             file_path=row["file_path"],
             line_start=row["line_start"],
             line_end=row["line_end"],
-            executor_type=ExecutorType(row["executor_type"]),
+            executor_type=ExecutorType(row["executor_type"]) if row["executor_type"] else None,
             master_prompt_section=row["master_prompt_section"] or "",
             description=row["description"],
             fix_requires_files=json.loads(row["fix_requires_files"] or "[]"),
@@ -1470,6 +1481,9 @@ class SQLiteBrainStorage(BrainStorage):
                 ]
 
                                                                                 
+    async def upsert_formal_result(self, result: FormalVerificationResult) -> None:
+        await self.store_formal_result(result)
+
     async def upsert_test_result(self, result: TestRunResult) -> None:
         async with self._write() as db:
             await db.execute("""
