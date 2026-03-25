@@ -717,8 +717,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             pass
         return None
 
-    async def upsert_synthesis_report(self, report: 'SynthesisReport') -> None:
-        from brain.schemas import SynthesisReport as _SR
+    async def upsert_synthesis_report(self, report: SynthesisReport) -> None:
+        from brain.schemas import SynthesisReport
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.upsert_synthesis_report(report)
@@ -732,8 +732,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             if self._fallback:
                 await self._fallback.upsert_synthesis_report(report)
 
-    async def get_synthesis_report(self, run_id: str, cycle: int | None=None) -> 'SynthesisReport | None':
-        from brain.schemas import SynthesisReport as _SR
+    async def get_synthesis_report(self, run_id: str, cycle: int | None=None) -> SynthesisReport | None:
+        from brain.schemas import SynthesisReport
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.get_synthesis_report(run_id, cycle)
@@ -755,8 +755,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
                 return await self._fallback.get_synthesis_report(run_id, cycle)
             return None
 
-    async def list_synthesis_reports(self, run_id: str | None=None) -> 'list[SynthesisReport]':
-        from brain.schemas import SynthesisReport as _SR
+    async def list_synthesis_reports(self, run_id: str | None=None) -> list[SynthesisReport]:
+        from brain.schemas import SynthesisReport
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.list_synthesis_reports(run_id)
@@ -805,8 +805,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
                 return await self._fallback.list_compound_findings(run_id=run_id, severity=severity)
             return []
 
-    async def upsert_convergence_record(self, record: 'ConvergenceRecord') -> None:
-        from brain.schemas import ConvergenceRecord as _CR
+    async def upsert_convergence_record(self, record: ConvergenceRecord) -> None:
+        from brain.schemas import ConvergenceRecord
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.upsert_convergence_record(record)
@@ -820,8 +820,8 @@ def get_storage(db_path: str='.stabilizer/brain.db') -> BrainStorage:
             if self._fallback:
                 await self._fallback.upsert_convergence_record(record)
 
-    async def list_convergence_records(self, run_id: str) -> list['ConvergenceRecord']:
-        from brain.schemas import ConvergenceRecord as _CR
+    async def list_convergence_records(self, run_id: str) -> list[ConvergenceRecord]:
+        from brain.schemas import ConvergenceRecord
         if not _PG_AVAILABLE or not self._engine:
             if self._fallback:
                 return await self._fallback.list_convergence_records(run_id)
