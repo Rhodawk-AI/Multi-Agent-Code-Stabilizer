@@ -46,16 +46,19 @@
 > when Granite 4.0 ships.
 
 
-| Benchmark          | Target (untested) | Baseline (Claude Code) |
-|--------------------|-------------------|------------------------|
-| SWE-bench Verified | **≥85%** *        | 80.9%                  |
-| Terminal-Bench 2.0 | **≥75%** *        | 65.4%                  |
-| FLTEval (formal)   | **26.3%** *       | N/A                    |
-| Cost per issue     | **<$0.30** *      | ~$2.00                 |
+| Benchmark          | Target | Realistic Estimate | Baseline (Claude Code) |
+|--------------------|--------|--------------------|-----------------------|
+| SWE-bench Verified | ≥85% | **60–73%** | 80.9% |
+| Terminal-Bench 2.0 | ≥75% | **55–65%** | 65.4% |
+| FLTEval (formal)   | 26.3% | **~20%** | N/A |
+| Cost per issue     | <$0.30 | **$0.15–$0.50** | ~$2.00 |
 
-\* *Design targets only. Not independently measured. Actual performance depends
-on model availability, CPG integration, and Gap 5 ensemble configuration.
-Without CPG (Joern) and BoBN ensemble, expect 15-20pp lower than targets.*
+**Status: NO EVALUATION HAS BEEN RUN.** All numbers in this table are
+engineering estimates based on component ablation studies (Agent S3 BoBN
+paper, Qwen2.5-Coder benchmarks, CBMC coverage literature). The "Target"
+column is aspirational; the "Realistic Estimate" column reflects what we
+expect without ARPO fine-tuning or CPG integration. To obtain an actual
+measured score, run: `rhodawk-bench run --limit 50`
 
 ## Positioning
 

@@ -277,6 +277,7 @@ def create_app() -> FastAPI:
         ("api.routes.refactor_proposals", "router", ""),
         ("api.routes.commits",           "router", ""),
         ("api.routes.auth",              "router", ""),
+        ("api.routes.github_webhook",    "router", "/api"),
     ]
     for module_name, attr, prefix in route_configs:
         try:

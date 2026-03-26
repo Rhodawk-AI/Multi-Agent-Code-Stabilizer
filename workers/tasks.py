@@ -67,6 +67,13 @@ try:
         worker error alerting (Sentry, PagerDuty, etc.).
         """
         async def _approve() -> dict:
+            import os as _os
+            if not _os.environ.get("DATABASE_URL") and not _os.environ.get("RHODAWK_PG_DSN"):
+                raise RuntimeError(
+                    "DATABASE_URL or RHODAWK_PG_DSN must be set for "
+                    "escalation approval in production. Cannot connect to "
+                    "shared storage without a database connection string."
+                )
             from config.loader import load_config
             cfg = load_config()
             from orchestrator.controller import StabilizerController

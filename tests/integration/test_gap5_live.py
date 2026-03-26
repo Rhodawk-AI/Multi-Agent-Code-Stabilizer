@@ -82,7 +82,7 @@ def test_adversarial_critic_scores_candidate():
 @skipif_no_model
 @pytest.mark.integration
 def test_model_router_returns_valid_config():
-    from models.router import ModelRouter, BOBN_FIXER_A_COUNT, BOBN_FIXER_B_COUNT
+    from models.router import TieredModelRouter, BOBN_FIXER_A_COUNT, BOBN_FIXER_B_COUNT
 
     assert BOBN_FIXER_A_COUNT >= 1, "Must have at least 1 Fixer A candidate"
     assert BOBN_FIXER_B_COUNT >= 1, "Must have at least 1 Fixer B candidate"
@@ -90,9 +90,9 @@ def test_model_router_returns_valid_config():
         "BoBN requires at least 2 total candidates for meaningful comparison"
     )
 
-    router = ModelRouter()
-    temps_a = router.get_fixer_a_temperatures()
-    temps_b = router.get_fixer_b_temperatures()
+    router = TieredModelRouter()
+    temps_a = router.fixer_a_temperatures()
+    temps_b = router.fixer_b_temperatures()
     assert len(temps_a) == BOBN_FIXER_A_COUNT
     assert len(temps_b) == BOBN_FIXER_B_COUNT
     for t in temps_a + temps_b:

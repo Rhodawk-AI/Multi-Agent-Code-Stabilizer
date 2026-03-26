@@ -79,7 +79,7 @@ async def create_run(
     if hasattr(app_state, "storage") and app_state.storage is None:
         app_state.storage = controller._storage
 
-    # Launch in background with a done-callback to update run status.
+    # Launch in background with a done-callback to clean up controller reference.
     task = asyncio.create_task(controller.stabilize())
 
     def _on_done(t: asyncio.Task) -> None:
@@ -93,6 +93,9 @@ async def create_run(
             log.warning(f"Run {run.id[:8]} was cancelled")
         ctrls = getattr(app_state, "controllers", {})
         ctrls.pop(run.id, None)
+        log.info(
+            f"Run {run.id[:8]} cleaned up. Active controllers: {len(ctrls)}"
+        )
 
     task.add_done_callback(_on_done)
 
