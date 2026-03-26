@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
-from pydantic import BaseModel, Field, model_validator, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
@@ -751,6 +751,7 @@ class AuditScore(BaseModel):
     cycle_number: int = 0
     critical_count: int = 0
     major_count: int = 0
+    medium_count: int = 0
     minor_count: int = 0
     info_count: int = 0
     escalated_count: int = 0
@@ -764,11 +765,15 @@ class AuditScore(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
     def compute_score(self) -> None:
-        self.total_issues = self.critical_count + self.major_count + self.minor_count + self.info_count
+        self.total_issues = (
+            self.critical_count + self.major_count + self.medium_count
+            + self.minor_count + self.info_count
+        )
         c_pen = min(self.critical_count * 15, 60)
-        m_pen = min(self.major_count * 5, 30)
+        maj_pen = min(self.major_count * 5, 30)
+        med_pen = min(self.medium_count * 3, 20)
         n_pen = min(self.minor_count * 1, 10)
-        self.score = max(0.0, 100.0 - c_pen - m_pen - n_pen)
+        self.score = max(0.0, 100.0 - c_pen - maj_pen - med_pen - n_pen)
 
 class ConsensusVote(BaseModel):
     agent: ExecutorType = ExecutorType.GENERAL

@@ -96,15 +96,15 @@ class StabilizerConfig(BaseModel):
     github_token:        str           = ""
     # Model routing — Qwen2.5-Coder-32B via vLLM local; override with env RHODAWK_PRIMARY_MODEL
     primary_model:       str           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
-    critical_fix_model:  str           = "openrouter/meta-llama/llama-4"
-    triage_model:        str           = "ollama/granite4-tiny"
+    critical_fix_model:  str           = "openrouter/meta-llama/llama-4-scout"
+    triage_model:        str           = "ollama/granite-code:3b"
     reviewer_model:      str           = "ollama/qwen2.5-coder:32b"
     fallback_models:     list[str]     = Field(default_factory=lambda: [
         "ollama/qwen2.5-coder:32b",
-        "openrouter/mistralai/devstral-2",
-        "claude-sonnet-4-20250514",
+        "openrouter/mistralai/devstral-small",
+        "claude-sonnet-4-6",
     ])
-    vllm_base_url:       str           = "http://localhost:8000/v1"
+    vllm_base_url:       str           = "http://localhost:8001/v1"
     # Run limits
     # DEMO-02 FIX: max_cycles unified to 200. Was 50 here while run.py defaulted
     # to 200, meaning API-path deployments silently got 4× fewer cycles than
@@ -131,7 +131,7 @@ class StabilizerConfig(BaseModel):
     formal_verification: bool          = False
     run_tests_after_fix: bool          = True
     # Storage
-    use_sqlite:          bool          = False
+    use_sqlite:          bool          = True
     postgres_dsn:        str           = ""
     # Vector store
     vector_store_enabled: bool         = False
@@ -200,7 +200,7 @@ class StabilizerConfig(BaseModel):
     #
     # Override with: RHODAWK_SYNTHESIS_MODEL env var or synthesis_model in
     # the [synthesis] section of your config TOML.
-    synthesis_model:            str    = ""
+    synthesis_model:            str    = "openrouter/deepseek/deepseek-coder-v2-0724"
     synthesis_max_compound:     int    = 20
     # ── Gap 5: Multi-Intelligence / Adversarial Ensemble (BoBN pipeline) ─────
     # Master switch.  When False the existing single-fixer path is used unchanged.
@@ -209,7 +209,7 @@ class StabilizerConfig(BaseModel):
     # DEFAULT ON: Gap 5 is now the standard fix path.  Set RHODAWK_GAP5_ENABLED=false
     # (or gap5_enabled=False in config) only if you lack the GPU/API budget for the
     # secondary vLLM endpoint and adversarial critic tier.
-    gap5_enabled:               bool   = True
+    gap5_enabled:               bool   = False
     # vLLM endpoint for Fixer B (DeepSeek-Coder-V2-Lite-16B).
     # Run alongside primary on a second GPU partition / port.
     # Override: VLLM_SECONDARY_BASE_URL
@@ -3382,6 +3382,7 @@ class StabilizerController:
             cycle_number=self.run.cycle_count,
             critical_count=counts.get(Severity.CRITICAL, 0),
             major_count=counts.get(Severity.MAJOR, 0),
+            medium_count=counts.get(Severity.MEDIUM, 0),
             minor_count=counts.get(Severity.MINOR, 0),
             info_count=counts.get(Severity.INFO, 0),
             misra_open=sum(

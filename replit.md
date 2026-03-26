@@ -65,6 +65,19 @@ All secrets are managed via Replit's Secrets panel. Key environment variables:
 - **z3-solver** — Formal verification
 - **Semgrep, Ruff, Bandit, Mypy** — Static analysis tools
 
+## Stabilization Status (March 2026)
+
+Full adversarial review (46 findings across 130 files) was completed and all critical bugs fixed:
+
+- **BLOCK-01–08**: Phantom model tags, vLLM port collision, `use_sqlite=True` default, `gap5_enabled=False` safe default, synthesis model default, `/auth/token` endpoint created
+- **BUG-01–08**: AuditScore medium_count, rate_limiter in BaseAgent, duplicate import, adversarial critic timeout, Celery error handling
+- **ARCH-07**: PostgresBrainStorage error messaging improved
+- **SEC-05**: MAX_CONCURRENT_RUNS=50 cap
+- **DEMO-03**: Lean4 stub warning
+- **MISSING-04**: SAS dynamic objectives from run data
+
+All 15 unit test files pass at 100% (agents, brain, chunking, consensus, convergence, cpg, execution_feedback, executor, gap3, gap4, gap5, gap6, graph, synthesis).
+
 ## Review Documents
 
 - **`ADVERSARIAL_REVIEW.md`** — Hostile technical review of the entire codebase (46 findings, 130 files analyzed). Covers BLOCK bugs, security issues, SWE-bench ceiling analysis, and DO-178C compliance gaps.

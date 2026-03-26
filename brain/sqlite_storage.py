@@ -2030,6 +2030,17 @@ class SQLiteBrainStorage(BrainStorage):
             except Exception:
                 pass
 
+    async def clear_file_staleness_marks(self, file_path: str) -> None:
+        async with self._write() as db:
+            try:
+                await db.execute(
+                    "DELETE FROM function_staleness WHERE file_path=?",
+                    (file_path,),
+                )
+                await db.commit()
+            except Exception:
+                pass
+
     # ── Commit-audit records (Gap 4) ─────────────────────────────────────────
 
     async def upsert_commit_audit_record(self, record: "CommitAuditRecord") -> None:  # type: ignore[override]

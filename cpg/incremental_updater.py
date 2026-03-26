@@ -544,15 +544,20 @@ def _regex_changed_functions(original: str, new_content: str, file_path: str) ->
 
     for diff_line in diff_lines:
         if diff_line.startswith("@@"):
-            m = re.search(r"\+(\d+)", diff_line)
+            m = re.search(r"\+(\d+)(?:,(\d+))?", diff_line)
             if m:
                 new_line_no = int(m.group(1)) - 1
+                hunk_len = int(m.group(2)) if m.group(2) else 1
                 for j in range(new_line_no, max(-1, new_line_no - 50), -1):
                     if 0 <= j < len(new_lines_list):
                         fn_m = pat.match(new_lines_list[j])
                         if fn_m:
                             changed_fns.add(fn_m.group(1))
                             break
+                for j in range(new_line_no, min(len(new_lines_list), new_line_no + hunk_len + 1)):
+                    fn_m = pat.match(new_lines_list[j])
+                    if fn_m:
+                        changed_fns.add(fn_m.group(1))
     return list(changed_fns)
 
 

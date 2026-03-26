@@ -49,12 +49,72 @@ class SASGenerator:
         cwe_open     = sum(1 for i in issues if i.cwe_id and i.status.value not in ("CLOSED","DEFERRED"))
         cwe_closed   = sum(1 for i in issues if i.cwe_id and i.status.value == "CLOSED")
 
-        do178c_met  = ["Table A-7 Obj 5 — Source code standards verification (partial)"]
-        do178c_open = [
-            "Table A-4 — High-level requirements accuracy (requires human review)",
-            "Table A-5 — Traceability (RTM partially populated — expand requirement_id coverage)",
-            "Table A-7 Obj 6 — Absence of unintended functions (requires path coverage analysis)",
-        ]
+        do178c_met:  list[str] = []
+        do178c_open: list[str] = []
+
+        has_misra = misra_closed > 0 or misra_open > 0
+        has_traceability = any(
+            getattr(i, "requirement_id", "") for i in issues
+        )
+        has_formal = any(
+            e.event_type in ("formal_verification", "cbmc_verification")
+            for e in trail
+        )
+        has_test_coverage = any(
+            e.event_type == "test_run" for e in trail
+        )
+        has_reviews = any(
+            e.event_type in ("review", "consensus_vote") for e in trail
+        )
+        critical_open = sum(
+            1 for i in issues
+            if i.severity == Severity.CRITICAL
+            and i.status.value not in ("CLOSED", "DEFERRED")
+        )
+
+        if has_misra and misra_open == 0:
+            do178c_met.append(
+                "Table A-7 Obj 5 — Source code standards verification (all MISRA findings closed)"
+            )
+        elif has_misra:
+            do178c_open.append(
+                f"Table A-7 Obj 5 — Source code standards verification ({misra_open} MISRA findings open)"
+            )
+        else:
+            do178c_open.append(
+                "Table A-7 Obj 5 — Source code standards verification (not assessed — no MISRA analysis run)"
+            )
+
+        if has_traceability:
+            traced = sum(1 for i in issues if getattr(i, "requirement_id", ""))
+            if traced >= len(issues) * 0.8:
+                do178c_met.append("Table A-5 — Traceability (requirements traced)")
+            else:
+                do178c_open.append(
+                    f"Table A-5 — Traceability ({traced}/{len(issues)} issues traced — expand coverage)"
+                )
+        else:
+            do178c_open.append("Table A-5 — Traceability (no requirement_id links found)")
+
+        do178c_open.append(
+            "Table A-4 — High-level requirements accuracy (requires human DER review)"
+        )
+
+        if has_formal:
+            do178c_met.append("Table A-7 Obj 7 — Formal methods applied")
+        else:
+            do178c_open.append(
+                "Table A-7 Obj 7 — Formal methods (CBMC/Z3 not applied in this run)"
+            )
+
+        if has_test_coverage:
+            do178c_met.append("Table A-6 Obj 3 — Test execution completed")
+        else:
+            do178c_open.append("Table A-6 Obj 3 — Test execution (no test runs recorded)")
+
+        do178c_open.append(
+            "Table A-7 Obj 6 — Absence of unintended functions (requires structural coverage analysis)"
+        )
 
         sas = SoftwareAccomplishmentSummary(
             baseline_id=baseline_id,

@@ -293,6 +293,7 @@ def create_app() -> FastAPI:
         ("api.routes.compound_findings", "router", ""),
         ("api.routes.refactor_proposals", "router", ""),
         ("api.routes.commits",           "router", ""),
+        ("api.routes.auth",              "router", ""),
     ]
     for module_name, attr, prefix in route_configs:
         try:

@@ -297,11 +297,10 @@ class ReaderAgent(BaseAgent):
             record.stale_functions = []
             await self.storage.upsert_file(record)
 
-            # GAP 4 FIX: clear without run_id filter for the same reason we
-            # query without it — marks from any run should be consumed once
-            # the file has been re-read.
             for fn_name in record.known_functions:
                 await self.storage.clear_staleness_mark(rel_path, fn_name)
+            if hasattr(self.storage, 'clear_file_staleness_marks'):
+                await self.storage.clear_file_staleness_marks(rel_path)
 
             return record
 
@@ -471,4 +470,42 @@ class ReaderAgent(BaseAgent):
             _walk(tree.root_node)
             return names
         except Exception:
-            return []
+            pass
+        import re as _re
+        if language == "python":
+            cls_re = _re.compile(r"^(\s*)class\s+(\w+)")
+            def_re = _re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)")
+            lines = content.split("\n")
+            class_stack: list[tuple[int, str]] = []
+            qualified_names: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                indent = len(line) - len(line.lstrip())
+                while class_stack and indent <= class_stack[-1][0]:
+                    class_stack.pop()
+                cm = cls_re.match(line)
+                if cm:
+                    class_stack.append((indent, cm.group(2)))
+                    continue
+                dm = def_re.match(line)
+                if dm:
+                    fn_name = dm.group(2)
+                    if class_stack:
+                        qualified_names.append(f"{class_stack[-1][1]}.{fn_name}")
+                    else:
+                        qualified_names.append(fn_name)
+            return qualified_names
+        _OTHER_PATTERNS = {
+            "c": _re.compile(r"^[a-zA-Z_][\w\s\*]+\s+(\w+)\s*\(", _re.MULTILINE),
+            "cpp": _re.compile(r"^[a-zA-Z_][\w:\s\*<>]+\s+(\w+)\s*\(", _re.MULTILINE),
+            "javascript": _re.compile(r"(?:^|\s)(?:async\s+)?function\s+(\w+)\s*\(", _re.MULTILINE),
+            "typescript": _re.compile(r"(?:^|\s)(?:async\s+)?function\s+(\w+)\s*[(<]", _re.MULTILINE),
+            "rust": _re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", _re.MULTILINE),
+            "go": _re.compile(r"^\s*func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(", _re.MULTILINE),
+        }
+        pat = _OTHER_PATTERNS.get(language)
+        if pat:
+            return list(pat.findall(content))
+        return []

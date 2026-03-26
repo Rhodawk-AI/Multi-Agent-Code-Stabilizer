@@ -833,7 +833,7 @@ class TestControllerGap2Integration:
         assert hasattr(cfg, "synthesis_compound_enabled")
         assert cfg.synthesis_compound_enabled is True
         assert hasattr(cfg, "synthesis_model")
-        assert cfg.synthesis_model == ""
+        assert cfg.synthesis_model == "openrouter/deepseek/deepseek-coder-v2-0724"
         assert hasattr(cfg, "synthesis_max_compound")
         assert cfg.synthesis_max_compound == 20
 

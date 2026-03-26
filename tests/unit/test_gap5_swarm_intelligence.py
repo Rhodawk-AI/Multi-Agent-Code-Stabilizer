@@ -969,12 +969,9 @@ class TestGap5ControllerConfig:
             **overrides,
         )
 
-    def test_gap5_enabled_by_default(self):
-        # Gap 5 is ON by default in StabilizerConfig (gap5_enabled=True).
-        # The default.toml sets enabled=false for operators who want it off;
-        # direct Python construction gets the production default which is True.
+    def test_gap5_disabled_by_default(self):
         cfg = self._make_config()
-        assert cfg.gap5_enabled is True
+        assert cfg.gap5_enabled is False
 
     def test_gap5_can_be_enabled(self):
         cfg = self._make_config(gap5_enabled=True)

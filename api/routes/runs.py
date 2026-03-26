@@ -59,6 +59,13 @@ async def create_run(
     app_state = request.app.state
     if not hasattr(app_state, "controllers"):
         app_state.controllers = {}
+    MAX_CONCURRENT_RUNS = 50
+    if len(app_state.controllers) >= MAX_CONCURRENT_RUNS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Maximum concurrent runs ({MAX_CONCURRENT_RUNS}) reached. "
+                   f"Wait for an existing run to complete.",
+        )
     app_state.controllers[run.id] = controller
 
     # Also inject storage into app state for the /health and other endpoints.

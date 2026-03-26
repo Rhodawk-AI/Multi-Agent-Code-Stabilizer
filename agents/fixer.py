@@ -142,32 +142,48 @@ class FixerAgent(BaseAgent):
 
     async def _extract_file_symbols(self, file_path: str) -> set[str]:
         try:
-            try:
-                from tree_sitter_language_pack import get_parser as _ts_check  # noqa: F401
-            except ImportError:
-                return set()
             content = await self._load_file(file_path)
             if not content:
                 return set()
-            ext = Path(file_path).suffix.lower()
-            lang_map = {'.py': 'python', '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.hpp': 'cpp', '.js': 'javascript', '.ts': 'typescript', '.rs': 'rust', '.go': 'go'}
-            lang = lang_map.get(ext)
-            if not lang:
-                return set()
-            from tree_sitter_language_pack import get_parser
-            parser = get_parser(lang)
-            tree = parser.parse(content.encode())
-            symbols: set[str] = set()
+            try:
+                from tree_sitter_language_pack import get_parser as _ts_check  # noqa: F401
+                ext = Path(file_path).suffix.lower()
+                lang_map = {'.py': 'python', '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.hpp': 'cpp', '.js': 'javascript', '.ts': 'typescript', '.rs': 'rust', '.go': 'go'}
+                lang = lang_map.get(ext)
+                if lang:
+                    from tree_sitter_language_pack import get_parser
+                    parser = get_parser(lang)
+                    tree = parser.parse(content.encode())
+                    symbols: set[str] = set()
 
-            def _walk(node) -> None:
-                if node.type in {'function_definition', 'function_declaration', 'method_definition', 'function_item', 'class_definition', 'struct_item', 'struct_specifier', 'enum_specifier', 'typedef_declaration'}:
-                    for child in node.children:
-                        if child.type in {'identifier', 'name', 'field_identifier'}:
-                            symbols.add(child.text.decode(errors='replace'))
-                for child in node.children:
-                    _walk(child)
-            _walk(tree.root_node)
-            return symbols
+                    def _walk(node) -> None:
+                        if node.type in {'function_definition', 'function_declaration', 'method_definition', 'function_item', 'class_definition', 'struct_item', 'struct_specifier', 'enum_specifier', 'typedef_declaration'}:
+                            for child in node.children:
+                                if child.type in {'identifier', 'name', 'field_identifier'}:
+                                    symbols.add(child.text.decode(errors='replace'))
+                        for child in node.children:
+                            _walk(child)
+                    _walk(tree.root_node)
+                    if symbols:
+                        return symbols
+            except ImportError:
+                pass
+            import re as _re
+            ext = Path(file_path).suffix.lower()
+            _REGEX_PATTERNS = {
+                '.py': _re.compile(r'^\s*(?:async\s+)?def\s+(\w+)\s*\(', _re.MULTILINE),
+                '.c':  _re.compile(r'^[a-zA-Z_][\w\s\*]+\s+(\w+)\s*\(', _re.MULTILINE),
+                '.h':  _re.compile(r'^[a-zA-Z_][\w\s\*]+\s+(\w+)\s*\(', _re.MULTILINE),
+                '.cpp': _re.compile(r'^[a-zA-Z_][\w:\s\*<>]+\s+(\w+)\s*\(', _re.MULTILINE),
+                '.js': _re.compile(r'(?:^|\s)(?:async\s+)?function\s+(\w+)\s*\(', _re.MULTILINE),
+                '.ts': _re.compile(r'(?:^|\s)(?:async\s+)?function\s+(\w+)\s*[(<]', _re.MULTILINE),
+                '.rs': _re.compile(r'^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*[(\<]', _re.MULTILINE),
+                '.go': _re.compile(r'^\s*func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(', _re.MULTILINE),
+            }
+            pat = _REGEX_PATTERNS.get(ext)
+            if pat:
+                return set(pat.findall(content))
+            return set()
         except Exception as exc:
             self.log.debug(f'_extract_file_symbols({file_path}): {exc}')
             return set()

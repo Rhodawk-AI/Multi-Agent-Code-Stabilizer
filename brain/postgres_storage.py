@@ -90,7 +90,11 @@ class PostgresBrainStorage(BrainStorage):
     def __getattr__(self, name: str):
         if self._fallback is not None:
             return getattr(self._fallback, name)
-        raise AttributeError(f'PostgresBrainStorage.{name} not implemented')
+        raise AttributeError(
+            f'PostgresBrainStorage.{name} not implemented. '
+            f'This method exists on SQLiteBrainStorage but has no PostgreSQL equivalent. '
+            f'Add a PostgreSQL implementation or set use_sqlite=True.'
+        )
 
     async def upsert_run(self, run: AuditRun) -> None:
         if not self._is_pg():

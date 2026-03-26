@@ -1,49 +1,4 @@
-# Rhodawk AI Code Stabilizer — Adversarial Technical Review
 
-> **Prepared for:** Pre-accelerator demo readiness gate  
-> **Review date:** 2026-03-26  
-> **Reviewer:** Hostile architecture / security review  
-> **Codebase commit:** HEAD (Replit main branch)  
-> **Files read end-to-end:** All 130 project files, ~62 000 lines  
-> _(orchestrator/controller.py 3 519 L, brain/schemas.py 1 021 L, brain/sqlite_storage.py 2 497 L, brain/postgres_storage.py 980 L, brain/storage.py 403 L, all agents/ 15 files, all swe_bench/ 7 files, all api/ 12 files, all compliance/ 3 files, all cpg/ 9 files, all memory/ 6 files, all tools/ 14 files, all workers/ 3 files, all verification/ 2 files, scripts/benchmark.py, scripts/arpo_trainer.py, utils/rate_limiter.py, startup/feature_matrix.py, config/loader.py, run.py, security/aegis.py, models/router.py, swarm/deerflow_orchestrator.py, all 16 test files, context/, plugins/)_
-
----
-
-## Finding Format
-
-```
-ID: [BLOCK|BUG|ARCH|SEC|DEMO|COMP|MISSING|TEST]-NN
-Severity: CRITICAL / HIGH / MEDIUM / LOW
-File: path:line
-```
-
----
-
-## 1 — BLOCK: Will Crash the Demo Immediately
-
-### BLOCK-01 — `triage_model` phantom Ollama tag crashes every triage call
-
-**Severity:** CRITICAL  
-**File:** `orchestrator/controller.py:100`
-
-```python
-triage_model: str = "ollama/granite4-tiny"
-```
-
-`granite4-tiny` is **not a real Ollama model tag**. The real tags are `granite-code:3b` and `granite-code:8b`. `agents/base.py` explicitly acknowledges and partially fixes this in the cost map comment (lines 41–43) — but the fix was applied only to the cost map, not to `StabilizerConfig`. Every call routed through `triage_model` (fast-path chunk triage, pre-audit classification) receives `OllamaError: model 'granite4-tiny' not found` from LiteLLM, killing triage for every file.
-
-**Impact:** Triage phase fails on first file; all issue classification attempts are dead.  
-**Fix:** `triage_model: str = "ollama/granite-code:3b"`
-
----
-
-### BLOCK-02 — `critical_fix_model` uses non-existent OpenRouter slug
-
-**Severity:** CRITICAL  
-**File:** `orchestrator/controller.py:99`
-
-```python
-critical_fix_model: str = "openrouter/meta-llama/llama-4"
 ```
 
 The real OpenRouter slugs for the Llama 4 family are `openrouter/meta-llama/llama-4-scout` and `openrouter/meta-llama/llama-4-maverick`. `llama-4` with no variant suffix returns a 404 from the OpenRouter API. The corrected `_COST_MAP` in `base.py` uses `"openrouter/meta-llama/llama-4-scout"` (line 56). The config still carries the broken slug, so every CRITICAL-severity fix attempt calls a non-existent model and falls back all the way through the fallback chain.

@@ -61,23 +61,30 @@ try:
     ) -> dict:
         """Async-safe escalation approval from external system."""
         async def _approve() -> dict:
-            from config.loader import load_config
-            cfg = load_config()
+            try:
+                from config.loader import load_config
+                cfg = load_config()
+            except Exception as exc:
+                log.error(f"[escalation] load_config failed: {exc}")
+                return {"error": f"Configuration load failed: {exc}"}
             from orchestrator.controller import StabilizerController
             controller = StabilizerController(cfg)
-            await controller._init_storage()
-            esc = await controller.storage.get_escalation(escalation_id)
-            if esc is None:
-                return {"error": f"escalation {escalation_id} not found"}
-            from brain.schemas import EscalationStatus
-            from datetime import datetime, timezone
-            esc.status             = EscalationStatus.APPROVED
-            esc.approved_by        = approved_by
-            esc.approved_at        = datetime.now(tz=timezone.utc)
-            esc.approval_rationale = rationale
-            await controller.storage.upsert_escalation(esc)
-            await controller.storage.close()
-            return {"status": "approved", "escalation_id": escalation_id}
+            try:
+                await controller._init_storage()
+                esc = await controller.storage.get_escalation(escalation_id)
+                if esc is None:
+                    return {"error": f"escalation {escalation_id} not found"}
+                from brain.schemas import EscalationStatus
+                from datetime import datetime, timezone
+                esc.status             = EscalationStatus.APPROVED
+                esc.approved_by        = approved_by
+                esc.approved_at        = datetime.now(tz=timezone.utc)
+                esc.approval_rationale = rationale
+                await controller.storage.upsert_escalation(esc)
+                return {"status": "approved", "escalation_id": escalation_id}
+            finally:
+                if hasattr(controller, 'storage') and controller.storage:
+                    await controller.storage.close()
         return asyncio.run(_approve())
 
     # ── Gap 4: Commit-granularity incremental audit task ──────────────────────

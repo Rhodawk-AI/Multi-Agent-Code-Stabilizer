@@ -240,7 +240,8 @@ class BaseAgent(ABC):
         self.config      = config or AgentConfig()
         self.mcp         = mcp_manager
         self._session_cost = 0.0
-        self._rate_limiter: Any | None = None
+        from utils.rate_limiter import RateLimiter
+        self._rate_limiter = RateLimiter()
         self.log = logging.getLogger(
             f"rhodawk.{getattr(self.agent_type, 'value', 'agent').lower()}"
         )
