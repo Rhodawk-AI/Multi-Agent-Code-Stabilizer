@@ -52,19 +52,29 @@ models:
   - prefix: "hermes"
     family: "nous"
 
+independence_method: "prefix_family_mapping"
+independence_note: >
+  Independence is asserted by mapping model name prefixes to provider
+  families (e.g. "qwen*" → "alibaba", "claude*" → "anthropic") and
+  verifying that the fixer and reviewer belong to different families.
+  This is string-based classification, NOT cryptographic model identity
+  verification. For DO-178C DAL-A deployments requiring cryptographic
+  assurance of model identity, populate the checksums section below
+  with SHA-256 hashes of the actual model weight files in use.
+
 checksums:
   - model: "qwen/qwen2.5-coder-32b-instruct"
-    sha256: "populate-with-actual-model-weight-hash"
-    note: "Verify via: sha256sum model-weights.safetensors"
+    sha256: ""
+    note: "UNPOPULATED — verify via: sha256sum model-weights.safetensors"
   - model: "meta-llama/llama-4-scout"
-    sha256: "populate-with-actual-model-weight-hash"
-    note: "Verify via: sha256sum model-weights.safetensors"
+    sha256: ""
+    note: "UNPOPULATED — verify via: sha256sum model-weights.safetensors"
   - model: "granite-code:3b"
-    sha256: "populate-with-actual-model-weight-hash"
-    note: "Verify via: ollama show granite-code:3b --modelfile"
+    sha256: ""
+    note: "UNPOPULATED — verify via: ollama show granite-code:3b --modelfile"
   - model: "qwen2.5-coder:32b"
-    sha256: "populate-with-actual-model-weight-hash"
-    note: "Verify via: ollama show qwen2.5-coder:32b --modelfile"
+    sha256: ""
+    note: "UNPOPULATED — verify via: ollama show qwen2.5-coder:32b --modelfile"
   - model: "deepseek/deepseek-coder-v2-0724"
-    sha256: "populate-with-actual-model-weight-hash"
-    note: "Verify via OpenRouter model card hash"
+    sha256: ""
+    note: "UNPOPULATED — verify via OpenRouter model card hash"

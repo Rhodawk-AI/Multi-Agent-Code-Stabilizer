@@ -97,13 +97,14 @@ class NotificationDispatcher:
             coros.append(("pagerduty", self._notify_pagerduty(escalation)))
 
         if not coros:
-            # No channels configured — log at ERROR and continue
-            log.error(
-                f"EscalationManager: no notification channels configured. "
-                f"Escalation {escalation.id} requires manual intervention. "
-                f"Set RHODAWK_SLACK_WEBHOOK_URL or RHODAWK_ESCALATION_WEBHOOKS."
+            raise RuntimeError(
+                f"No escalation notification channels configured. "
+                f"Escalation {escalation.id} requires human approval but "
+                f"cannot be delivered. Set RHODAWK_SLACK_WEBHOOK_URL, "
+                f"RHODAWK_ESCALATION_WEBHOOKS, RHODAWK_EMAIL_WEBHOOK_URL, "
+                f"or RHODAWK_PAGERDUTY_ROUTING_KEY. Refusing to proceed "
+                f"silently past a human-in-the-loop safety gate."
             )
-            return []
 
         results = await asyncio.gather(*[c for _, c in coros], return_exceptions=True)
         for (channel, _), result in zip(coros, results):
