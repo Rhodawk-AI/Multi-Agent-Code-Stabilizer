@@ -63,12 +63,37 @@ Rhodawk targets **regulated-industry codebases** (aerospace, defense, nuclear,
 automotive) where DO-178C / IEC 61508 compliance evidence is mandatory and
 human review bottlenecks are the dominant cost driver.
 
-The BoBN (Best-of-Best-of-N) ensemble uses N=10 candidate generations per fix,
-which requires 8–10× the GPU compute of single-model solutions. This is a
-deliberate trade-off: in safety-critical domains, the cost of a missed defect
-(FAA airworthiness directive, nuclear safety shutdown) far exceeds the compute
-premium. For general-purpose coding tasks where cost-per-token matters more
-than correctness guarantees, single-model solutions are more appropriate.
+The BoBN (Best-of-Best-of-N) ensemble uses N=10 candidate generations per fix
+by default, which requires 8–10× the GPU compute of single-model solutions.
+This is configurable via environment variables to match your budget:
+
+| Profile | Env Vars | GPU Cost | Expected Lift |
+|---------|----------|----------|---------------|
+| **Minimal** (N=2) | `RHODAWK_BOBN_FIXER_A=1 RHODAWK_BOBN_FIXER_B=1` | ~2× baseline | +5-8pp |
+| **Balanced** (N=5) | `RHODAWK_BOBN_FIXER_A=3 RHODAWK_BOBN_FIXER_B=2` | ~5× baseline | +10-15pp |
+| **Full** (N=10, default) | `RHODAWK_BOBN_FIXER_A=6 RHODAWK_BOBN_FIXER_B=4` | ~10× baseline | +12-18pp |
+
+In safety-critical domains, the cost of a missed defect (FAA airworthiness
+directive, nuclear safety shutdown) far exceeds the compute premium. For
+general-purpose coding tasks where cost-per-token matters more than correctness
+guarantees, single-model solutions or N=2 are more appropriate.
+
+### ARPO Fine-Tuning Compute Options
+
+Full ARPO training (OpenRLHF, 32B model) requires 4×A100 80GB with ZeRO-3.
+For smaller deployments, use the built-in TRL GRPO single-GPU fallback:
+
+```bash
+python scripts/arpo_trainer.py --trl    # Single GPU, 7B-14B models
+python scripts/arpo_trainer.py --run    # Multi-GPU, 32B (requires 4×A100)
+```
+
+### Integration Options
+
+Rhodawk exposes a REST API (FastAPI) and CLI (`rhodawk`, `rhodawk-bench`).
+For CI/CD integration, use the webhook endpoint (`POST /api/webhook/ci`)
+with HMAC verification. GitHub App and VS Code extension are on the roadmap
+but not yet implemented.
 
 ## Configuration: Environment Variables
 
@@ -102,8 +127,9 @@ export RHODAWK_AUDIT_SECRET=$(python -c "import secrets; print(secrets.token_hex
 export RHODAWK_DEV_AUTH=1
 
 # 3. Pull local models (Ollama)
-ollama pull granite4-small
-ollama pull granite4-tiny
+ollama pull granite-code:8b
+ollama pull granite-code:3b
+ollama pull qwen2.5-coder:32b
 
 # 4. Start API server
 uvicorn api.app:app --port 8000
