@@ -51,7 +51,14 @@ async def create_run(
         cost_ceiling_usd=req.cost_ceiling_usd,
     )
     controller = StabilizerController(config)
-    run = await controller.initialise()
+    try:
+        run = await asyncio.wait_for(controller.initialise(), timeout=60.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Controller initialisation timed out after 60 seconds. "
+                   "Check that all external services (git, database, Joern) are reachable.",
+        )
 
     # SEC-02 FIX: store controller reference on app.state so get_run() can
     # retrieve real status. Without this the controller was garbage-collected

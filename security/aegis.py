@@ -152,8 +152,8 @@ _INJECTION_PATTERNS: list[tuple[str, str, ThreatSeverity]] = [
     # OS command via string interpolation
     (r"os\.system\s*\([^)]*\$|subprocess\.call\s*\([^)]*\$",
      "command-string-interpolation", ThreatSeverity.HIGH),
-    # Hardcoded IPs in production code (not comments)
-    (r"(?<!\#.{0,200})\b(?:10|172|192)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    # Hardcoded IPs in production code
+    (r"\b(?:10|172|192)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
      "hardcoded-private-ip", ThreatSeverity.LOW),
 ]
 

@@ -416,16 +416,39 @@ def require_scope(scope: str):
 
 async def ws_auth(websocket: WebSocket) -> TokenData:
     """
-    WebSocket authentication: token passed as ?token=<jwt> query parameter.
+    WebSocket authentication via Sec-WebSocket-Protocol subprotocol header.
 
-    Closes the connection with code 1008 (policy violation) if token is invalid.
+    Clients should send the token as a subprotocol:
+        new WebSocket(url, ["access_token", "<jwt>"])
+
+    Falls back to ?token=<jwt> query parameter for backward compatibility,
+    but logs a deprecation warning since query params are logged by proxies.
     """
-    token = websocket.query_params.get("token")
+    token: str | None = None
+    protocols = websocket.headers.get("sec-websocket-protocol", "")
+    parts = [p.strip() for p in protocols.split(",")]
+    if "access_token" in parts:
+        idx = parts.index("access_token")
+        if idx + 1 < len(parts):
+            token = parts[idx + 1]
+
+    if not token:
+        token = websocket.query_params.get("token")
+        if token:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "WebSocket token passed via query parameter (logged by proxies). "
+                "Migrate to Sec-WebSocket-Protocol subprotocol header."
+            )
+
     if not token:
         await websocket.close(code=1008, reason="Token required")
         raise HTTPException(status_code=401, detail="WebSocket: token required")
     try:
-        return verify_token(token)
+        data = verify_token(token)
+        if protocols:
+            websocket._accepted_subprotocol = "access_token"
+        return data
     except HTTPException as exc:
         await websocket.close(code=1008, reason=str(exc.detail))
         raise

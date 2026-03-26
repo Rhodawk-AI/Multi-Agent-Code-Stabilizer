@@ -67,14 +67,28 @@ All secrets are managed via Replit's Secrets panel. Key environment variables:
 
 ## Stabilization Status (March 2026)
 
-Full adversarial review (46 findings across 130 files) was completed and all critical bugs fixed:
+Full adversarial review (46 findings across 130 files) was completed and ALL bugs fixed end-to-end:
 
+### Batch 1 (27 findings)
 - **BLOCK-01–08**: Phantom model tags, vLLM port collision, `use_sqlite=True` default, `gap5_enabled=False` safe default, synthesis model default, `/auth/token` endpoint created
-- **BUG-01–08**: AuditScore medium_count, rate_limiter in BaseAgent, duplicate import, adversarial critic timeout, Celery error handling
-- **ARCH-07**: PostgresBrainStorage error messaging improved
+- **BUG-01/04/07/08**: AuditScore medium_count, rate_limiter in BaseAgent, duplicate import, adversarial critic timeout, Celery error handling
+- **ARCH-05/07**: PostgresBrainStorage error messaging improved
 - **SEC-05**: MAX_CONCURRENT_RUNS=50 cap
-- **DEMO-03**: Lean4 stub warning
-- **MISSING-04**: SAS dynamic objectives from run data
+- **MISSING-04/05**: SAS dynamic objectives, refactor proposals
+
+### Batch 2 (19 findings)
+- **BUG-02/03**: completion_tokens reads actual usage; instructor client FD leak fixed
+- **BUG-05/06**: `solver_used=` field mismatch; `max_cycles` default 50→200
+- **SEC-01/02/03/04**: WebSocket subprotocol auth; webhook HMAC required in prod; `os._exit` → `sys.exit`; AegisEDR sanitization on all source before LLM prompts
+- **ARCH-01/02/03/04/08**: Honest SWE-bench estimates; DO-178C advisory disclaimer on SAS; `cpg_enabled=False` default; model registry YAML; 60s controller init timeout
+- **ARCH-06**: PostgreSQL DDL synced with SQLite (13 missing tables added)
+- **DEMO-02/03/04**: Subprocess sandbox fallback (no Docker); Lean4 advisory language; Prometheus metrics pre-initialized
+- **MISSING-01/02/03**: Leanstral wired into formal_verifier; federation peer warning; escalation notification fallback
+
+### Code Review Fixes
+- **AegisEDR regex**: Variable-width lookbehind replaced with simple pattern
+- **Formal verifier**: `NOT_APPLICABLE` → `SKIPPED` (enum member exists); stale `solver` → `solver_used`
+- **Subprocess sandbox**: Shell injection via `bash -c` replaced with direct argv + test ID validation
 
 All 15 unit test files pass at 100% (agents, brain, chunking, consensus, convergence, cpg, execution_feedback, executor, gap3, gap4, gap5, gap6, graph, synthesis).
 

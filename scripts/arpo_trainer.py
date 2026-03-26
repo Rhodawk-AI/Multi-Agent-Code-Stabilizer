@@ -10,8 +10,16 @@ trajectory format. Uses OpenRLHF as the primary GRPO/PPO training framework,
 with TRL GRPO as a single-GPU fallback for smaller setups.
 
 ARPO demonstrated 71.8% -> 85.2% lift on SWE-bench for an 8B model purely
-through RL on SWE-bench trajectories. Applied to Qwen2.5-Coder-32B (which
-starts at ~37% solo), the combined BoBN + ARPO system targets >=90%.
+through RL on SWE-bench trajectories (arxiv 2411.06345).
+
+Performance estimates (not yet independently measured):
+  - Base Qwen2.5-Coder-32B solo: ~45% on SWE-bench Verified
+  - With BoBN N=10 (no fine-tuning): ~60-66%
+  - With BoBN + Joern CPG + Docker sandbox: ~63-68%
+  - With BoBN + ARPO fine-tuning (requires 4xA100 80GB): ~71-73% (theoretical)
+  - 85%+ requires all of the above plus additional gains not yet demonstrated.
+NOTE: These are engineering estimates. Run scripts/benchmark.py against
+SWE-bench Verified to obtain an actual measured score before publishing.
 
 Prerequisites
 -------------

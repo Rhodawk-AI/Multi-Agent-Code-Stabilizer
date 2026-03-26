@@ -83,6 +83,23 @@ _INJECTION_STRIP_PATTERNS = [
 _INJECTION_PLACEHOLDER = "[INJECTION_PATTERN_REMOVED]"
 
 
+def _aegis_sanitize(text: str) -> str:
+    """Run AegisEDR scan on source content before it enters LLM prompts."""
+    try:
+        from security.aegis import AegisEDR
+        scanner = AegisEDR()
+        findings = scanner.scan_fix_content("<prompt_input>", text)
+        if findings:
+            import unicodedata
+            text = unicodedata.normalize("NFC", text)
+            for ch in ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff']:
+                text = text.replace(ch, '')
+            text = text.replace('\x00', '')
+    except ImportError:
+        pass
+    return text
+
+
 def sanitize_content(text: str) -> str:
     """
     Escape structural delimiters and strip known prompt-injection patterns.
@@ -100,10 +117,9 @@ def sanitize_content(text: str) -> str:
     The stripping is applied to ALL source code before it reaches any LLM,
     including during the read phase (reader.py) and audit phase (auditor.py).
     """
-    # Step 1: strip injection phrases
+    text = _aegis_sanitize(text)
     for pattern in _INJECTION_STRIP_PATTERNS:
         text = pattern.sub(_INJECTION_PLACEHOLDER, text)
-    # Step 2: escape structural delimiters
     text = text.replace("<content>",       "&lt;content&gt;")
     text = text.replace("</content>",      "&lt;/content&gt;")
     text = text.replace("<source_code",    "&lt;source_code")
@@ -280,13 +296,13 @@ class BaseAgent(ABC):
 
         for attempt_model in models_to_try:
             try:
-                result = await self._call_with_retry(
+                result, raw_usage = await self._call_with_retry(
                     attempt_model, system, full_prompt,
                     response_model, temperature=temperature,
                 )
                 elapsed_ms      = int((time.monotonic() - start) * 1000)
-                prompt_tokens   = len(full_prompt) // 4
-                completion_tokens = 500
+                prompt_tokens   = raw_usage.get("prompt_tokens", len(full_prompt) // 4) if raw_usage else len(full_prompt) // 4
+                completion_tokens = raw_usage.get("completion_tokens", 500) if raw_usage else 500
                 cost            = self._estimate_cost(
                     attempt_model, prompt_tokens, completion_tokens
                 )
@@ -422,7 +438,7 @@ class BaseAgent(ABC):
         prompt:         str,
         response_model: type[T],
         temperature:    float = 0.1,
-    ) -> T:
+    ) -> tuple[T, dict | None]:
         try:
             import instructor
             import litellm
@@ -438,6 +454,9 @@ class BaseAgent(ABC):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        if not hasattr(self, "_instructor_client") or self._instructor_client is None:
+            self._instructor_client = instructor.from_litellm(litellm.acompletion)
+
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.config.max_retries),
             wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -447,9 +466,8 @@ class BaseAgent(ABC):
             reraise=True,
         ):
             with attempt:
-                client   = instructor.from_litellm(litellm.acompletion)
                 response = await asyncio.wait_for(
-                    client.chat.completions.create(
+                    self._instructor_client.chat.completions.create(
                         model=model,
                         messages=messages,
                         response_model=response_model,
@@ -458,7 +476,14 @@ class BaseAgent(ABC):
                     ),
                     timeout=self.config.timeout_s,
                 )
-                return response  # type: ignore[return-value]
+                usage: dict | None = None
+                raw = getattr(response, "_raw_response", None)
+                if raw and hasattr(raw, "usage") and raw.usage:
+                    usage = {
+                        "prompt_tokens": getattr(raw.usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(raw.usage, "completion_tokens", 0),
+                    }
+                return response, usage  # type: ignore[return-value]
 
         raise RuntimeError(
             f"[{self.agent_name}] Retry loop exited without result for model={model}"

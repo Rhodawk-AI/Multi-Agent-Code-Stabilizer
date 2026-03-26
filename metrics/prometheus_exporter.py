@@ -108,6 +108,32 @@ def record_cpg_context(source_type: str) -> None:
     try: CPG_CONTEXT_TOTAL.labels(source_type=source_type).inc()
     except Exception: pass
 
+def initialize_metric_labels() -> None:
+    """
+    DEMO-04 FIX: Pre-initialize all label combinations so Prometheus dashboards
+    show zero-valued series from startup instead of being empty until the first
+    event fires. Call this once at application startup (lifespan handler).
+    """
+    if not _PROM_AVAILABLE:
+        return
+    try:
+        for sev in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            for dom in ("GENERAL", "AVIONICS", "AUTOMOTIVE", "NUCLEAR", "MEDICAL"):
+                ISSUES_TOTAL.labels(severity=sev, domain=dom)
+        for st in ("applied", "rejected", "partial", "error"):
+            FIXES_TOTAL.labels(status=st)
+        for r in ("pass", "fail"):
+            GATE_RESULTS.labels(result=r)
+        for ts in ("passed", "failed", "error", "timeout"):
+            TEST_RUNS.labels(status=ts)
+        for src in ("cpg", "graph_fallback", "vector_fallback"):
+            CPG_CONTEXT_TOTAL.labels(source_type=src)
+        ACTIVE_RUNS.set(0)
+        COST_PCT.set(0)
+    except Exception:
+        pass
+
+
 class time_cycle:
     def __enter__(self):
         self._start = __import__("time").monotonic()

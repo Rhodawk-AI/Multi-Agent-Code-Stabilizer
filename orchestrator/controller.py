@@ -170,7 +170,7 @@ class StabilizerConfig(BaseModel):
     # Fix memory
     fix_memory_enabled:  bool          = True
     # CPG (Gap 1)
-    cpg_enabled:         bool          = True
+    cpg_enabled:         bool          = False
     joern_url:           str           = "http://localhost:8080"
     joern_repo_path:     str           = ""
     joern_project_name:  str           = "rhodawk"
@@ -638,7 +638,24 @@ class StabilizerController:
 
         # 7. Gap 6: federated anonymized pattern store
         if self.config.gap6_federation_enabled:
+            if not self.config.gap6_registry_url and not self.config.gap6_extra_peer_urls:
+                self.log.warning(
+                    "Gap 6 federation is enabled but no peers are configured "
+                    "(gap6_registry_url and gap6_extra_peer_urls are both empty). "
+                    "Federation requires at least one external peer to be meaningful. "
+                    "Set gap6_registry_url or gap6_extra_peer_urls, or disable with "
+                    "gap6_federation_enabled=False."
+                )
             await self._init_gap6()
+
+        # MISSING-03 FIX: warn if escalation notifications have no transport
+        if not self.config.api_base_url:
+            self.log.warning(
+                "ESCALATION WARNING: api_base_url is empty — escalation notifications "
+                "cannot include actionable approval links. Set api_base_url to the "
+                "deployment URL (e.g. https://rhodawk.example.com) for human-in-the-loop "
+                "escalation to function properly."
+            )
 
         self.log.info(
             f"Antagonist subsystems: "
@@ -663,9 +680,11 @@ class StabilizerController:
           IncrementalUpdater  — updates CPG after commits (Gap 4 integration)
         """
         if not self.config.cpg_enabled or not _CPG_AVAILABLE:
-            self.log.info(
-                "CPG disabled (cpg_enabled=False or cpg module not installed). "
-                "Context selection will use hybrid BM25+dense retrieval."
+            self.log.warning(
+                "CPG DISABLED (cpg_enabled=False or cpg module not installed). "
+                "Context selection will use hybrid BM25+dense retrieval. "
+                "Expected SWE-bench score penalty vs CPG-enabled: -15 to -20pp on cross-file bugs. "
+                "To enable: set cpg_enabled=True and ensure Joern is running (JOERN_URL env var)."
             )
             return
 

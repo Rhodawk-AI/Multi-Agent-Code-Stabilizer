@@ -22,8 +22,37 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_REGISTRY_PATH = Path(__file__).parent / "model_registry.yaml"
+
+
+def _load_yaml_registry() -> dict[str, str] | None:
+    """
+    ARCH-04 FIX: Load model family overrides from model_registry.yaml if present.
+    Returns None if file doesn't exist or can't be parsed.
+    """
+    if not _REGISTRY_PATH.exists():
+        return None
+    try:
+        import yaml
+        with open(_REGISTRY_PATH, "r") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict) and "models" in data:
+            registry: dict[str, str] = {}
+            for entry in data["models"]:
+                if isinstance(entry, dict) and "prefix" in entry and "family" in entry:
+                    registry[entry["prefix"]] = entry["family"]
+            if registry:
+                log.info(f"Loaded {len(registry)} model entries from {_REGISTRY_PATH}")
+                return registry
+    except ImportError:
+        log.debug("PyYAML not installed — using built-in model family map")
+    except Exception as exc:
+        log.warning(f"Failed to load {_REGISTRY_PATH}: {exc}")
+    return None
 
 
 class IndependenceViolationError(RuntimeError):
@@ -102,10 +131,16 @@ _PROVIDER_PREFIXES = {
 }
 
 
+_yaml_registry: dict[str, str] | None = _load_yaml_registry()
+
+
 def extract_model_family(model_id: str) -> str:
     """
     Extract a normalized model family (provider organization) from a
     LiteLLM-style model identifier string.
+
+    ARCH-04 FIX: Checks model_registry.yaml first (if present), then
+    falls back to the built-in MODEL_FAMILY_MAP.
 
     Examples
     --------
@@ -121,16 +156,17 @@ def extract_model_family(model_id: str) -> str:
     if not model_id:
         return "unknown"
 
-    # Normalise: lowercase, strip version tags
     m = model_id.lower().strip()
-    # Remove provider prefix (ollama/, openrouter/, etc.)
     for prefix in sorted(_PROVIDER_PREFIXES, key=len, reverse=True):
         if m.startswith(prefix + "/"):
             m = m[len(prefix) + 1:]
             break
 
-    # Check longest-first match against family map
-    for pattern, family in sorted(MODEL_FAMILY_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+    effective_map = {**MODEL_FAMILY_MAP}
+    if _yaml_registry:
+        effective_map.update(_yaml_registry)
+
+    for pattern, family in sorted(effective_map.items(), key=lambda x: len(x[0]), reverse=True):
         if m.startswith(pattern) or re.search(r'\b' + re.escape(pattern) + r'\b', m):
             return family
 

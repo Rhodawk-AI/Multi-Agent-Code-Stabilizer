@@ -1,7 +1,7 @@
 """
 verification/leanstral.py
 ==========================
-LLM-based property reasoning for Rhodawk AI Code Stabilizer.
+LLM-based advisory property reasoning for Rhodawk AI Code Stabilizer.
 
 AUDIT FIX (critical honesty fix)
 ──────────────────────────────────

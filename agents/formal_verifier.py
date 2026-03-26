@@ -294,7 +294,7 @@ class FormalVerifierAgent(BaseAgent):
         total_files   = len([ff for ff in fix.fixed_files if ff.content or ff.patch])
         skipped_files = sum(
             1 for r in results
-            if r.status == FormalVerificationStatus.NOT_APPLICABLE
+            if r.status == FormalVerificationStatus.SKIPPED
             and r.property_name == "quick_applicability_check"
         )
         verified_files = total_files - skipped_files
@@ -441,13 +441,13 @@ class FormalVerifierAgent(BaseAgent):
                 fix_attempt_id=fix_id,
                 file_path=file_path,
                 property_name="quick_applicability_check",
-                status=FormalVerificationStatus.NOT_APPLICABLE,
+                status=FormalVerificationStatus.SKIPPED,
                 counterexample=(
                     "Pre-LLM static filter: file contains async/IO/network/ORM/"
                     "subprocess/virtual-dispatch constructs that cannot be modelled "
                     "by Z3 or CBMC. Skipped to avoid wasting LLM tokens."
                 ),
-                solver="static_filter",
+                solver_used="static_filter",
             )
             # Persist so the gate can see it without running verify_fix again.
             try:
@@ -473,7 +473,7 @@ class FormalVerifierAgent(BaseAgent):
                 # If any CRITICAL counterexample found, return early (same logic as CBMC)
                 if any(
                     r.status == FormalVerificationStatus.COUNTEREXAMPLE
-                    and getattr(r, "solver", "") in {"python_ast", "bandit"}
+                    and getattr(r, "solver_used", "") in {"python_ast", "bandit"}
                     for r in py_results
                 ):
                     return results
@@ -499,7 +499,7 @@ class FormalVerifierAgent(BaseAgent):
                         counterexample=cbmc_result.counterexample
                         if status == FormalVerificationStatus.COUNTEREXAMPLE
                         else "",
-                        solver="cbmc",
+                        solver_used="cbmc",
                         elapsed_s=cbmc_result.elapsed_s,
                     )
                     await self.storage.upsert_formal_result(r)
@@ -546,7 +546,7 @@ class FormalVerifierAgent(BaseAgent):
                         f"Pattern match at position {match.start()}: "
                         f"{match.group()[:100]!r}"
                     ),
-                    solver="pattern",
+                    solver_used="pattern",
                 )
                 self._write_evidence(r)
                 return r
@@ -555,13 +555,25 @@ class FormalVerifierAgent(BaseAgent):
         if is_available("z3_solver"):
             return await self._verify_with_z3(fix_id, file_path, content, prop)
 
-        # Step 3: No violation found by pattern, Z3 not available
+        # Step 3: Advisory LLM reasoning via leanstral (non-blocking, non-authoritative)
+        try:
+            from verification.leanstral import llm_reason_property
+            advisory = await llm_reason_property(prop_name, content)
+            if advisory.get("method") not in ("unavailable",):
+                self.log.debug(
+                    f"Advisory LLM reasoning for {prop_name}: "
+                    f"proved={advisory.get('proved')}, method={advisory.get('method')}"
+                )
+        except Exception:
+            pass
+
+        # Step 4: No violation found by pattern, Z3 not available
         return FormalVerificationResult(
             fix_attempt_id=fix_id,
             file_path=file_path,
             property_name=prop_name,
             status=FormalVerificationStatus.PROVED,
-            solver="pattern",
+            solver_used="pattern",
             proof_script=f"Pattern {pattern!r} not found in content",
         )
 
@@ -595,7 +607,7 @@ class FormalVerifierAgent(BaseAgent):
                     property_name=prop_name,
                     status=FormalVerificationStatus.SKIPPED,
                     proof_script=constraint_resp.skip_reason,
-                    solver="z3",
+                    solver_used="z3",
                 )
             return await self._run_z3(fix_id, file_path, prop_name, constraint_resp)
         except Exception as exc:
@@ -605,7 +617,7 @@ class FormalVerifierAgent(BaseAgent):
                 property_name=prop_name,
                 status=FormalVerificationStatus.ERROR,
                 counterexample=str(exc)[:500],
-                solver="z3",
+                solver_used="z3",
             )
 
     async def _run_z3(
@@ -623,7 +635,7 @@ class FormalVerifierAgent(BaseAgent):
                 file_path=file_path,
                 property_name=prop_name,
                 status=FormalVerificationStatus.SKIPPED,
-                solver="z3",
+                solver_used="z3",
                 proof_script="z3 not installed",
             )
 
@@ -660,7 +672,7 @@ class FormalVerifierAgent(BaseAgent):
                 status=status,
                 counterexample=ce,
                 proof_script=script,
-                solver="z3",
+                solver_used="z3",
                 elapsed_s=elapsed,
             )
             self._write_evidence(r)
@@ -672,7 +684,7 @@ class FormalVerifierAgent(BaseAgent):
                 property_name=prop_name,
                 status=FormalVerificationStatus.ERROR,
                 counterexample=str(exc)[:500],
-                solver="z3",
+                solver_used="z3",
                 elapsed_s=time.monotonic() - start,
             )
 
@@ -725,7 +737,7 @@ class FormalVerifierAgent(BaseAgent):
                     f"Pattern '{pattern}' matched at pos {match.start()}: "
                     f"{match.group()[:120]!r}"
                 ) if match else "",
-                solver         = "python_ast",
+                solver_used    = "python_ast",
                 elapsed_s      = time.monotonic() - start,
             )
             self._write_evidence(r)
@@ -784,20 +796,19 @@ class FormalVerifierAgent(BaseAgent):
                                 property_name  = "bandit_security_scan",
                                 status         = FormalVerificationStatus.COUNTEREXAMPLE,
                                 counterexample = "\n".join(summary_lines),
-                                solver         = "bandit",
+                                solver_used    = "bandit",
                                 elapsed_s      = bandit_elapsed,
                             )
                             self._write_evidence(r)
                             await self.storage.upsert_formal_result(r)
                             results.append(r)
                         else:
-                            # Clean scan
                             r = FormalVerificationResult(
                                 fix_attempt_id = fix_id,
                                 file_path      = file_path,
                                 property_name  = "bandit_security_scan",
                                 status         = FormalVerificationStatus.PROVED,
-                                solver         = "bandit",
+                                solver_used    = "bandit",
                                 elapsed_s      = bandit_elapsed,
                             )
                             await self.storage.upsert_formal_result(r)

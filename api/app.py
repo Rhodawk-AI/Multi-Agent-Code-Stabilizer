@@ -123,19 +123,23 @@ def _enforce_production_security() -> None:
         # limit.  If this is a concern, add a lifespan guard:
         #   if os.environ.get("RHODAWK_DEV_AUTH") == "1" and not _IS_DEV:
         #       return  # skip pool init entirely — nothing to clean up on _exit
-        import logging as _logging
-        import os as _os
-        _logging.shutdown()
-        _os._exit(1)
+        sys.exit(msg)
 
-    # Check 2: webhook secret should be configured in production.
     if not os.environ.get("RHODAWK_WEBHOOK_SECRET"):
-        log.warning(
-            "SECURITY WARNING: RHODAWK_WEBHOOK_SECRET is not set. "
-            "CI push webhooks will be accepted without signature verification. "
-            "Generate a secret with: python -c \"import secrets; print(secrets.token_hex(32))\" "
-            "and set RHODAWK_WEBHOOK_SECRET in your environment."
-        )
+        if not _IS_DEV:
+            msg = (
+                "FATAL: RHODAWK_WEBHOOK_SECRET is not set in production. "
+                "CI push webhooks would be accepted without signature verification. "
+                "Generate a secret with: python -c \"import secrets; print(secrets.token_hex(32))\" "
+                "and set RHODAWK_WEBHOOK_SECRET in your environment."
+            )
+            log.critical(msg)
+            sys.exit(msg)
+        else:
+            log.warning(
+                "SECURITY WARNING: RHODAWK_WEBHOOK_SECRET is not set. "
+                "CI push webhooks will be accepted without signature verification."
+            )
 
     # Check 3: JWT secret must not be the placeholder value.
     jwt_secret = os.environ.get("RHODAWK_JWT_SECRET", "")
@@ -157,6 +161,15 @@ async def lifespan(app: FastAPI):
         f"Rhodawk AI API starting — env={os.environ.get('RHODAWK_ENV','production')} "
         f"cors_origins={_ALLOWED_ORIGINS}"
     )
+
+    # DEMO-04 FIX: Pre-initialize Prometheus metric labels so dashboards
+    # show zero-valued series from startup instead of being empty.
+    try:
+        from metrics.prometheus_exporter import initialize_metric_labels
+        initialize_metric_labels()
+    except Exception:
+        pass
+
     # BUG-2 FIX: enforce production security at startup — raises SystemExit on
     # policy violations instead of continuing with degraded security.
     _enforce_production_security()
@@ -168,10 +181,7 @@ async def lifespan(app: FastAPI):
         _init_config()
     except RuntimeError as _jwt_err:
         log.critical("JWT configuration failed — startup aborted: %s", _jwt_err)
-        import os as _os
-        import logging as _logging
-        _logging.shutdown()
-        _os._exit(1)
+        sys.exit(str(_jwt_err))
 
     # MISSING-2 FIX: replay any commits that arrived while the API was down,
     # the webhook timed out, or the repo does not support push webhooks.

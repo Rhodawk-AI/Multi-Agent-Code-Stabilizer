@@ -214,7 +214,25 @@ class ExecutionFeedbackLoop:
             )
             return rr
 
-        # Fallback: heuristic evaluation
+        # Fallback 2: subprocess isolation with ulimit (no Docker)
+        subprocess_result = await self._run_subprocess_isolated(patch)
+        if subprocess_result is not None:
+            rr.docker_used   = False
+            rr.tests_passed  = subprocess_result["passed"]
+            rr.tests_failed  = subprocess_result["failed"]
+            rr.stderr        = subprocess_result["stderr"]
+            rr.all_passed    = subprocess_result["all_passed"]
+            rr.score         = (
+                rr.tests_passed / rr.tests_total if rr.tests_total else 0.0
+            )
+            return rr
+
+        # Fallback 3: heuristic evaluation (least accurate)
+        log.warning(
+            "[exec_loop] Neither Docker nor subprocess sandbox available. "
+            "Using heuristic scoring — results are NOT reliable for final evaluation. "
+            "Install Docker for accurate SWE-bench scoring."
+        )
         score = self._heuristic_score(patch)
         rr.tests_passed = int(score * rr.tests_total)
         rr.tests_failed = rr.tests_total - rr.tests_passed
@@ -313,6 +331,59 @@ class ExecutionFeedbackLoop:
                     return None
         except Exception as exc:
             log.debug(f"[exec_loop] Docker init failed: {exc}")
+            return None
+
+    async def _run_subprocess_isolated(
+        self, patch: str
+    ) -> dict | None:
+        """
+        DEMO-02 FIX: Subprocess-based test execution with resource limits.
+
+        When Docker is unavailable, runs pytest with resource constraints.
+        Tests are executed via direct argv (no shell interpolation) to prevent
+        command injection from test IDs.
+
+        Returns None if repo_root is not available or subprocess fails.
+        """
+        if not self.repo_root or not self.repo_root.exists():
+            return None
+
+        import resource
+        import subprocess
+
+        def _set_limits() -> None:
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (120, 120))
+                resource.setrlimit(resource.RLIMIT_FSIZE, (100 * 1024 * 1024, 100 * 1024 * 1024))
+            except (ValueError, OSError):
+                pass
+
+        try:
+            safe_tests = [
+                t for t in self.fail_tests[:5]
+                if t.replace("_", "").replace(".", "").replace("/", "").replace("::", "").replace("-", "").isalnum()
+            ]
+            if not safe_tests:
+                return None
+
+            argv = [
+                "python", "-m", "pytest",
+                "--tb=short", "-q",
+            ] + safe_tests
+
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=TEST_TIMEOUT_S + 10,
+                cwd=str(self.repo_root),
+                preexec_fn=_set_limits,
+            )
+            raw = proc.stdout + "\n" + proc.stderr
+            return self._parse_harness_output(raw)
+        except (subprocess.TimeoutExpired, OSError, Exception) as exc:
+            log.debug(f"[exec_loop] Subprocess sandbox failed: {exc}")
             return None
 
     def _parse_harness_output(self, raw: str) -> dict:
