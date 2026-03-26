@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "AvymTvfG6H5SPxByXqvgR"
+uri = "file://ADVERSARIAL_REVIEW.md"
+type = "text"
+title = "Rhodawk AI — Adversarial Technical Review (46 findings, 130 files)"
