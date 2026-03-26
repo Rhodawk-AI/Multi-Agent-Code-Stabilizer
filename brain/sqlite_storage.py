@@ -232,7 +232,6 @@ CREATE INDEX IF NOT EXISTS idx_graph_target ON graph_edges(target);
 
 CREATE TABLE IF NOT EXISTS formal_verification_results (
     id               TEXT PRIMARY KEY,
-    run_id           TEXT DEFAULT '',
     fix_attempt_id   TEXT DEFAULT '',
     file_path        TEXT NOT NULL,
     property_name    TEXT NOT NULL,
@@ -241,7 +240,8 @@ CREATE TABLE IF NOT EXISTS formal_verification_results (
     proof_summary    TEXT DEFAULT '',
     solver_used      TEXT DEFAULT 'z3',
     elapsed_ms       INTEGER DEFAULT 0,
-    evaluated_at     TEXT NOT NULL
+    evidence_path    TEXT DEFAULT '',
+    verified_at      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS test_run_results (
@@ -1442,17 +1442,18 @@ class SQLiteBrainStorage(BrainStorage):
         async with self._write() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO formal_verification_results
-                    (id, run_id, fix_attempt_id, file_path, property_name,
+                    (id, fix_attempt_id, file_path, property_name,
                      status, counterexample, proof_summary, solver_used,
-                     elapsed_ms, evaluated_at)
+                     elapsed_ms, evidence_path, verified_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                result.id, result.run_id, result.fix_attempt_id,
+                result.id, result.fix_attempt_id,
                 result.file_path, result.property_name,
                 result.status.value,
                 result.counterexample, result.proof_summary,
                 result.solver_used, result.elapsed_ms,
-                result.evaluated_at.isoformat(),
+                result.evidence_path,
+                result.verified_at.isoformat(),
             ))
             await db.commit()
 
@@ -1466,7 +1467,6 @@ class SQLiteBrainStorage(BrainStorage):
                 return [
                     FormalVerificationResult(
                         id=r["id"],
-                        run_id=r["run_id"] or "",
                         fix_attempt_id=r["fix_attempt_id"] or "",
                         file_path=r["file_path"],
                         property_name=r["property_name"],
@@ -1475,7 +1475,8 @@ class SQLiteBrainStorage(BrainStorage):
                         proof_summary=r["proof_summary"] or "",
                         solver_used=r["solver_used"] or "z3",
                         elapsed_ms=r["elapsed_ms"],
-                        evaluated_at=_require_dt(r["evaluated_at"]),
+                        evidence_path=r.get("evidence_path", "") or "",
+                        verified_at=_require_dt(r["verified_at"]),
                     )
                     for r in rows
                 ]
