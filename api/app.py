@@ -284,20 +284,25 @@ def create_app() -> FastAPI:
     )
 
     # ── Core routes ──────────────────────────────────────────────────────────
-    for module_name, attr in [
-        ("api.routes.runs",              "router"),
-        ("api.routes.issues",            "router"),
-        ("api.routes.fixes",             "router"),
-        ("api.routes.files",             "router"),
-        ("api.routes.escalations",       "router"),
-        ("api.routes.compound_findings", "router"),
-        ("api.routes.refactor_proposals", "router"),
-        ("api.routes.commits",           "router"),
-    ]:
+    route_configs = [
+        ("api.routes.runs",              "router", ""),
+        ("api.routes.issues",            "router", "/api/issues"),
+        ("api.routes.fixes",             "router", "/api/fixes"),
+        ("api.routes.files",             "router", "/api/files"),
+        ("api.routes.escalations",       "router", ""),
+        ("api.routes.compound_findings", "router", ""),
+        ("api.routes.refactor_proposals", "router", ""),
+        ("api.routes.commits",           "router", ""),
+    ]
+    for module_name, attr, prefix in route_configs:
         try:
             import importlib
             mod = importlib.import_module(module_name)
-            app.include_router(getattr(mod, attr))
+            router_obj = getattr(mod, attr)
+            if prefix:
+                app.include_router(router_obj, prefix=prefix)
+            else:
+                app.include_router(router_obj)
         except ImportError as exc:
             log.warning(f"Route module unavailable: {module_name} — {exc}")
 

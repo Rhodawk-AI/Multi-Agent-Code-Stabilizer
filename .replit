@@ -1,6 +1,6 @@
 language = "python3"
 run = "pytest tests/unit/ -v"
-modules = ["python-3.11"]
+modules = ["python-3.11", "web", "rust-stable", "bash"]
 
 [nix]
 channel = "stable-25_05"
@@ -25,14 +25,33 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python3 -m pytest tests/unit/ --tb=short -q 2>&1; echo 'Tests complete'"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload"
+waitForPort = 8000
 
 [userenv]
 
 [userenv.shared]
 GH_TOKEN = "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"
+RHODAWK_ENV = "development"
+RHODAWK_JWT_ALGORITHM = "HS256"
+RHODAWK_JWT_SECRET = "9RYPp198XPtabsUEHoJSW1o44bi32bAZj420lxuXPmXXobHeWvWs5boHMX1TcGyH7fKmDi3shGp59f7YuFXnMqIAQ2DopqkM"
+RHODAWK_AUDIT_SECRET = "cf0e12e43c51517a31019d9b7777f57db0f0e6970c8baacf7d818da8318e6f69"
+RHODAWK_FORCE_CLOUD = "0"
+HELIX_USE_LOCAL_QDRANT = "0"
+TOOLHIVE_DISABLE = "0"
+CPG_ENABLED = "0"
+RHODAWK_GAP5_ENABLED = "false"
+RHODAWK_MAX_CONCURRENT_UPLOADS = "5"
+RHODAWK_MAX_FILE_BYTES = "5242880"
+RHODAWK_MAX_FILES = "50000"
+RHODAWK_CORS_ORIGINS = "http://localhost:3000,http://localhost:8000,https://c690359e-6267-49dc-8a33-d3832c6c488c-00-ziizh0cyd09e.riker.replit.dev"
+PORT = "8000"
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
