@@ -60,10 +60,12 @@ def _try_lean4_proof(property_name: str, code: str) -> dict:
         )
         Path(tmp).unlink(missing_ok=True)
         if r.returncode == 0:
-            return {"proved": True, "method": "lean4_stub",
+            return {"proved": False, "method": "lean4_stub",
                     "proof": lean_src, "counterexample": "",
-                    "warning": "STUB PROOF: Proves tautology (True := trivial), "
-                               "not a real property. Do NOT cite as DO-178C formal evidence."}
+                    "warning": "STUB ONLY: Lean 4 binary present but proof is tautology "
+                               "(True := trivial). NOT a property verification. "
+                               "proved=False because no real property was checked. "
+                               "Do NOT cite as DO-178C formal evidence."}
         return {"proved": False, "method": "lean4_failed",
                 "proof": "", "counterexample": r.stderr[:500]}
     except Exception as exc:

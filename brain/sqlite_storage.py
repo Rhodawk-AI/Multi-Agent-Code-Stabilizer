@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS audit_runs (
     domain_mode         TEXT NOT NULL DEFAULT 'general',
     status              TEXT NOT NULL DEFAULT 'RUNNING',
     cycle_count         INTEGER DEFAULT 0,
-    max_cycles          INTEGER DEFAULT 50,
+    max_cycles          INTEGER DEFAULT 200,
     files_total         INTEGER DEFAULT 0,
     files_read          INTEGER DEFAULT 0,
     graph_built         INTEGER DEFAULT 0,

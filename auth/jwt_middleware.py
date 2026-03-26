@@ -433,15 +433,6 @@ async def ws_auth(websocket: WebSocket) -> TokenData:
             token = parts[idx + 1]
 
     if not token:
-        token = websocket.query_params.get("token")
-        if token:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "WebSocket token passed via query parameter (logged by proxies). "
-                "Migrate to Sec-WebSocket-Protocol subprotocol header."
-            )
-
-    if not token:
         await websocket.close(code=1008, reason="Token required")
         raise HTTPException(status_code=401, detail="WebSocket: token required")
     try:

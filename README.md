@@ -1,6 +1,11 @@
 # Rhodawk AI Code Stabilizer v1.0
 
-**Swarm-based autonomous AI engineer** targeting ≥85% on SWE-bench Verified, beating Claude Code (80.9%).
+**Swarm-based autonomous AI engineer** for safety-critical code stabilization.
+
+> **Benchmark status (March 2026):** SWE-bench Verified has not yet been
+> measured on this system. The 85% target below is an *architectural design
+> goal*, not a measured result. No independent evaluation has been run.
+> Claims in the comparison table are projected targets, not demonstrated scores.
 
 ## Architecture
 
@@ -41,12 +46,16 @@
 > when Granite 4.0 ships.
 
 
-| Benchmark          | Target    | Baseline (Claude Code) |
-|--------------------|-----------|------------------------|
-| SWE-bench Verified | **≥85%**  | 80.9%                  |
-| Terminal-Bench 2.0 | **≥75%**  | 65.4%                  |
-| FLTEval (formal)   | **26.3%** | N/A                    |
-| Cost per issue     | **<$0.30**| ~$2.00                 |
+| Benchmark          | Target (untested) | Baseline (Claude Code) |
+|--------------------|-------------------|------------------------|
+| SWE-bench Verified | **≥85%** *        | 80.9%                  |
+| Terminal-Bench 2.0 | **≥75%** *        | 65.4%                  |
+| FLTEval (formal)   | **26.3%** *       | N/A                    |
+| Cost per issue     | **<$0.30** *      | ~$2.00                 |
+
+\* *Design targets only. Not independently measured. Actual performance depends
+on model availability, CPG integration, and Gap 5 ensemble configuration.
+Without CPG (Joern) and BoBN ensemble, expect 15-20pp lower than targets.*
 
 ## Quick Start
 

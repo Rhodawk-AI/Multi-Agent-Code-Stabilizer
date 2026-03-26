@@ -500,7 +500,7 @@ class FormalVerifierAgent(BaseAgent):
                         if status == FormalVerificationStatus.COUNTEREXAMPLE
                         else "",
                         solver_used="cbmc",
-                        elapsed_s=cbmc_result.elapsed_s,
+                        elapsed_ms=cbmc_result.elapsed_s * 1000,
                     )
                     await self.storage.upsert_formal_result(r)
                     results.append(r)
@@ -574,7 +574,7 @@ class FormalVerifierAgent(BaseAgent):
             property_name=prop_name,
             status=FormalVerificationStatus.PROVED,
             solver_used="pattern",
-            proof_script=f"Pattern {pattern!r} not found in content",
+            proof_summary=f"Pattern {pattern!r} not found in content",
         )
 
     async def _verify_with_z3(
@@ -606,7 +606,7 @@ class FormalVerifierAgent(BaseAgent):
                     file_path=file_path,
                     property_name=prop_name,
                     status=FormalVerificationStatus.SKIPPED,
-                    proof_script=constraint_resp.skip_reason,
+                    proof_summary=constraint_resp.skip_reason,
                     solver_used="z3",
                 )
             return await self._run_z3(fix_id, file_path, prop_name, constraint_resp)
@@ -636,7 +636,7 @@ class FormalVerifierAgent(BaseAgent):
                 property_name=prop_name,
                 status=FormalVerificationStatus.SKIPPED,
                 solver_used="z3",
-                proof_script="z3 not installed",
+                proof_summary="z3 not installed",
             )
 
         import time
@@ -671,9 +671,9 @@ class FormalVerifierAgent(BaseAgent):
                 property_name=prop_name,
                 status=status,
                 counterexample=ce,
-                proof_script=script,
+                proof_summary=script,
                 solver_used="z3",
-                elapsed_s=elapsed,
+                elapsed_ms=elapsed * 1000,
             )
             self._write_evidence(r)
             return r
@@ -685,7 +685,7 @@ class FormalVerifierAgent(BaseAgent):
                 status=FormalVerificationStatus.ERROR,
                 counterexample=str(exc)[:500],
                 solver_used="z3",
-                elapsed_s=time.monotonic() - start,
+                elapsed_ms=(time.monotonic() - start) * 1000,
             )
 
     async def _run_python_ast_check(
@@ -738,7 +738,7 @@ class FormalVerifierAgent(BaseAgent):
                     f"{match.group()[:120]!r}"
                 ) if match else "",
                 solver_used    = "python_ast",
-                elapsed_s      = time.monotonic() - start,
+                elapsed_ms     = (time.monotonic() - start) * 1000,
             )
             self._write_evidence(r)
             await self.storage.upsert_formal_result(r)
@@ -797,7 +797,7 @@ class FormalVerifierAgent(BaseAgent):
                                 status         = FormalVerificationStatus.COUNTEREXAMPLE,
                                 counterexample = "\n".join(summary_lines),
                                 solver_used    = "bandit",
-                                elapsed_s      = bandit_elapsed,
+                                elapsed_ms     = bandit_elapsed * 1000,
                             )
                             self._write_evidence(r)
                             await self.storage.upsert_formal_result(r)
@@ -809,7 +809,7 @@ class FormalVerifierAgent(BaseAgent):
                                 property_name  = "bandit_security_scan",
                                 status         = FormalVerificationStatus.PROVED,
                                 solver_used    = "bandit",
-                                elapsed_s      = bandit_elapsed,
+                                elapsed_ms     = bandit_elapsed * 1000,
                             )
                             await self.storage.upsert_formal_result(r)
                             results.append(r)

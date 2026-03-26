@@ -95,34 +95,7 @@ def _enforce_production_security() -> None:
             "This variable must NEVER be set in production."
         )
         log.critical(msg)
-        # SEC-05 FIX: use os._exit(1) instead of sys.exit(msg).
-        # sys.exit() raises SystemExit which is caught by uvicorn/asyncio and
-        # causes the container to restart (restart: unless-stopped in compose).
-        # The container then crash-loops indefinitely with no visible diagnostic.
-        # os._exit(1) terminates the process immediately with a non-zero code,
-        # which docker-compose / k8s surface as an exit-code failure — visible
-        # in `docker ps` and container logs — rather than an infinite restart loop.
-        #
-        # SEC-05 FIX (part 2): call logging.shutdown() BEFORE os._exit(1).
-        # os._exit() bypasses Python's atexit handlers and therefore bypasses
-        # the implicit logging.shutdown() that Python normally calls on clean
-        # exit.  If the log handler buffers writes (e.g. TimedRotatingFileHandler,
-        # a remote log shipper, or any handler with a non-zero buffer size) the
-        # log.critical() message above may be lost before the process dies.
-        # logging.shutdown() flushes and closes all handlers synchronously,
-        # guaranteeing that the diagnostic message reaches the log sink before
-        # the hard exit.
-        #
-        # ADD-3 NOTE — asyncio cleanup gap:
-        # os._exit() bypasses asyncio's shutdown sequence.  Any async resources
-        # opened at startup (database connection pools from the lifespan handler)
-        # are not closed cleanly.  On PostgreSQL this leaves dangling connections
-        # until the server times them out (~30 s per connection).  On a
-        # high-connection-limit deployment, repeated crash-restarts before
-        # RHODAWK_DEV_AUTH is corrected can exhaust the PostgreSQL connection
-        # limit.  If this is a concern, add a lifespan guard:
-        #   if os.environ.get("RHODAWK_DEV_AUTH") == "1" and not _IS_DEV:
-        #       return  # skip pool init entirely — nothing to clean up on _exit
+        logging.shutdown()
         sys.exit(msg)
 
     if not os.environ.get("RHODAWK_WEBHOOK_SECRET"):

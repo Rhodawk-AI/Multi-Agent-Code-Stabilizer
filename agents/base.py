@@ -258,6 +258,7 @@ class BaseAgent(ABC):
         self._session_cost = 0.0
         from utils.rate_limiter import RateLimiter
         self._rate_limiter = RateLimiter()
+        self._instructor_client = None
         self.log = logging.getLogger(
             f"rhodawk.{getattr(self.agent_type, 'value', 'agent').lower()}"
         )
@@ -302,7 +303,8 @@ class BaseAgent(ABC):
                 )
                 elapsed_ms      = int((time.monotonic() - start) * 1000)
                 prompt_tokens   = raw_usage.get("prompt_tokens", len(full_prompt) // 4) if raw_usage else len(full_prompt) // 4
-                completion_tokens = raw_usage.get("completion_tokens", 500) if raw_usage else 500
+                _fallback_ct = max(1, len(result.model_dump_json()) // 4) if hasattr(result, "model_dump_json") else 500
+                completion_tokens = raw_usage.get("completion_tokens", _fallback_ct) if raw_usage else _fallback_ct
                 cost            = self._estimate_cost(
                     attempt_model, prompt_tokens, completion_tokens
                 )
@@ -454,7 +456,7 @@ class BaseAgent(ABC):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        if not hasattr(self, "_instructor_client") or self._instructor_client is None:
+        if self._instructor_client is None:
             self._instructor_client = instructor.from_litellm(litellm.acompletion)
 
         async for attempt in AsyncRetrying(
@@ -466,6 +468,12 @@ class BaseAgent(ABC):
             reraise=True,
         ):
             with attempt:
+                api_key = await self._rate_limiter.get_key(
+                    estimated_tokens=self.config.max_tokens
+                )
+                extra_kwargs: dict = {}
+                if api_key:
+                    extra_kwargs["api_key"] = api_key
                 response = await asyncio.wait_for(
                     self._instructor_client.chat.completions.create(
                         model=model,
@@ -473,6 +481,7 @@ class BaseAgent(ABC):
                         response_model=response_model,
                         max_tokens=self.config.max_tokens,
                         temperature=temperature,
+                        **extra_kwargs,
                     ),
                     timeout=self.config.timeout_s,
                 )

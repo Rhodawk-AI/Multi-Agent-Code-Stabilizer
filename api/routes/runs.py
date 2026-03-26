@@ -83,10 +83,14 @@ async def create_run(
     task = asyncio.create_task(controller.stabilize())
 
     def _on_done(t: asyncio.Task) -> None:
-        exc = t.exception()
+        try:
+            exc = t.exception() if not t.cancelled() else None
+        except Exception:
+            exc = None
         if exc:
             log.error(f"Run {run.id[:8]} background task failed: {exc}")
-        # Remove from active controllers when done.
+        if t.cancelled():
+            log.warning(f"Run {run.id[:8]} was cancelled")
         ctrls = getattr(app_state, "controllers", {})
         ctrls.pop(run.id, None)
 

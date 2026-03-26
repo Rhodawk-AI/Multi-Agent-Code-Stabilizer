@@ -9,7 +9,7 @@ domain_mode = "general"
 primary               = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
 audit_model           = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
 fix_model             = "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
-critical_fix_model    = "openai/deepseek-ai/DeepSeek-Coder-V2-Instruct"
+critical_fix_model    = "openrouter/meta-llama/llama-4-scout"
 # Light models served via Ollama (triage/fallback only)
 triage_model          = "ollama/granite-code:3b"
 fallbacks             = ["ollama/qwen2.5-coder:7b", "ollama/deepseek-coder-v2"]
@@ -108,7 +108,7 @@ paths = []
 # Gap 1: Joern Code Property Graph
 # docker-compose up joern, then set JOERN_REPO_PATH to your repo.
 [cpg]
-enabled                = true
+enabled                = false
 joern_url              = "http://localhost:8080"
 joern_repo_path        = ""
 joern_project_name     = "rhodawk"

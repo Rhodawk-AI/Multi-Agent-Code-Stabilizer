@@ -161,9 +161,9 @@ class AdversarialCriticAgent:
                 # participate in composite ranking (unknown robustness ≠ zero).
                 reports.append(CriticAttackReport(
                     candidate_id      = cid,
-                    attack_confidence = 0.8,
+                    attack_confidence = 1.0,
                     critic_model      = self.model_router.critic_model(),
-                    raw_critique      = f"Critic error (untested — penalised): {r}",
+                    raw_critique      = f"Critic error (untested — maximally penalised): {r}",
                 ))
         return reports
 
