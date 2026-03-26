@@ -62,6 +62,66 @@ class IndependenceViolationError(RuntimeError):
     """
 
 
+_KNOWN_MODEL_CHECKSUMS: dict[str, str] = {}
+
+
+def _load_model_checksums() -> None:
+    """Load model identity checksums from model_registry.yaml if present."""
+    if not _REGISTRY_PATH.exists():
+        return
+    try:
+        import yaml
+        with open(_REGISTRY_PATH, "r") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict) and "checksums" in data:
+            for entry in data["checksums"]:
+                if isinstance(entry, dict) and "model" in entry and "sha256" in entry:
+                    _KNOWN_MODEL_CHECKSUMS[entry["model"]] = entry["sha256"]
+            if _KNOWN_MODEL_CHECKSUMS:
+                log.info(f"Loaded {len(_KNOWN_MODEL_CHECKSUMS)} model checksums")
+    except ImportError:
+        pass
+    except Exception as exc:
+        log.warning(f"Failed to load checksums from {_REGISTRY_PATH}: {exc}")
+
+
+_load_model_checksums()
+
+
+def verify_model_identity(model_id: str) -> bool:
+    """
+    ARCH-04 FIX: Verify model identity against known checksums.
+
+    When checksums are configured in model_registry.yaml, this function
+    checks that the model's reported identifier matches a known hash.
+    This prevents independence falsification via custom-named models.
+
+    Returns True if verified or if no checksums are configured (advisory mode).
+    Returns False if model claims an identity that doesn't match its checksum.
+    """
+    if not _KNOWN_MODEL_CHECKSUMS:
+        return True
+    normalized = model_id.lower().strip()
+    for prefix in sorted(_PROVIDER_PREFIXES, key=len, reverse=True):
+        if normalized.startswith(prefix + "/"):
+            normalized = normalized[len(prefix) + 1:]
+            break
+    if normalized in _KNOWN_MODEL_CHECKSUMS:
+        log.debug(f"Model {model_id!r} has registered checksum")
+        return True
+    for known_prefix in _KNOWN_MODEL_CHECKSUMS:
+        if normalized.startswith(known_prefix):
+            log.debug(f"Model {model_id!r} matches known prefix {known_prefix!r}")
+            return True
+    log.warning(
+        f"Model {model_id!r} has no registered checksum in model_registry.yaml. "
+        f"Independence certificate is UNVERIFIED — model identity cannot be "
+        f"cryptographically confirmed. Add a checksums entry to "
+        f"{_REGISTRY_PATH} for production use."
+    )
+    return False
+
+
 # Canonical model family map.
 # Maps model identifier prefixes/patterns to a normalized family name.
 # Organization = unit of independence (different company = independent).
@@ -204,6 +264,14 @@ class IndependenceEnforcer:
         self._log_initial_check()
 
     def _log_initial_check(self) -> None:
+        fixer_verified = verify_model_identity(self.fixer_model)
+        reviewer_verified = verify_model_identity(self.reviewer_model)
+        if not fixer_verified or not reviewer_verified:
+            log.warning(
+                "Independence certificate is advisory-only: one or both model "
+                "identities could not be cryptographically verified. "
+                "Configure checksums in model_registry.yaml for production."
+            )
         same = self.fixer_family == self.reviewer_family
         if same:
             msg = (

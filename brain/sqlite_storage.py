@@ -595,6 +595,11 @@ class SQLiteBrainStorage(BrainStorage):
             pass
         await self._db.commit()
         await self._run_migrations()
+        try:
+            from brain.migrations import apply_migrations_sqlite
+            await apply_migrations_sqlite(self._db)
+        except Exception as exc:
+            log.warning(f"Schema migration check failed (non-fatal): {exc}")
         log.info(f"Brain storage initialised at {self._path}")
 
     async def _run_migrations(self) -> None:

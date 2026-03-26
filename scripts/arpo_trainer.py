@@ -17,7 +17,7 @@ Performance estimates (not yet independently measured):
   - With BoBN N=10 (no fine-tuning): ~60-66%
   - With BoBN + Joern CPG + Docker sandbox: ~63-68%
   - With BoBN + ARPO fine-tuning (requires 4xA100 80GB): ~71-73% (theoretical)
-  - 85%+ requires all of the above plus additional gains not yet demonstrated.
+  - Higher scores require all of the above plus additional gains not yet demonstrated.
 NOTE: These are engineering estimates. Run scripts/benchmark.py against
 SWE-bench Verified to obtain an actual measured score before publishing.
 

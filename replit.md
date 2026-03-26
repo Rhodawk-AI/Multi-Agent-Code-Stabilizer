@@ -2,7 +2,7 @@
 
 ## Overview
 
-Rhodawk AI is a production-grade, swarm-based autonomous AI software engineer designed to identify, audit, and fix vulnerabilities and logic errors in large-scale codebases. It targets high-reliability and safety-critical domains (military, aerospace, medical) and aims for ≥85% on SWE-bench Verified.
+Rhodawk AI is a production-grade, swarm-based autonomous AI software engineer designed to identify, audit, and fix vulnerabilities and logic errors in large-scale codebases. It targets high-reliability and safety-critical domains (military, aerospace, medical). Design targets are ~60-73% on SWE-bench Verified depending on configuration (not independently measured).
 
 ## Architecture
 
@@ -81,16 +81,19 @@ Full adversarial review (46 findings across 130 files) was completed and ALL bug
 - **BUG-05/06**: `solver_used=` field mismatch; `max_cycles` default 50→200
 - **SEC-01/02/03/04**: WebSocket subprotocol auth; webhook HMAC required in prod; `os._exit` → `sys.exit`; AegisEDR sanitization on all source before LLM prompts
 - **ARCH-01/02/03/04/08**: Honest SWE-bench estimates; DO-178C advisory disclaimer on SAS; `cpg_enabled=False` default; model registry YAML; 60s controller init timeout
-- **ARCH-06**: PostgreSQL DDL synced with SQLite (13 missing tables added)
-- **DEMO-02/03/04**: Subprocess sandbox fallback (no Docker); Lean4 advisory language; Prometheus metrics pre-initialized
+- **ARCH-06**: PostgreSQL DDL synced with SQLite (13 missing tables added); lightweight migration framework (`brain/migrations.py`) with schema version tracking
+- **ARCH-07**: Static test (`test_storage_interface.py`) detecting PostgresBrainStorage `__getattr__` delegation gap (58/66 methods)
+- **DEMO-02/03/04**: Subprocess sandbox fallback (no Docker); Lean4 tautology stub removed (version-check only); Prometheus metrics pre-initialized
 - **MISSING-01/02/03**: Leanstral wired into formal_verifier; federation peer warning; escalation notification fallback
+- **BUG-08**: Celery `approve_escalation_task` now raises exceptions instead of returning silent error dicts
+- **COMP-02**: README niche positioning statement (GPU cost vs regulated-industry value)
 
 ### Code Review Fixes
 - **AegisEDR regex**: Variable-width lookbehind replaced with simple pattern
 - **Formal verifier**: `NOT_APPLICABLE` → `SKIPPED` (enum member exists); stale `solver` → `solver_used`
 - **Subprocess sandbox**: Shell injection via `bash -c` replaced with direct argv + test ID validation
 
-All 15 unit test files pass at 100% (agents, brain, chunking, consensus, convergence, cpg, execution_feedback, executor, gap3, gap4, gap5, gap6, graph, synthesis).
+All 17 unit test files pass (agents, brain, chunking, consensus, convergence, cpg, execution_feedback, executor, gap3, gap4, gap5, gap6, graph, schema_sync, storage_interface, synthesis).
 
 ## Review Documents
 

@@ -57,6 +57,39 @@
 on model availability, CPG integration, and Gap 5 ensemble configuration.
 Without CPG (Joern) and BoBN ensemble, expect 15-20pp lower than targets.*
 
+## Positioning
+
+Rhodawk targets **regulated-industry codebases** (aerospace, defense, nuclear,
+automotive) where DO-178C / IEC 61508 compliance evidence is mandatory and
+human review bottlenecks are the dominant cost driver.
+
+The BoBN (Best-of-Best-of-N) ensemble uses N=10 candidate generations per fix,
+which requires 8–10× the GPU compute of single-model solutions. This is a
+deliberate trade-off: in safety-critical domains, the cost of a missed defect
+(FAA airworthiness directive, nuclear safety shutdown) far exceeds the compute
+premium. For general-purpose coding tasks where cost-per-token matters more
+than correctness guarantees, single-model solutions are more appropriate.
+
+## Configuration: Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `RHODAWK_JWT_SECRET` | Yes | 256-bit hex secret for JWT signing |
+| `RHODAWK_AUDIT_SECRET` | Yes | HMAC secret for audit trail integrity |
+| `RHODAWK_DEV_AUTH` | Dev only | Set to `1` to bypass auth in development |
+| `RHODAWK_WEBHOOK_SECRET` | Prod | HMAC secret for CI webhook verification |
+| `RHODAWK_CORS_ORIGINS` | No | Comma-separated allowed CORS origins |
+| `RHODAWK_SLACK_WEBHOOK_URL` | No | Slack webhook for escalation notifications |
+| `RHODAWK_ESCALATION_WEBHOOKS` | No | Additional webhook URLs for escalation alerts |
+| `RHODAWK_ENV` | No | Set to `development` for dev mode (default: `production`) |
+| `DATABASE_URL` | Prod | PostgreSQL connection string (SQLite used if absent) |
+| `gap6_federation_peers` | No | Comma-separated peer URLs for federated pattern sharing |
+
+> **Note:** Without `RHODAWK_SLACK_WEBHOOK_URL` or `RHODAWK_ESCALATION_WEBHOOKS`,
+> escalation notifications are logged but not delivered externally. Configure at
+> least one notification channel for DO-178C DAL-A deployments where human-in-the-loop
+> approval is mandatory.
+
 ## Quick Start
 
 ```bash
@@ -108,7 +141,7 @@ auth/            JWT middleware + token factory
 metrics/         Prometheus instrumentation
 models/          Tiered model router (local→cloud)
 swarm/           DeerFlow (bespoke DAG) + CrewAI + AutoGen
-verification/    Leanstral (Lean4) + Z3 formal verification
+verification/    Advisory property reasoning + Z3 formal verification
 memory/          HelixDB (Qdrant graph+vector)
 security/        Aegis EDR (exploit + injection detection)
 tools/           ToolHive MCP layer + server stubs

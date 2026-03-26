@@ -38,33 +38,22 @@ def _try_lean4_proof(property_name: str, code: str) -> dict:
     """Attempt a real lean --check proof. Returns {} if lean not installed."""
     if not _lean4_available():
         return {}
-    # NOTE: This produces a trivially-true proof stub only.
-    # Real property encoding requires a hand-authored Lean 4 specification
-    # for each property.  This stub is useful only as a "lean binary present"
-    # smoke-test, not as DO-178C formal evidence.
-    safe_name = property_name.replace('-','_').replace('.','_').replace(':','_')
-    lean_src = (
-        f"-- Rhodawk AI: property={property_name}\n"
-        f"-- STUB: Trivial proof — not a real property verification.\n"
-        f"-- Replace with domain-specific Lean 4 specification for DO-178C evidence.\n"
-        f"theorem {safe_name}_stub : True := trivial\n"
-    )
+    # DEMO-03 FIX: No longer generates a tautology stub (True := trivial).
+    # Instead, checks if Lean 4 binary is present and returns its version.
+    # Real formal proofs require hand-authored domain-specific specifications.
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".lean", mode="w", encoding="utf-8", delete=False
-        ) as f:
-            f.write(lean_src); tmp = f.name
         r = subprocess.run(
-            ["lean", "--check", tmp],
-            capture_output=True, text=True, timeout=30,
+            ["lean", "--version"],
+            capture_output=True, text=True, timeout=10,
         )
-        Path(tmp).unlink(missing_ok=True)
         if r.returncode == 0:
-            return {"proved": False, "method": "lean4_stub",
-                    "proof": lean_src, "counterexample": "",
-                    "warning": "STUB ONLY: Lean 4 binary present but proof is tautology "
-                               "(True := trivial). NOT a property verification. "
-                               "proved=False because no real property was checked. "
+            lean_version = r.stdout.strip()
+            return {"proved": False, "method": "lean4_available",
+                    "proof": "", "counterexample": "",
+                    "lean_version": lean_version,
+                    "warning": "Lean 4 binary detected but no domain-specific "
+                               "specification exists for this property. "
+                               "Real formal proofs require hand-authored Lean 4 specs. "
                                "Do NOT cite as DO-178C formal evidence."}
         return {"proved": False, "method": "lean4_failed",
                 "proof": "", "counterexample": r.stderr[:500]}

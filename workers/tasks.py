@@ -59,21 +59,23 @@ try:
         self, escalation_id: str, approved_by: str,
         rationale: str, run_id: str
     ) -> dict:
-        """Async-safe escalation approval from external system."""
+        """Async-safe escalation approval from external system.
+
+        BUG-08 FIX: Failures now raise exceptions instead of returning silent
+        error dicts. Celery marks the task as FAILURE, which surfaces in
+        Flower/Prometheus celery_task_failed_total and triggers any configured
+        worker error alerting (Sentry, PagerDuty, etc.).
+        """
         async def _approve() -> dict:
-            try:
-                from config.loader import load_config
-                cfg = load_config()
-            except Exception as exc:
-                log.error(f"[escalation] load_config failed: {exc}")
-                return {"error": f"Configuration load failed: {exc}"}
+            from config.loader import load_config
+            cfg = load_config()
             from orchestrator.controller import StabilizerController
             controller = StabilizerController(cfg)
             try:
                 await controller._init_storage()
                 esc = await controller.storage.get_escalation(escalation_id)
                 if esc is None:
-                    return {"error": f"escalation {escalation_id} not found"}
+                    raise ValueError(f"escalation {escalation_id} not found")
                 from brain.schemas import EscalationStatus
                 from datetime import datetime, timezone
                 esc.status             = EscalationStatus.APPROVED
