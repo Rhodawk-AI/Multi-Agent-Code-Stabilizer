@@ -65,6 +65,11 @@ All secrets are managed via Replit's Secrets panel. Key environment variables:
 - **z3-solver** — Formal verification
 - **Semgrep, Ruff, Bandit, Mypy** — Static analysis tools
 
+## Review Documents
+
+- **`ADVERSARIAL_REVIEW.md`** — Hostile technical review of the entire codebase (46 findings, 130 files analyzed). Covers BLOCK bugs, security issues, SWE-bench ceiling analysis, and DO-178C compliance gaps.
+- **`BILLION_DOLLAR_ROADMAP.md`** — Strategic roadmap covering: path to 90% SWE-bench via open-source integrations (Moatless Tools, OpenHands, ARPO), billion-dollar product architecture, and 14-week sprint plan.
+
 ## Security Notes
 
 - JWT authentication is enforced on all protected endpoints
