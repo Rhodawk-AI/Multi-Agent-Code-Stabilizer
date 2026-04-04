@@ -304,8 +304,8 @@ We are actively seeking accelerator programs, strategic investors, and design pa
 
 | Role | Contact |
 |------|---------|
-| Founder & Lead Engineer | [founder@rhodawk.com](mailto:founder@rhodawk.com) |
-| Operations & Partnerships | [manager@rhodawk.com](mailto:manager@rhodawk.com) |
+| Founder & Lead Engineer | [founder@rhodawk.com](mailto:founder@rhodawkai.com) |
+| Operations & Partnerships | [manager@rhodawk.com](mailto:manager@rhodawkai.com) |
 
 🌐 **Website:** [rhodawkai.com](https://rhodawkai.com)
 
@@ -320,7 +320,7 @@ We welcome contributions from the aerospace software safety, formal verification
 3. Ensure all tests pass (`pytest`)
 4. Submit a pull request with a clear description of the change and its safety implications
 
-For security disclosures, contact [founder@rhodawk.com](mailto:founder@rhodawk.com) directly. Do not open public issues for security vulnerabilities.
+For security disclosures, contact [founder@rhodawkai.com](mailto:founder@rhodawkai.com) directly. Do not open public issues for security vulnerabilities.
 
 ---
 
@@ -335,6 +335,6 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 **Rhodawk AI Code Stabilizer**
 *Autonomous verification for the software that can't fail.*
 
-[rhodawkai.com](https://rhodawkai.com) · [founder@rhodawk.com](mailto:founder@rhodawk.com) · [manager@rhodawk.com](mailto:manager@rhodawk.com)
+[rhodawkai.com](https://rhodawkai.com) · [founder@rhodawk.com](mailto:founder@rhodawkai.com) · [manager@rhodawkai.com](mailto:manager@rhodawkai.com)
 
 </div>
