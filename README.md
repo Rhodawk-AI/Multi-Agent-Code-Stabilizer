@@ -335,6 +335,6 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 **Rhodawk AI Code Stabilizer**
 *Autonomous verification for the software that can't fail.*
 
-[rhodawkai.com](https://rhodawkai.com) · [founder@rhodawk.com](mailto:founder@rhodawkai.com) · [manager@rhodawkai.com](mailto:manager@rhodawkai.com)
+[rhodawkai.com](https://rhodawkai.com) · [founder@rhodawkai.com](mailto:founder@rhodawkai.com) · [manager@rhodawkai.com](mailto:manager@rhodawkai.com)
 
 </div>
