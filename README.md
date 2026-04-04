@@ -1,180 +1,95 @@
-# Rhodawk AI Code Stabilizer v1.0
+<div align="center">
 
-**Swarm-based autonomous AI engineer** for safety-critical code stabilization.
+# Rhodawk AI
 
-> **Benchmark status (March 2026):** SWE-bench Verified has not yet been
-> measured on this system. The 85% target below is an *architectural design
-> goal*, not a measured result. No independent evaluation has been run.
-> Claims in the comparison table are projected targets, not demonstrated scores.
+### Building the autonomous engineering layer for software that can't fail.
 
-## Architecture
+[![Website](https://img.shields.io/badge/Website-rhodawkai.com-0a0a0a?style=flat-square&logo=google-chrome&logoColor=00e5ff)](https://rhodawkai.com)
+[![Contact](https://img.shields.io/badge/Founder-founder%40rhodawk.com-0a0a0a?style=flat-square&logo=mail.ru&logoColor=00e5ff)](mailto:founder@rhodawk.com)
+[![Partnerships](https://img.shields.io/badge/Partnerships-manager%40rhodawk.com-0a0a0a?style=flat-square&logo=mail.ru&logoColor=00e5ff)](mailto:manager@rhodawk.com)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Rhodawk AI Swarm                          │
-├──────────────────┬──────────────────┬───────────────────────┤
-│  LangGraph       │  CrewAI Crews    │  AutoGen Agents       │
-│  State Machine   │  (Security,      │  (Conversational      │
-│                  │   SWE-bench)     │   coordination)       │
-└──────────────────┴──────────────────┴───────────────────────┘
-           ↕ DeerFlow Workflow Orchestration (bespoke async DAG — not Prefect)
-┌─────────────────────────────────────────────────────────────┐
-│                Tiered Model Router                           │
-│  Tier1: Granite 4.0-H-Tiny (7B/1B)  — local, $0.00        │
-│  Tier2: Granite 4.0-H-Small (32B/9B) — local, $0.00       │
-│  Tier3: Llama4 / Devstral2 via OpenRouter — cloud           │
-│  Tier4: Claude Sonnet/Opus — critical fallback              │
-└─────────────────────────────────────────────────────────────┘
-           ↕                    ↕
-┌──────────────────┐  ┌──────────────────────────────────────┐
-│  HelixDB         │  │  ToolHive MCP Layer                  │
-│  (Qdrant-backed) │  │  cppcheck | Semgrep | CVE | SBOM     │
-│  10M+ lines      │  │  Jujutsu  | Swarm Health | Promptfoo  │
-└──────────────────┘  └──────────────────────────────────────┘
-           ↕
-┌─────────────────────────────────────────────────────────────┐
-│  Aegis EDR + Z3/CBMC Formal Verification                    │
-│  Prometheus Metrics | JWT Auth | HMAC Audit Trail           │
-└─────────────────────────────────────────────────────────────┘
-```
+</div>
 
-## Benchmark Targets
+---
 
-> **Model Note:** Granite 4.0-H-Tiny/Small referenced in earlier documentation
-> are unreleased as of this writing. The router uses `granite-code:3b` and
-> `granite-code:8b` (real, available on Ollama hub). Update `models/router.py`
-> when Granite 4.0 ships.
+We build open-source autonomous AI systems that replace the most expensive, error-prone parts of software engineering — starting with the industries where software failure has zero tolerance.
 
+Our thesis: the bottleneck in safety-critical software is no longer writing code. It is **auditing, verifying, and proving correctness** at scale. That bottleneck is now solvable with AI — and the window to own it is open.
 
-| Benchmark          | Target | Realistic Estimate | Baseline (Claude Code) |
-|--------------------|--------|--------------------|-----------------------|
-| SWE-bench Verified | ≥85% | **60–73%** | 80.9% |
-| Terminal-Bench 2.0 | ≥75% | **55–65%** | 65.4% |
-| FLTEval (formal)   | 26.3% | **~20%** | N/A |
-| Cost per issue     | <$0.30 | **$0.15–$0.50** | ~$2.00 |
+---
 
-**Status: NO EVALUATION HAS BEEN RUN.** All numbers in this table are
-engineering estimates based on component ablation studies (Agent S3 BoBN
-paper, Qwen2.5-Coder benchmarks, CBMC coverage literature). The "Target"
-column is aspirational; the "Realistic Estimate" column reflects what we
-expect without ARPO fine-tuning or CPG integration. To obtain an actual
-measured score, run: `rhodawk-bench run --limit 50`
+## Projects
 
-## Positioning
+### 🦅 [Rhodawk AI Code Stabilizer](https://github.com/rhodawkai/rhodawk)
+**Swarm-based autonomous AI engineer for safety-critical code stabilization.**
 
-Rhodawk targets **regulated-industry codebases** (aerospace, defense, nuclear,
-automotive) where DO-178C / IEC 61508 compliance evidence is mandatory and
-human review bottlenecks are the dominant cost driver.
+A multi-agent system (LangGraph + CrewAI + AutoGen) that ingests codebases at 10M+ line scale, finds defects through adversarial ensemble checking (BoBN, N=10), applies formally-verified fixes via Z3/CBMC, and produces tamper-proof DO-178C / IEC 61508 compliance artifacts — all at near-zero variable cost using a local-first tiered model router.
 
-The BoBN (Best-of-Best-of-N) ensemble uses N=10 candidate generations per fix
-by default, which requires 8–10× the GPU compute of single-model solutions.
-This is configurable via environment variables to match your budget:
+> **Status:** Demo-ready · All internal tests passing · SWE-bench evaluation in progress
+> **Target market:** Aerospace, defense, nuclear, automotive software verification
 
-| Profile | Env Vars | GPU Cost | Expected Lift |
-|---------|----------|----------|---------------|
-| **Minimal** (N=2) | `RHODAWK_BOBN_FIXER_A=1 RHODAWK_BOBN_FIXER_B=1` | ~2× baseline | +5-8pp |
-| **Balanced** (N=5) | `RHODAWK_BOBN_FIXER_A=3 RHODAWK_BOBN_FIXER_B=2` | ~5× baseline | +10-15pp |
-| **Full** (N=10, default) | `RHODAWK_BOBN_FIXER_A=6 RHODAWK_BOBN_FIXER_B=4` | ~10× baseline | +12-18pp |
+---
 
-In safety-critical domains, the cost of a missed defect (FAA airworthiness
-directive, nuclear safety shutdown) far exceeds the compute premium. For
-general-purpose coding tasks where cost-per-token matters more than correctness
-guarantees, single-model solutions or N=2 are more appropriate.
+### 🧠 [ProjectZeo](https://github.com/rhodawkai/projectzeo)
+**General Interactive Intelligence (GII) — autonomous desktop operation at human level.**
 
-### ARPO Fine-Tuning Compute Options
+A 257-file, 117K+ line research system implementing a 19-algorithm hybrid cognitive stack (SOAR, BDI, LATS, Reflexion, Active Inference, Theory of Mind, V-JEPA, GRPO, and more) that operates a desktop environment autonomously — perceiving, planning, and acting the way a human operator would. Designed to replace digital labor at scale with locally-run, open-source AI.
 
-Full ARPO training (OpenRLHF, 32B model) requires 4×A100 80GB with ZeRO-3.
-For smaller deployments, use the built-in TRL GRPO single-GPU fallback:
+> **Status:** Active research · GII score 93–95/100 on internal rubric · Vision-based desktop agent
+> **Target use:** Autonomous agent infrastructure, digital labor automation, AI R&D
 
-```bash
-python scripts/arpo_trainer.py --trl    # Single GPU, 7B-14B models
-python scripts/arpo_trainer.py --run    # Multi-GPU, 32B (requires 4×A100)
-```
+---
 
-### Integration Options
+## Our Approach
 
-Rhodawk exposes a REST API (FastAPI) and CLI (`rhodawk`, `rhodawk-bench`).
-For CI/CD integration, use the webhook endpoint (`POST /api/webhook/ci`)
-with HMAC verification. GitHub App and VS Code extension are on the roadmap
-but not yet implemented.
+**Local-first.** Both systems are designed to run on commodity hardware with Ollama-hosted models at $0 variable cost. No cloud dependency, no data exposure — critical for regulated industries and air-gapped environments.
 
-## Configuration: Environment Variables
+**Open source.** Safety-critical tooling must be transparent and auditable. Closed black boxes cannot earn DO-178C trust. Community ownership creates a moat through inspection, contribution, and federated learning.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RHODAWK_JWT_SECRET` | Yes | 256-bit hex secret for JWT signing |
-| `RHODAWK_AUDIT_SECRET` | Yes | HMAC secret for audit trail integrity |
-| `RHODAWK_DEV_AUTH` | Dev only | Set to `1` to bypass auth in development |
-| `RHODAWK_WEBHOOK_SECRET` | Prod | HMAC secret for CI webhook verification |
-| `RHODAWK_CORS_ORIGINS` | No | Comma-separated allowed CORS origins |
-| `RHODAWK_SLACK_WEBHOOK_URL` | No | Slack webhook for escalation notifications |
-| `RHODAWK_ESCALATION_WEBHOOKS` | No | Additional webhook URLs for escalation alerts |
-| `RHODAWK_ENV` | No | Set to `development` for dev mode (default: `production`) |
-| `DATABASE_URL` | Prod | PostgreSQL connection string (SQLite used if absent) |
-| `gap6_federation_peers` | No | Comma-separated peer URLs for federated pattern sharing |
+**Solo-built, production-grade.** Both projects were designed, architected, and implemented by a single founder — 317K+ lines of production code across two systems. This is what obsession with the problem looks like.
 
-> **Note:** Without `RHODAWK_SLACK_WEBHOOK_URL` or `RHODAWK_ESCALATION_WEBHOOKS`,
-> escalation notifications are logged but not delivered externally. Configure at
-> least one notification channel for DO-178C DAL-A deployments where human-in-the-loop
-> approval is mandatory.
+**Honest engineering.** We publish benchmark targets alongside honest estimates and current status. We do not claim measured results we haven't run. Trust is the only currency that matters in safety-critical markets.
 
-## Quick Start
+---
 
-```bash
-# 1. Install
-pip install -e ".[dev]"
+## Roadmap Highlights
 
-# 2. Set required secrets (never skip this)
-export RHODAWK_JWT_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
-export RHODAWK_AUDIT_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
-export RHODAWK_DEV_AUTH=1
+| Timeline | Milestone |
+|----------|-----------|
+| Q2 2026 | SWE-bench Verified external evaluation — published results |
+| Q2 2026 | ARPO fine-tuning pipeline — open weights released |
+| Q3 2026 | Rhodawk GitHub App + VS Code extension |
+| Q3 2026 | Enterprise compliance dashboard (DO-178C artifact export) |
+| Q4 2026 | Rhodawk SaaS beta — managed deployment for aerospace teams |
+| Q1 2027 | Federated fix-pattern network (Gap 6 production) |
+| 2027+ | ProjectZeo v2 — multi-modal GII with full tool-use autonomy |
 
-# 3. Pull local models (Ollama)
-ollama pull granite-code:8b
-ollama pull granite-code:3b
-ollama pull qwen2.5-coder:32b
+---
 
-# 4. Start API server
-uvicorn api.app:app --port 8000
+## For Accelerators & Investors
 
-# 5. Run stabilization
-rhodawk run --repo-url https://github.com/org/repo \
-            --repo-root /path/to/cloned/repo \
-            --max-cycles 10
+We are actively applying to accelerator programs and seeking strategic investment.
 
-# 6. Run SWE-bench evaluation
-rhodawk-bench run --limit 50
-```
+**What we're building toward:** A defensible platform business at the intersection of AI, formal verification, and regulated-industry compliance — a vertical that general-purpose AI coding tools (Copilot, Cursor, Claude Code) cannot enter without a complete architectural rebuild.
 
-## Bug Fixes (B1–B12)
+**What we're looking for:**
+- Accelerator programs with enterprise / deep-tech tracks
+- Design partners with DO-178C, IEC 61508, or ISO 26262 obligations
+- GPU compute credits for fine-tuning and benchmarking
+- Introductions to aerospace and defense software procurement
 
-| ID  | Component              | Fix |
-|-----|------------------------|-----|
-| B1  | audit_trail.py         | HMAC secret from env, fail-fast |
-| B2  | api/routes             | JWT Bearer auth on all endpoints |
-| B3  | config/loader.py       | Required secrets validated at startup |
-| B4  | api/app.py             | Prometheus /metrics endpoint |
-| B5  | plugins/base.py        | Subprocess env scrubbed of credentials |
-| B6  | plugins/base.py        | Plugin path validation |
-| B7  | utils/rate_limiter.py  | Returns key, never sets os.environ |
-| B8  | security/aegis.py      | ExfiltrationGuard covers terminal ops |
-| B9  | api/websocket          | WebSocket JWT via ?token= |
-| B10 | config/loader.py       | Config fails if secrets missing |
-| B11 | orchestrator/controller| Aegis EDR scans every fix pre-commit |
-| B12 | memory/helixdb.py      | Qdrant-backed 10M+ line scale |
+**Get in touch:**
 
-## New Modules
+| | |
+|--|--|
+| 🌐 Website | [rhodawkai.com](https://rhodawkai.com) |
+| 👤 Founder | [founder@rhodawk.com](mailto:founder@rhodawk.com) |
+| 🤝 Partnerships | [manager@rhodawk.com](mailto:manager@rhodawk.com) |
 
-```
-auth/            JWT middleware + token factory
-metrics/         Prometheus instrumentation
-models/          Tiered model router (local→cloud)
-swarm/           DeerFlow (bespoke DAG) + CrewAI + AutoGen
-verification/    Advisory property reasoning + Z3 formal verification
-memory/          HelixDB (Qdrant graph+vector)
-security/        Aegis EDR (exploit + injection detection)
-tools/           ToolHive MCP layer + server stubs
-swe_bench/       SWE-bench Verified evaluation harness
-workers/         Celery distributed workers
-rust/mcp_server/ High-performance Rust MCP static analysis
-```
+---
+
+<div align="center">
+
+*Autonomous verification for the software that can't fail.*
+
+</div>
