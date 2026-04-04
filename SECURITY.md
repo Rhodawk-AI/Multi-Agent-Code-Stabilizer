@@ -1,0 +1,1 @@
+"If you discover a vulnerability in the Aegis EDR or the core Swarm logic, do NOT open a public issue. Email founder@rhodawkai.com directly. We aim to respond to critical disclosures within 24 hours."
