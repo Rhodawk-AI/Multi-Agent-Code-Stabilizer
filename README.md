@@ -304,8 +304,8 @@ We are actively seeking accelerator programs, strategic investors, and design pa
 
 | Role | Contact |
 |------|---------|
-| Founder & Lead Engineer | [founder@rhodawk.com](mailto:founder@rhodawkai.com) |
-| Operations & Partnerships | [manager@rhodawk.com](mailto:manager@rhodawkai.com) |
+| Founder & Lead Engineer | [founder@rhodawkai.com](mailto:founder@rhodawkai.com) |
+| Operations & Partnerships | [manager@rhodawkai.com](mailto:manager@rhodawkai.com) |
 
 🌐 **Website:** [rhodawkai.com](https://rhodawkai.com)
 
