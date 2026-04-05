@@ -728,6 +728,11 @@ pdm run pytest tests/ -v
 ```
 
 ---
+Contact for any queries
+
+founder@rhodawkai.com
+
+manager@rhodawkai.com
 
 ## 🔒 Security
 
