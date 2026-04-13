@@ -79,10 +79,42 @@ class ReviewerAgent(BaseAgent):
         return decisions
 
     async def _review_fix(self, fix: FixAttempt) -> ReviewDecision:
-        file_summaries = "\n".join(
-            f"  {ff.path} — {ff.diff_summary or ff.changes_made[:150]}"
-            for ff in fix.fixed_files
-        )
+        # DIFF-01 FIX: present the FULL unified diff (ff.patch) to the reviewer
+        # instead of ff.changes_made[:150].  The original 150-char prose snippet
+        # is equivalent to asking a code reviewer to approve a PR without showing
+        # them the diff — they can only rubber-stamp, not actually review.
+        # With the full diff the reviewer can detect: introduced off-by-one errors,
+        # sign-flip bugs, incomplete null checks, changed return paths, and other
+        # issues that are invisible from a one-line summary.
+        _MAX_CONTENT_CHARS = 24_000   # ~6 000 lines — keeps prompt within budget
+        file_sections: list[str] = []
+        for ff in fix.fixed_files:
+            lines = [f"### `{ff.path}`"]
+            if ff.diff_summary:
+                lines.append(f"**Summary**: {ff.diff_summary}")
+            if ff.changes_made:
+                lines.append(f"**Changes**: {ff.changes_made}")
+            if ff.patch and ff.patch.strip():
+                # Unified diff — present in full so the reviewer sees every hunk
+                lines.append("```diff")
+                lines.append(ff.patch)
+                lines.append("```")
+            elif ff.content:
+                # Full-file rewrite path (PatchMode.FULL_FILE / AST_REWRITE)
+                display = ff.content
+                if len(display) > _MAX_CONTENT_CHARS:
+                    display = (
+                        display[:_MAX_CONTENT_CHARS]
+                        + f"\n... [{len(ff.content) - _MAX_CONTENT_CHARS} chars omitted — file too large]")
+                lines.append("```")
+                lines.append(display)
+                lines.append("```")
+            else:
+                lines.append("_No content or patch available for this file._")
+            file_sections.append("\n".join(lines))
+
+        file_summaries = "\n\n".join(file_sections)
+
         issues = [
             await self.storage.get_issue(iid) for iid in fix.issue_ids
         ]
@@ -95,7 +127,7 @@ class ReviewerAgent(BaseAgent):
             f"## Fix to Review\n"
             f"Fix ID: {fix.id[:12]}\n\n"
             f"## Issues Being Fixed\n{issue_summary}\n\n"
-            f"## Files Modified\n{file_summaries}\n\n"
+            f"## Files Modified (full unified diff)\n{file_summaries}\n\n"
             "## Review Criteria\n"
             "1. Does the fix completely and correctly address the stated issues?\n"
             "2. Does the fix introduce any new bugs, security vulnerabilities, or "
