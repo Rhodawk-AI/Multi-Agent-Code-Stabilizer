@@ -567,64 +567,131 @@ def _require_dt(v: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# ── POOL-01 FIX: aiosqlite connection pool ────────────────────────────────
+# A single shared aiosqlite.Connection across concurrent async tasks serialises
+# ALL I/O through one OS file handle. Under heavy cycle concurrency (4+ parallel
+# fix groups each doing storage reads) this causes deadlocks: aiosqlite's
+# internal thread is blocked by one coroutine's cursor while another coroutine's
+# await for the same connection never resolves.
+#
+# Fix: maintain a pool of N independent read connections. Writes are serialised
+# through a dedicated write connection (WAL mode) so SQLite's write serialisation
+# is still respected. Pool size is configurable via RHODAWK_SQLITE_POOL_SIZE.
+import os as _os
+_POOL_SIZE = int(_os.environ.get("RHODAWK_SQLITE_POOL_SIZE", "8"))
+
+
 class SQLiteBrainStorage(BrainStorage):
 
     def __init__(self, db_path: str | Path = ".stabilizer/brain.db") -> None:
-        self._path       = Path(db_path)
-        self._db: aiosqlite.Connection | None = None
-        self._write_lock = asyncio.Lock()
+        self._path         = Path(db_path)
+        # Dedicated write connection — serialised by _write_lock
+        self._write_conn:  aiosqlite.Connection | None = None
+        self._write_lock   = asyncio.Lock()
+        # Read pool — asyncio.Queue of open aiosqlite.Connection objects
+        self._pool:        asyncio.Queue  # type: ignore[type-arg]
+        self._pool_size:   int = _POOL_SIZE
+        self._initialised: bool = False
 
     @asynccontextmanager
     async def _conn(self) -> AsyncIterator[aiosqlite.Connection]:
-        if self._db is None:
-            raise RuntimeError("Storage not initialised — call await storage.initialise() first")
-        yield self._db
+        """Acquire a pooled read connection (blocks if pool is exhausted)."""
+        if not self._initialised:
+            raise RuntimeError(
+                "Storage not initialised — call await storage.initialise() first"
+            )
+        conn = await self._pool.get()
+        try:
+            yield conn
+        finally:
+            await self._pool.put(conn)
 
     @asynccontextmanager
     async def _write(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Acquire the dedicated write connection (serialised by lock)."""
         async with self._write_lock:
-            if self._db is None:
-                raise RuntimeError("Storage not initialised — call await storage.initialise() first")
-            yield self._db
+            if self._write_conn is None:
+                raise RuntimeError(
+                    "Storage not initialised — call await storage.initialise() first"
+                )
+            yield self._write_conn
 
     async def initialise(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self._path))
-        self._db.row_factory = aiosqlite.Row
-        async with self._db.executescript(DDL):
+
+        # Bootstrap: apply DDL and enable WAL on a temporary connection.
+        # WAL mode must be set before the pool is created so all connections
+        # share the same WAL file.
+        _boot = await aiosqlite.connect(str(self._path))
+        _boot.row_factory = aiosqlite.Row
+        await _boot.execute("PRAGMA journal_mode=WAL")
+        await _boot.execute("PRAGMA synchronous=NORMAL")
+        async with _boot.executescript(DDL):
             pass
-        await self._db.commit()
+        await _boot.commit()
+        await _boot.close()
+
+        # Write connection
+        self._write_conn = await aiosqlite.connect(str(self._path))
+        self._write_conn.row_factory = aiosqlite.Row
+        await self._write_conn.execute("PRAGMA journal_mode=WAL")
+        await self._write_conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Read pool — each connection is query-only to catch accidental writes
+        self._pool = asyncio.Queue(maxsize=self._pool_size)
+        for _ in range(self._pool_size):
+            conn = await aiosqlite.connect(str(self._path))
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA query_only=ON")
+            await self._pool.put(conn)
+
+        self._initialised = True
         await self._run_migrations()
         try:
             from brain.migrations import apply_migrations_sqlite
-            await apply_migrations_sqlite(self._db)
+            await apply_migrations_sqlite(self._write_conn)
         except Exception as exc:
             log.warning(f"Schema migration check failed (non-fatal): {exc}")
-        log.info(f"Brain storage initialised at {self._path}")
+        log.info(
+            f"Brain storage initialised at {self._path} "
+            f"(pool_size={self._pool_size})"
+        )
 
     async def _run_migrations(self) -> None:
         """Apply additive column migrations idempotently."""
         for stmt in _MIGRATIONS:
             try:
-                await self._db.execute(stmt)
-                await self._db.commit()
+                await self._write_conn.execute(stmt)
+                await self._write_conn.commit()
             except Exception:
-                                                        
                 pass
 
     async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-            self._db = None
-
-    def __del__(self) -> None:
-        if self._db is not None:
+        self._initialised = False
+        # Drain and close all pool connections
+        if hasattr(self, "_pool"):
+            closed = 0
+            while not self._pool.empty():
+                try:
+                    conn = self._pool.get_nowait()
+                    await conn.close()
+                    closed += 1
+                except Exception:
+                    pass
+            log.debug(f"[sqlite] Closed {closed} pool read connections")
+        # Close write connection
+        if self._write_conn:
             try:
-                self._db.stop()
+                await self._write_conn.close()
             except Exception:
                 pass
-            finally:
-                self._db = None
+            self._write_conn = None
+
+    def __del__(self) -> None:
+        # Best-effort teardown — aiosqlite handles internal thread cleanup
+        self._write_conn  = None
+        self._initialised = False
 
 
                                                                                
