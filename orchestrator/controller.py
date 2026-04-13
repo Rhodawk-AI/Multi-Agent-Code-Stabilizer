@@ -1135,10 +1135,30 @@ class StabilizerController:
             getattr(self.run, "cycle_count", 1) > 1
             and self._commit_audit_scheduler is not None
         )
-        issues = await self._phase_audit(stale_only=is_incremental_cycle)
-        # FIX (CRITICAL): populate inter-phase state so DeerFlow consensus/fix
-        # steps receive the issue list.  Without this assignment _last_audit_issues
-        # defaulted to [] and the entire fix pipeline was a silent no-op.
+        # ── GUARD-01 FIX: _last_audit_issues partial-list guard ───────────────
+        # If _phase_audit raises an exception midway (e.g. SynthesisAgent crash,
+        # storage error) we must NOT assign a partial issue list to
+        # _last_audit_issues. A partial list passed to ConsensusEngine produces
+        # phantom approvals — issues that look approved but map to incomplete
+        # audit data. Instead we preserve the previous clean state (empty on
+        # first cycle, last clean result on subsequent cycles) and re-raise so
+        # the DeerFlow orchestrator can decide whether to skip or halt the cycle.
+        _previous_issues = list(self._last_audit_issues)   # snapshot
+        try:
+            issues = await self._phase_audit(stale_only=is_incremental_cycle)
+        except Exception as _audit_exc:
+            self.log.error(
+                "[audit] _phase_audit raised an exception — preserving previous "
+                "_last_audit_issues (%d issues) and NOT passing partial results "
+                "to consensus. Exception: %s",
+                len(_previous_issues), _audit_exc,
+            )
+            # Reset to empty so a stale list from a prior cycle never leaks into
+            # a new cycle's consensus pass.
+            self._last_audit_issues = []
+            raise
+
+        # Audit completed cleanly — commit the result.
         self._last_audit_issues = issues
         # Gap 2: _last_compound_findings is set inside _phase_audit by SynthesisAgent.
         # It is already populated when we reach here.
@@ -1252,6 +1272,34 @@ class StabilizerController:
             await self.run_read_phase(incremental=True, force_reread=modified)
             await self.run_build_graph_phase()
 
+        # ── STALE-01 FIX: repo_map staleness after commit ─────────────────────
+        # After a fix is committed and this phase runs, the repo_map object held
+        # by self._repo_map may still cache symbol/centrality data from BEFORE
+        # the commit.  ReaderAgent.run() calls self.repo_map.invalidate() during
+        # the read pass above, but if the same object reference is held by an
+        # already-constructed FixerAgent from an earlier concurrent task, that
+        # agent still sees the pre-commit map.
+        #
+        # Fix: unconditionally invalidate the controller's repo_map reference
+        # here AND force an immediate cache-warm (generate()) so that the NEXT
+        # cycle's FixerAgent construction receives a pre-built, post-commit map
+        # rather than a lazy-rebuilt one that may race with the next audit phase.
+        if self._repo_map is not None and self.config.repo_map_enabled:
+            try:
+                self._repo_map.invalidate()
+                # Pre-warm with no target_files so the full repo map is rebuilt
+                # in this background phase rather than on the critical path of
+                # the next cycle's fix prompt assembly.
+                self._repo_map.generate(max_tokens=self.config.repo_map_max_tokens)
+                self.log.debug(
+                    "[reindex] repo_map invalidated and regenerated post-commit"
+                )
+            except Exception as _rm_exc:
+                self.log.debug(
+                    "[reindex] repo_map post-commit refresh failed (non-fatal): %s",
+                    _rm_exc,
+                )
+
     # ── Audit phase ────────────────────────────────────────────────────────────
 
     async def _phase_audit(self, stale_only: bool = False) -> list[Issue]:
@@ -1318,6 +1366,32 @@ class StabilizerController:
             f"[audit] Three-domain audit complete: {raw_count} raw findings "
             f"(SECURITY + ARCHITECTURE + STANDARDS)"
         )
+
+        # ── TOOL-WIRE-01 FIX: dynamic tool server integration ─────────────────
+        # tools/servers/ (semgrep_server, mariana_trench_server, etc.) were
+        # previously disconnected stubs — defined but never called from the main
+        # hunting loop.  Wire them in here so the system dynamically triggers
+        # them during the audit phase and their pre-computed findings are merged
+        # into all_issues before the SynthesisAgent dedup pass.
+        #
+        # Tool servers are additive — failures are non-fatal and logged at WARNING.
+        # Findings are deduplicated by SynthesisAgent in the next step.
+        try:
+            tool_issues = await self._run_tool_servers()
+            if tool_issues:
+                for ti in tool_issues:
+                    record_issue(ti.severity.value, self.config.domain_mode.value)
+                all_issues.extend(tool_issues)
+                self.log.info(
+                    "[audit] Tool servers contributed %d additional findings "
+                    "(total before synthesis: %d)",
+                    len(tool_issues), len(all_issues),
+                )
+        except Exception as _tool_exc:
+            self.log.warning(
+                "[audit] TOOL-WIRE-01: tool server run failed (non-fatal, "
+                "continuing with LLM-only findings): %s", _tool_exc,
+            )
 
         # ── Gap 2: Synthesis — dedup + cross-domain compound detection ────────
         if self.config.synthesis_enabled and all_issues:
@@ -1520,6 +1594,192 @@ class StabilizerController:
             ),
         )
         return all_issues
+
+    # ── TOOL-WIRE-01: dynamic tool server dispatch ─────────────────────────────
+
+    async def _run_tool_servers(self) -> list[Issue]:
+        """
+        Dynamically invoke wired tool servers (Semgrep, Mariana Trench, etc.)
+        and convert their findings to Issue objects for the main hunting loop.
+
+        Design principles:
+          - Each tool server is called in parallel via asyncio.gather.
+          - Individual server failures are caught and logged — they NEVER abort
+            the main audit pipeline.
+          - Findings are returned without dedup; SynthesisAgent handles that.
+          - Mariana Trench is only invoked when Java/Android source files exist.
+          - Semgrep uses the pinned offline ruleset (see semgrep_server.py).
+
+        Returns an empty list on total failure so the caller is unaffected.
+        """
+        assert self.run and self.storage and self.config.repo_root
+
+        tasks = []
+
+        # ── Semgrep (Python / JS / TS / Go / Ruby / etc.) ────────────────────
+        if self.config.run_semgrep:
+            tasks.append(self._run_semgrep_server())
+
+        # ── Mariana Trench (Android / Java taint analysis) ───────────────────
+        # Only invoke when the repo contains .java files — the tool requires
+        # the Android SDK and takes 60-300 s on non-trivial codebases.
+        if self._repo_has_java():
+            tasks.append(self._run_mariana_trench_server())
+
+        if not tasks:
+            return []
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        issues: list[Issue] = []
+        for r in results:
+            if isinstance(r, list):
+                issues.extend(r)
+            elif isinstance(r, Exception):
+                self.log.warning(
+                    "[TOOL-WIRE-01] A tool server raised an exception "
+                    "(non-fatal): %s", r,
+                )
+        return issues
+
+    def _repo_has_java(self) -> bool:
+        """Return True when the repo contains at least one .java source file."""
+        try:
+            for _ in self.config.repo_root.rglob("*.java"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _run_semgrep_server(self) -> list[Issue]:
+        """
+        Call semgrep_server.semgrep_scan() on every non-binary source file and
+        aggregate the results as Issue objects.
+
+        Semgrep is invoked in a thread-pool executor to avoid blocking the event
+        loop on the subprocess call.
+        """
+        try:
+            from tools.servers.semgrep_server import semgrep_scan_repo
+        except ImportError:
+            # Older server that only exposes per-file API — fall back gracefully
+            self.log.debug("[TOOL-WIRE-01] semgrep_server: semgrep_scan_repo not found, skipping")
+            return []
+
+        assert self.run
+
+        try:
+            loop = asyncio.get_event_loop()
+            raw_findings: list[dict] = await loop.run_in_executor(
+                None,
+                semgrep_scan_repo,
+                str(self.config.repo_root),
+            )
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] semgrep_server run failed: %s", exc)
+            return []
+
+        issues: list[Issue] = []
+        for f in raw_findings:
+            try:
+                sev_str = str(f.get("severity", "medium")).lower()
+                sev_map = {
+                    "critical": Severity.CRITICAL,
+                    "high":     Severity.HIGH,
+                    "medium":   Severity.MEDIUM,
+                    "low":      Severity.LOW,
+                    "info":     Severity.INFO,
+                }
+                sev = sev_map.get(sev_str, Severity.MEDIUM)
+                issue = Issue(
+                    run_id      = self.run.id,
+                    file_path   = f.get("file_path", f.get("path", "unknown")),
+                    line_start  = int(f.get("line", f.get("line_start", 0))),
+                    line_end    = int(f.get("line_end", f.get("line", 0))),
+                    description = f"[Semgrep:{f.get('rule', 'rule')}] {f.get('msg', f.get('message', ''))}",
+                    severity    = sev,
+                    source      = "semgrep_server",
+                )
+                await self.storage.upsert_issue(issue)
+                issues.append(issue)
+            except Exception as _conv_exc:
+                self.log.debug(
+                    "[TOOL-WIRE-01] semgrep finding conversion failed: %s", _conv_exc
+                )
+
+        self.log.info("[TOOL-WIRE-01] Semgrep: %d findings", len(issues))
+        return issues
+
+    async def _run_mariana_trench_server(self) -> list[Issue]:
+        """
+        Run Mariana Trench taint analysis via its MCP tool server and convert
+        findings to Issue objects.
+
+        MT findings bypass the LLM discovery step because MT already computed
+        the full source-to-sink trace.  The description includes the trace so
+        the FixerAgent can determine whether to sanitize at the source, sink,
+        or an intermediate step.
+        """
+        try:
+            from tools.servers.mariana_trench_server import run_mariana_trench_analysis
+        except ImportError:
+            self.log.debug("[TOOL-WIRE-01] mariana_trench_server not importable, skipping")
+            return []
+
+        assert self.run
+
+        try:
+            import tempfile, os as _os
+            output_dir = _os.path.join(
+                tempfile.gettempdir(),
+                f"rhodawk_mt_{self.run.id[:8]}",
+            )
+            raw_findings: list[dict] = await run_mariana_trench_analysis(
+                repo_root  = str(self.config.repo_root),
+                output_dir = output_dir,
+            )
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] mariana_trench run failed: %s", exc)
+            return []
+
+        issues: list[Issue] = []
+        for f in raw_findings:
+            try:
+                sev_str = str(f.get("severity", "high")).lower()
+                sev_map = {
+                    "critical": Severity.CRITICAL,
+                    "high":     Severity.HIGH,
+                    "medium":   Severity.MEDIUM,
+                    "low":      Severity.LOW,
+                }
+                sev = sev_map.get(sev_str, Severity.HIGH)
+                description = f.get("description", "")
+                if not description:
+                    rule   = f.get("rule", f.get("check_id", "MT"))
+                    source = f.get("source", "")
+                    sink   = f.get("sink", "")
+                    description = (
+                        f"[MarianaTrench:{rule}] Taint flow"
+                        + (f" from {source}" if source else "")
+                        + (f" to {sink}"     if sink   else "")
+                    )
+                issue = Issue(
+                    run_id      = self.run.id,
+                    file_path   = f.get("file_path", f.get("path", "unknown")),
+                    line_start  = int(f.get("line", f.get("line_start", 0))),
+                    line_end    = int(f.get("line_end", f.get("line", 0))),
+                    description = description,
+                    severity    = sev,
+                    source      = "mariana_trench_server",
+                )
+                await self.storage.upsert_issue(issue)
+                issues.append(issue)
+            except Exception as _conv_exc:
+                self.log.debug(
+                    "[TOOL-WIRE-01] MT finding conversion failed: %s", _conv_exc
+                )
+
+        self.log.info("[TOOL-WIRE-01] Mariana Trench: %d findings", len(issues))
+        return issues
 
     # ── Consensus phase ────────────────────────────────────────────────────────
 
