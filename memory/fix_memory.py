@@ -69,6 +69,21 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# ── LOCK-01 FIX: file locking for JSON fallback ───────────────────────────
+# Concurrent writers from multi-cycle runs on the same repo will corrupt the
+# JSON store without locking: writer A reads [r1,r2], writer B reads [r1,r2],
+# both append, both write — one record is silently lost.
+try:
+    from filelock import FileLock as _FileLock
+    _FILELOCK_AVAILABLE = True
+except ImportError:
+    _FILELOCK_AVAILABLE = False
+    log.debug(
+        "[fix_memory] filelock not installed (pip install filelock) — "
+        "JSON fallback uses atomic rename-swap only. Install filelock for "
+        "full concurrent-write safety."
+    )
+
 _MEMORY_COLLECTION = "rhodawk_fix_memory"
 
 
@@ -887,14 +902,41 @@ class FixMemory:
     # ── JSON fallback backend ─────────────────────────────────────────────────
 
     def _json_store(self, meta: dict) -> None:
+        """
+        LOCK-01 FIX: write to JSON fallback with strict file locking.
+
+        Concurrent writers from multi-cycle runs on the same repo previously
+        produced torn writes: writer A reads [r1,r2], writer B reads [r1,r2],
+        both append their record, both write — one record is lost.
+
+        Fix: acquire an exclusive FileLock (cross-process safe) before the
+        read-modify-write cycle. Fall back to an atomic rename-swap when
+        filelock is unavailable (provides partial safety: prevents partial
+        reads, not concurrent-writer loss).
+        """
         if not self._json_path:
             return
-        records = self._json_load()
-        records.append(meta)
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        self._json_path.write_text(
-            json.dumps(records, indent=2), encoding="utf-8"
-        )
+        lock_path = self._json_path.with_suffix(".json.lock")
+
+        def _do_write() -> None:
+            records = self._json_load_unlocked()
+            records.append(meta)
+            # Atomic write: tmp → rename prevents readers from seeing a
+            # partially-written file.
+            tmp_path = self._json_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+            tmp_path.replace(self._json_path)
+
+        if _FILELOCK_AVAILABLE:
+            try:
+                with _FileLock(str(lock_path), timeout=30):
+                    _do_write()
+            except Exception as exc:
+                log.warning("[fix_memory] FileLock acquisition failed (%s) — "                            "attempting unlocked write", exc)
+                _do_write()
+        else:
+            _do_write()
 
     def _json_retrieve(
         self, query: str, n: int
@@ -926,6 +968,24 @@ class FixMemory:
         ]
 
     def _json_load(self) -> list[dict]:
+        """
+        LOCK-01 FIX: acquire a shared lock before reading to avoid seeing a
+        partially-written file from a concurrent _json_store call.
+        """
+        if not self._json_path or not self._json_path.exists():
+            return []
+        lock_path = self._json_path.with_suffix(".json.lock")
+        if _FILELOCK_AVAILABLE:
+            try:
+                with _FileLock(str(lock_path), timeout=10):
+                    return self._json_load_unlocked()
+            except Exception:
+                # Lock timeout — best-effort read
+                return self._json_load_unlocked()
+        return self._json_load_unlocked()
+
+    def _json_load_unlocked(self) -> list[dict]:
+        """Read without acquiring lock — caller must hold the lock."""
         if not self._json_path or not self._json_path.exists():
             return []
         try:
