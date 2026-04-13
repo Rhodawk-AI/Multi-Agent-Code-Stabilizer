@@ -97,6 +97,27 @@ class ReaderAgent(BaseAgent):
                     "[reader] RepoMap cache invalidated after read pass "
                     f"({len(processed)} files)"
                 )
+                # STALE-01 FIX: on incremental (reindex) passes — triggered
+                # after a commit via run_reindex_phase() — force an immediate
+                # cache-warm so the NEXT cycle's FixerAgent receives a
+                # pre-built, post-commit map rather than building it lazily
+                # on the critical path of fix-prompt assembly.
+                #
+                # force_reread being non-None (or non-empty) is the reliable
+                # signal that this is a post-commit reindex pass, not the
+                # initial full scan.
+                if force_reread:
+                    try:
+                        self.repo_map.generate(max_tokens=2048)
+                        self.log.debug(
+                            "[reader] RepoMap pre-warmed after commit reindex "
+                            f"(modified={len(force_reread)} file(s))"
+                        )
+                    except Exception as _warm_exc:
+                        self.log.debug(
+                            "[reader] RepoMap pre-warm failed (non-fatal): %s",
+                            _warm_exc,
+                        )
             except Exception as exc:
                 self.log.debug(f"[reader] RepoMap invalidate failed (non-fatal): {exc}")
 

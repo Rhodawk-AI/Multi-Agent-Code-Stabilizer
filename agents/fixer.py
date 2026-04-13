@@ -275,6 +275,23 @@ class FixerAgent(BaseAgent):
         file_context = await self._build_file_context(file_paths, file_contents, patch_modes)
         vector_context = await self._get_vector_context(issues)
 
+        # ── BUDGET-01 FIX: token-budget enforcement ───────────────────────────
+        # Assemble the full prompt before the LLM call and measure its size.
+        # If the combined context exceeds the model's context window, truncate
+        # file_context FIRST — never the CPG slice or memory examples, which
+        # carry the highest-value causal and pattern signal.  Silently exceeding
+        # the budget causes the API to drop content from the END of the prompt,
+        # which removes CPG + memory examples first — the exact opposite of what
+        # we want.
+        file_context = self._enforce_context_budget(
+            file_context=file_context,
+            cpg_context=cpg_context,
+            memory_examples=memory_examples,
+            repo_map_text=repo_map_text,
+            issue_summary=issue_summary,
+            model=model,
+        )
+
         # ARCH-03 FIX: populate issue.fail_tests via heuristic test extraction
         # before the fix generation loop so the BoBN sampler receives a non-zero
         # test_score signal even for static-analysis-sourced issues that have no
@@ -467,6 +484,135 @@ class FixerAgent(BaseAgent):
                 self.log.debug(f'_check_bug_recurrence (coupling): {exc}')
 
         return signal
+
+    # ── BUDGET-01: context window enforcement helpers ─────────────────────────
+
+    _CHARS_PER_TOKEN: float = 3.5   # conservative code estimate (≈3.5 chars/token)
+    _OUTPUT_RESERVE:  int   = 4_096  # tokens reserved for model output
+
+    @staticmethod
+    def _get_context_window(model: str) -> int:
+        """
+        Return the published context window (in tokens) for a model.
+
+        We err on the CONSERVATIVE side — better to truncate file content by a
+        few hundred tokens than to silently lose CPG context at the API layer.
+
+        Override by setting RHODAWK_CONTEXT_WINDOW_TOKENS in the environment.
+        """
+        import os as _os
+        env_override = _os.environ.get("RHODAWK_CONTEXT_WINDOW_TOKENS", "")
+        if env_override.isdigit():
+            return int(env_override)
+
+        m = model.lower()
+        # 200 K (Claude)
+        if "claude" in m:
+            return 200_000
+        # 128 K class
+        if any(x in m for x in (
+            "qwen2.5", "qwen2-5", "llama-3", "llama3",
+            "deepseek-v2", "deepseek-coder-v2",
+            "devstral", "mistral-large", "gpt-4o",
+        )):
+            return 128_000
+        # 32 K class
+        if any(x in m for x in ("32b", "coder-32", "qwen2", "gpt-4-32")):
+            return 32_768
+        # Conservative default for unknown models
+        return 32_768
+
+    def _enforce_context_budget(
+        self,
+        file_context:    str,
+        cpg_context:     str,
+        memory_examples: str,
+        repo_map_text:   str,
+        issue_summary:   str,
+        model:           str,
+    ) -> str:
+        """
+        BUDGET-01 FIX — enforce strict token budget before the LLM call.
+
+        Truncation priority (highest = never truncated):
+          1. CPG backward slice      — causal context; losing it causes regressions
+          2. Memory few-shot examples — pattern recall; losing them drops fix quality
+          3. Repo map                 — structural context; truncate to 50% if needed
+          4. File contents            — truncated proportionally to fit the remainder
+
+        When file_context is truncated, a visible sentinel is appended so the model
+        knows it received incomplete content rather than silently reasoning over a
+        broken partial file.
+
+        Returns the (possibly truncated) file_context string.
+        """
+        window   = self._get_context_window(model)
+        budget_t = window - self._OUTPUT_RESERVE   # tokens available for input
+
+        # Estimate token counts for each immutable component
+        cpg_t     = len(cpg_context)     / self._CHARS_PER_TOKEN
+        memory_t  = len(memory_examples) / self._CHARS_PER_TOKEN
+        repo_t    = len(repo_map_text)   / self._CHARS_PER_TOKEN
+        summary_t = len(issue_summary)   / self._CHARS_PER_TOKEN
+        # System prompt + instruction blocks + JSON wrapper overhead
+        overhead_t = 2_500
+
+        protected_t = cpg_t + memory_t + summary_t + overhead_t
+
+        if protected_t >= budget_t:
+            # Edge case: even the protected context is too large.
+            # Emit an error — operator must either shorten CPG slice max_lines
+            # or switch to a model with a larger context window.
+            self.log.error(
+                "[Fixer] BUDGET-01: protected context alone (%d tokens) exceeds "
+                "context budget (%d tokens) for model=%r. "
+                "Reduce cpg_max_slice_nodes or switch to a 128K context model. "
+                "file_context will be EMPTY for this fix group.",
+                int(protected_t), budget_t, model,
+            )
+            return ""
+
+        remaining_t = budget_t - protected_t
+
+        # Allocate repo_map: cap at 25% of remaining budget
+        repo_cap_t  = remaining_t * 0.25
+        actual_repo_t = min(repo_t, repo_cap_t)
+        if repo_t > repo_cap_t:
+            self.log.warning(
+                "[Fixer] BUDGET-01: repo_map truncated from %d → %d tokens "
+                "to fit context budget (model=%r).",
+                int(repo_t), int(actual_repo_t), model,
+            )
+
+        file_budget_t = remaining_t - actual_repo_t
+        file_actual_t = len(file_context) / self._CHARS_PER_TOKEN
+
+        if file_actual_t <= file_budget_t:
+            return file_context   # no truncation needed ✓
+
+        # Truncate file_context to the available budget
+        max_chars = int(file_budget_t * self._CHARS_PER_TOKEN)
+        # Prefer breaking on a newline boundary near the cut point
+        search_start = max(0, max_chars - 400)
+        last_nl      = file_context.rfind("\n", search_start, max_chars)
+        cut          = last_nl if last_nl > search_start else max_chars
+
+        self.log.warning(
+            "[Fixer] BUDGET-01: file_context truncated from %d → %d tokens "
+            "(budget=%d, model=%r, window=%d). "
+            "CPG slice (%d tok) and memory examples (%d tok) are PRESERVED.",
+            int(file_actual_t), int(file_budget_t), budget_t,
+            model, window, int(cpg_t), int(memory_t),
+        )
+
+        sentinel = (
+            "\n\n"
+            "⚠️  [FILE CONTEXT TRUNCATED — token budget exhausted]\n"
+            "The file contents above were cut to preserve the CPG causal slice\n"
+            "and memory examples. Fix the issues using the available context.\n"
+            "If the truncation point falls mid-function, prioritise the CPG slice.\n"
+        )
+        return file_context[:cut] + sentinel
 
     def _get_repo_map_context(self, target_files: list[str]) -> str:
         if not self.repo_map:
