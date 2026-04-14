@@ -1599,32 +1599,44 @@ class StabilizerController:
 
     async def _run_tool_servers(self) -> list[Issue]:
         """
-        Dynamically invoke wired tool servers (Semgrep, Mariana Trench, etc.)
-        and convert their findings to Issue objects for the main hunting loop.
+        Dynamically invoke all wired tool servers and merge findings.
 
-        Design principles:
-          - Each tool server is called in parallel via asyncio.gather.
-          - Individual server failures are caught and logged — they NEVER abort
-            the main audit pipeline.
-          - Findings are returned without dedup; SynthesisAgent handles that.
-          - Mariana Trench is only invoked when Java/Android source files exist.
-          - Semgrep uses the pinned offline ruleset (see semgrep_server.py).
+        Tool roster:
+          Tier 1 (always run when available):
+            • Semgrep       — pattern-based, fast, all languages
+            • TruffleHog    — secret scanning + git history
+            • CodeQL        — semantic interprocedural analysis (gold standard)
+            • Nuclei        — web vuln + code exposure templates
 
-        Returns an empty list on total failure so the caller is unaffected.
+          Tier 2 (language/platform conditional):
+            • Infer         — Facebook formal analyser (Java/C/C++/ObjC)
+            • Mariana Trench — Android taint analysis (Java repos only)
+            • AFL++          — fuzzing (C/C++ repos with fuzz targets only;
+                               disabled by default — set RHODAWK_RUN_AFL=1)
+
+        All failures are non-fatal — tool server errors never abort the pipeline.
+        Findings are deduplicated by SynthesisAgent in the next step.
         """
         assert self.run and self.storage and self.config.repo_root
 
         tasks = []
 
-        # ── Semgrep (Python / JS / TS / Go / Ruby / etc.) ────────────────────
+        # ── Tier 1: universal ─────────────────────────────────────────────────
         if self.config.run_semgrep:
             tasks.append(self._run_semgrep_server())
 
-        # ── Mariana Trench (Android / Java taint analysis) ───────────────────
-        # Only invoke when the repo contains .java files — the tool requires
-        # the Android SDK and takes 60-300 s on non-trivial codebases.
+        tasks.append(self._run_trufflehog_server())
+        tasks.append(self._run_codeql_server())
+        tasks.append(self._run_nuclei_server())
+
+        # ── Tier 2: conditional ───────────────────────────────────────────────
+        tasks.append(self._run_infer_server())
+
         if self._repo_has_java():
             tasks.append(self._run_mariana_trench_server())
+
+        if os.environ.get("RHODAWK_RUN_AFL", "0") == "1":
+            tasks.append(self._run_afl_server())
 
         if not tasks:
             return []
@@ -1636,8 +1648,7 @@ class StabilizerController:
                 issues.extend(r)
             elif isinstance(r, Exception):
                 self.log.warning(
-                    "[TOOL-WIRE-01] A tool server raised an exception "
-                    "(non-fatal): %s", r,
+                    "[TOOL-WIRE-01] A tool server raised (non-fatal): %s", r,
                 )
         return issues
 
@@ -1779,6 +1790,108 @@ class StabilizerController:
                 )
 
         self.log.info("[TOOL-WIRE-01] Mariana Trench: %d findings", len(issues))
+        return issues
+
+    async def _run_trufflehog_server(self) -> list[Issue]:
+        """TruffleHog secret scanner — filesystem + full git history."""
+        try:
+            from tools.servers.trufflehog_server import trufflehog_scan
+        except ImportError:
+            return []
+        assert self.run
+        try:
+            raw = await trufflehog_scan(str(self.config.repo_root), scan_history=True)
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] TruffleHog failed: %s", exc)
+            return []
+        return await self._raw_findings_to_issues(raw, "trufflehog")
+
+    async def _run_codeql_server(self) -> list[Issue]:
+        """CodeQL semantic analysis — interprocedural taint flows."""
+        try:
+            from tools.servers.codeql_server import codeql_scan_repo
+        except ImportError:
+            return []
+        assert self.run
+        try:
+            raw = await codeql_scan_repo(str(self.config.repo_root), timeout_s=600)
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] CodeQL failed: %s", exc)
+            return []
+        # Prefix CWE ids into description for fixer context
+        enriched = []
+        for f in raw:
+            cwe_str = ", ".join(f.get("cwe", [])[:2])
+            if cwe_str:
+                f = {**f, "msg": f"[{cwe_str}] {f.get('msg', '')}"}
+            enriched.append(f)
+        return await self._raw_findings_to_issues(enriched, "codeql")
+
+    async def _run_nuclei_server(self) -> list[Issue]:
+        """Nuclei template scanner — web vulns, misconfigs, exposure."""
+        try:
+            from tools.servers.nuclei_server import nuclei_scan_repo
+        except ImportError:
+            return []
+        assert self.run
+        try:
+            raw = await nuclei_scan_repo(str(self.config.repo_root), severity_min="medium")
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] Nuclei failed: %s", exc)
+            return []
+        return await self._raw_findings_to_issues(raw, "nuclei")
+
+    async def _run_infer_server(self) -> list[Issue]:
+        """Facebook Infer — formal null/resource/race analysis."""
+        try:
+            from tools.servers.infer_server import infer_scan
+        except ImportError:
+            return []
+        assert self.run
+        try:
+            raw = await infer_scan(str(self.config.repo_root), timeout_s=600)
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] Infer failed: %s", exc)
+            return []
+        return await self._raw_findings_to_issues(raw, "infer")
+
+    async def _run_afl_server(self) -> list[Issue]:
+        """AFL++ fuzzer — crash discovery on C/C++ fuzz targets."""
+        try:
+            from tools.servers.afl_server import discover_and_fuzz
+        except ImportError:
+            return []
+        assert self.run
+        try:
+            raw = await discover_and_fuzz(str(self.config.repo_root), duration_per_target_s=120)
+        except Exception as exc:
+            self.log.warning("[TOOL-WIRE-01] AFL++ failed: %s", exc)
+            return []
+        return await self._raw_findings_to_issues(raw, "afl++")
+
+    async def _raw_findings_to_issues(
+        self, raw: list[dict], source: str
+    ) -> list[Issue]:
+        """Convert raw tool-server finding dicts to Issue objects and upsert."""
+        assert self.run
+        issues: list[Issue] = []
+        for f in raw:
+            try:
+                sev = _tool_sev(f.get("severity", "medium"))
+                issue = Issue(
+                    run_id      = self.run.id,
+                    file_path   = f.get("file_path", "unknown"),
+                    line_start  = int(f.get("line", 0)),
+                    line_end    = int(f.get("line_end", f.get("line", 0))),
+                    description = str(f.get("msg", ""))[:500],
+                    severity    = sev,
+                    source      = source,
+                )
+                await self.storage.upsert_issue(issue)
+                issues.append(issue)
+            except Exception as exc:
+                self.log.debug("[TOOL-WIRE-01] %s conversion: %s", source, exc)
+        self.log.info("[TOOL-WIRE-01] %s: %d findings", source, len(issues))
         return issues
 
     # ── Consensus phase ────────────────────────────────────────────────────────
