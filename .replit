@@ -8,6 +8,7 @@ packages = ["cargo", "libiconv", "libxcrypt", "libyaml", "openssl", "pkg-config"
 
 [agent]
 expertMode = true
+stack = "BEST_EFFORT_FALLBACK"
 
 [workflows]
 runButton = "Project"
