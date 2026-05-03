@@ -234,11 +234,12 @@ class FixMemory:
 
     def store_failure(
         self,
-        issue_type:   str,
-        file_context: str,
-        fix_approach: str,
-        failure_reason: str,
-        run_id:       str = "",
+        issue_type:     str,
+        file_context:   str,
+        fix_approach:   str,
+        failure_reason: str = "",
+        run_id:         str = "",
+        test_result:    str = "",
     ) -> None:
         """
         Persist a fix approach that caused a test regression and was reverted.
@@ -789,15 +790,19 @@ class FixMemory:
         """
         from datetime import timedelta
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if max_age_days is None:
+            return list(entries)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days, seconds=1)
         kept: list[FixMemoryEntry] = []
         for entry in entries:
-            if not entry.created_at:
+            created_at = entry.get("created_at") if isinstance(entry, dict) else getattr(entry, "created_at", None)
+            if not created_at:
                 # No timestamp — retain (backward-compat with old entries).
                 kept.append(entry)
                 continue
             try:
-                ts_str = entry.created_at
+                ts_str = created_at
                 # Handle both offset-aware ("...+00:00") and naive ISO strings.
                 if ts_str.endswith("Z"):
                     ts_str = ts_str[:-1] + "+00:00"

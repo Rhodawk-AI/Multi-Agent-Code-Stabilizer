@@ -37,8 +37,9 @@ def reset_jwt_state():
 
 @pytest.fixture()
 def hs256_env(monkeypatch):
+    import secrets
     """Set environment for HS256 mode."""
-    secret = "a" * 64  # 64-char high-entropy secret
+    secret = secrets.token_hex(32)  # 64-char high-entropy hex secret
     monkeypatch.setenv("RHODAWK_JWT_ALGORITHM", "HS256")
     monkeypatch.setenv("RHODAWK_JWT_SECRET", secret)
     monkeypatch.delenv("RHODAWK_JWT_PRIVATE_KEY", raising=False)

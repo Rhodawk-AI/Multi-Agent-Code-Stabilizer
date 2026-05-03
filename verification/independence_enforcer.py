@@ -307,10 +307,7 @@ class IndependenceEnforcer:
                 f"reviewer_family={self.reviewer_family!r}"
                 + (f" (context: {context})" if context else "")
             )
-            if self.strict:
-                raise IndependenceViolationError(msg)
-            else:
-                log.error(msg)
+            raise IndependenceViolationError(msg)
 
     def verify_pair(
         self,

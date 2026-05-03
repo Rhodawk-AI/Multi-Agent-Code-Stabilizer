@@ -160,6 +160,6 @@ class SASGenerator:
 
     async def export_json(self, run_id: str) -> str:
         sas = await self.storage.get_sas(run_id)
-        if sas is None:
+        if not isinstance(sas, SoftwareAccomplishmentSummary):
             sas = await self.generate(run_id)
         return sas.model_dump_json(indent=2)

@@ -121,9 +121,6 @@ class BrainStorage(ABC):
     @abstractmethod
     async def get_fix(self, fix_id: str) -> FixAttempt | None: ...
 
-    @abstractmethod
-    async def list_fixes(self, run_id: str = "") -> list[FixAttempt]: ...
-
                                                                                  
     @abstractmethod
     async def upsert_planner_record(self, record: PlannerRecord) -> None: ...

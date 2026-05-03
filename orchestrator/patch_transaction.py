@@ -253,12 +253,11 @@ class PatchTransaction:
         gate_outputs: list[str] = []
 
         for ff in fixed_files:
-            target = (root / ff.path).resolve()
-
             # Validate that the target is inside root (path-traversal guard)
             try:
+                target = (root / ff.path).resolve()
                 target.relative_to(root)
-            except ValueError:
+            except (ValueError, OSError):
                 return PatchTransactionResult(
                     ok=False,
                     failure_reason=(

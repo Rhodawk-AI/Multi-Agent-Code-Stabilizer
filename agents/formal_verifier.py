@@ -911,7 +911,7 @@ class FormalVerifierAgent(BaseAgent):
             l for l in content.splitlines()
             if l.strip() and not l.strip().startswith(("#", "//", "/*", "*"))
         ]
-        return len(code_lines) >= 3
+        return len(code_lines) >= 1
 
     async def _verify_file(
         self, fix_id: str, file_path: str, content: str

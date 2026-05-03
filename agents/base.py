@@ -213,13 +213,14 @@ class AgentConfig(BaseModel):
     Carries both fixer and reviewer model identities for independence tracking.
     """
     model:               str       = "claude-sonnet-4-6"
+    primary_model:       str       = ""  # alias/override for model used by fixer
     fallback_models:     list[str] = Field(default_factory=lambda: [
         "gpt-4o-mini", "ollama/qwen2.5-coder:32b"
     ])
     max_tokens:          int       = 8192
     temperature:         float     = 0.1
     max_retries:         int       = DEFAULT_MAX_RETRIES
-    timeout_s:           int       = DEFAULT_TIMEOUT_S
+    timeout_s:           float     = float(DEFAULT_TIMEOUT_S)
     cost_ceiling_usd:    float     = 50.0
     triage_model:        str       = "ollama/granite-code:3b"    # FIX: real Ollama tag
     critical_fix_model:  str       = "openrouter/meta-llama/llama-4-scout"
@@ -246,8 +247,8 @@ class BaseAgent(ABC):
 
     def __init__(
         self,
-        storage:     Any,
-        run_id:      str,
+        storage:     Any = None,
+        run_id:      str = "",
         config:      AgentConfig | None = None,
         mcp_manager: Any | None = None,
     ) -> None:

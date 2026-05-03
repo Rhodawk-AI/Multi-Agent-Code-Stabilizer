@@ -114,9 +114,11 @@ class SWEBenchLocalizer:
 
     async def localize(
         self,
-        issue_text:   str,
-        repo:         str = "",
-        base_commit:  str = "",
+        issue_text:     str = "",
+        repo:           str = "",
+        base_commit:    str = "",
+        instance_id:    str = "",
+        problem_statement: str = "",
     ) -> LocalizationResult:
         """
         Run the full two-phase localization pipeline.
@@ -125,6 +127,8 @@ class SWEBenchLocalizer:
         populated. Falls back gracefully at each step if components
         are unavailable.
         """
+        if not issue_text and problem_statement:
+            issue_text = problem_statement
         result = LocalizationResult()
 
         # ── Phase A: File Localization ────────────────────────────────────────
@@ -150,13 +154,23 @@ class SWEBenchLocalizer:
         result.edit_functions = candidate_functions[:_TOP_FUNCTIONS_COUNT]
 
         # ── CPG expansion (optional) ──────────────────────────────────────────
+        _joern_available = False
         if self.joern_client and result.edit_functions:
-            cpg_ctx = await self._expand_via_cpg(
-                result.edit_functions, result.edit_files
-            )
-            if cpg_ctx:
-                result.cpg_context = cpg_ctx
-                result.used_cpg    = True
+            try:
+                _joern_available = await self.joern_client.connect()
+            except Exception:
+                _joern_available = False
+
+        if _joern_available and result.edit_functions:
+            try:
+                cpg_ctx = await self._expand_via_cpg(
+                    result.edit_functions, result.edit_files
+                )
+                if cpg_ctx:
+                    result.cpg_context = cpg_ctx
+                    result.used_cpg    = True
+            except Exception as exc:
+                log.debug(f"[localization] CPG expansion error: {exc}")
 
         # Estimate confidence from hit quality
         top_score = candidate_files[0][1] if candidate_files else 0.0
@@ -176,9 +190,26 @@ class SWEBenchLocalizer:
     ) -> list[tuple[str, float]]:
         """
         Returns sorted list of (file_path, relevance_score) tuples.
-        Uses BM25 keyword matching → LLM rerank.
+        Uses HybridRetriever (dense+BM25) if available, else pure BM25 → LLM rerank.
         """
-        # Step 1: gather all candidate files from the repo
+        # Step 1: Try HybridRetriever (dense vector search) first
+        if self.hybrid_retriever is not None:
+            try:
+                hr_results = await self.hybrid_retriever.find_similar_to_issue(
+                    issue_text
+                )
+                if hr_results:
+                    hr_files = [(r.file_path, 1.0 - r.distance) for r in hr_results]
+                    try:
+                        reranked = await self._llm_rerank_files(issue_text, hr_files)
+                        return self._normalize_file_list(reranked, hr_files)
+                    except Exception as exc:
+                        log.debug(f"[localization] LLM rerank after HR failed: {exc}")
+                        return hr_files[:_TOP_FILES_COUNT]
+            except Exception as exc:
+                log.debug(f"[localization] HybridRetriever failed: {exc} — falling back to BM25")
+
+        # Step 2: gather all candidate files from the repo (BM25 fallback)
         all_files = self._gather_repo_files()
         if not all_files:
             # Fall back to extracting file hints from issue text
@@ -187,16 +218,20 @@ class SWEBenchLocalizer:
         if not all_files:
             return []
 
-        # Step 2: BM25 keyword scoring
+        # Step 3: BM25 keyword scoring
         bm25_hits = self._bm25_score_files(issue_text, all_files)
         top_bm25  = bm25_hits[:20]  # Top 20 for LLM rerank
 
         if not top_bm25:
             return []
 
-        # Step 3: LLM rerank
-        reranked = await self._llm_rerank_files(issue_text, top_bm25)
-        return reranked
+        # Step 4: LLM rerank
+        try:
+            reranked = await self._llm_rerank_files(issue_text, top_bm25)
+            return self._normalize_file_list(reranked, top_bm25)
+        except Exception as exc:
+            log.debug(f"[localization] LLM rerank failed: {exc} — returning BM25 results")
+            return top_bm25[:_TOP_FILES_COUNT]
 
     def _gather_repo_files(self) -> list[str]:
         """Walk repo_root and return all Python/source file paths."""
@@ -322,7 +357,9 @@ class SWEBenchLocalizer:
 
         try:
             import litellm
-            model = self.model_router.localize_model()
+            model = self.model_router.localize_model() if self.model_router else None
+            if not model:
+                return bm25_hits[:_TOP_FILES_COUNT]
             resp  = await litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -343,6 +380,22 @@ class SWEBenchLocalizer:
             log.debug(f"[localization] LLM rerank error: {exc}")
 
         return bm25_hits[:_TOP_FILES_COUNT]
+
+    def _normalize_file_list(
+        self,
+        result: list,
+        fallback_tuples: list[tuple[str, float]],
+    ) -> list[tuple[str, float]]:
+        """
+        Normalize the output of _llm_rerank_files which may return
+        list[str] or list[tuple[str, float]] depending on the call path.
+        """
+        if not result:
+            return []
+        if isinstance(result[0], str):
+            score_map = dict(fallback_tuples)
+            return [(f, score_map.get(f, 0.5)) for f in result]
+        return result
 
     def _parse_file_list(
         self, llm_text: str, bm25_hits: list[tuple[str, float]]
@@ -495,27 +548,79 @@ class SWEBenchLocalizer:
             return ""
 
         context_lines: list[str] = []
-        try:
-            for fn_name in function_names[:5]:  # Limit to top-5 to control tokens
-                # Get all call chains where this function is called
-                chains = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.joern_client.get_call_chains,
-                        fn_name,
-                        depth=_CPG_DEPTH,
-                    ),
+        for fn_name in function_names[:5]:  # Limit to top-5 to control tokens
+            try:
+                callees = await asyncio.wait_for(
+                    self.joern_client.get_callees(fn_name),
                     timeout=10.0,
                 )
-                if chains:
+                if callees:
+                    context_lines.append(f"\nCallees of `{fn_name}`:")
+                    for callee in callees[:3]:
+                        context_lines.append(f"  → {callee}")
+            except (asyncio.TimeoutError, Exception) as exc:
+                log.debug(f"[localization] Joern get_callees error for {fn_name}: {exc}")
+
+            try:
+                callers = await asyncio.wait_for(
+                    self.joern_client.get_callers(fn_name),
+                    timeout=10.0,
+                )
+                if callers:
                     context_lines.append(f"\nCallers of `{fn_name}`:")
-                    for chain in chains[:3]:
-                        context_lines.append(
-                            f"  {chain.caller_file}:{chain.caller_line} "
-                            f"→ {chain.caller_name}()"
-                        )
-        except asyncio.TimeoutError:
-            log.debug("[localization] Joern CPG query timed out — skipping")
-        except Exception as exc:
-            log.debug(f"[localization] CPG expansion error: {exc}")
+                    for caller in callers[:3]:
+                        context_lines.append(f"  → {caller}")
+            except (asyncio.TimeoutError, Exception) as exc:
+                log.debug(f"[localization] Joern get_callers error for {fn_name}: {exc}")
 
         return "\n".join(context_lines) if context_lines else ""
+
+    def _parse_functions_from_file(self, file_path: str) -> list[str]:
+        """
+        Parse function/method names from a single source file using regex.
+        Returns a list of function names found in the file.
+        """
+        full_path = (
+            self.repo_root / file_path
+            if self.repo_root
+            else Path(file_path)
+        )
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+            return [
+                m.group(3)
+                for m in re.finditer(
+                    r"^(    |\t)*(def|async def)\s+([\w]+)\s*\(",
+                    content,
+                    re.MULTILINE,
+                )
+            ]
+        except Exception as exc:
+            log.debug(f"[localization] _parse_functions_from_file error {file_path}: {exc}")
+            return []
+
+    async def localize_batch(
+        self,
+        problems: dict[str, str],
+    ) -> dict[str, "LocalizationResult | None"]:
+        """
+        Localize a batch of {instance_id: problem_statement} problems.
+
+        Each item is localized independently; a failure on one instance
+        does NOT propagate to others.  Returns a dict mapping each
+        instance_id to its LocalizationResult (or None on error).
+        """
+        results: dict[str, LocalizationResult | None] = {}
+        for instance_id, problem_statement in problems.items():
+            try:
+                result = await self.localize(
+                    instance_id=instance_id,
+                    problem_statement=problem_statement,
+                )
+                results[instance_id] = result
+            except Exception as exc:
+                log.warning(
+                    f"[localization] localize_batch: instance '{instance_id}' failed: {exc}"
+                )
+                results[instance_id] = None
+        return results

@@ -113,6 +113,9 @@ class NotificationDispatcher:
                 log.warning(f"Notification failed [{channel}]: {result}")
             elif result is True:
                 succeeded.append(channel)
+            else:
+                errors.append(f"{channel}: returned False")
+                log.warning(f"Notification rejected [{channel}]: channel returned False")
 
         if not succeeded and errors:
             raise RuntimeError(
@@ -127,7 +130,7 @@ class NotificationDispatcher:
             "escalation_id":   esc.id,
             "escalation_type": esc.escalation_type,
             "description":     esc.description,
-            "severity":        esc.severity.value,
+            "severity":        esc.severity.value if hasattr(esc.severity, "value") else esc.severity,
             "mil882e_category": esc.mil882e_category.value,
             "issue_ids":       esc.issue_ids,
             "run_id":          esc.run_id,
@@ -156,7 +159,7 @@ class NotificationDispatcher:
                 "type": "section",
                 "fields": [
                     {"type": "mrkdwn", "text": f"*Type:*\n{esc.escalation_type}"},
-                    {"type": "mrkdwn", "text": f"*Severity:*\n{esc.severity.value}"},
+                    {"type": "mrkdwn", "text": f"*Severity:*\n{esc.severity.value if hasattr(esc.severity, 'value') else esc.severity}"},
                     {"type": "mrkdwn",
                      "text": f"*MIL-STD-882E:*\n{esc.mil882e_category.value}"},
                     {"type": "mrkdwn", "text": f"*Run ID:*\n`{esc.run_id[:16]}`"},
@@ -289,10 +292,10 @@ class EscalationManager:
         await self.storage.upsert_escalation(esc)
         log.warning(
             f"ESCALATION CREATED [{esc.id[:12]}] type={escalation_type} "
-            f"severity={severity.value} issues={issue_ids}"
+            f"severity={severity.value if hasattr(severity, 'value') else severity} issues={issue_ids}"
         )
 
-        # Dispatch notifications — failure is logged but does not abort
+        # Dispatch notifications — RuntimeError propagates to caller (pipeline must block)
         try:
             channels = await self._dispatcher.notify(esc, self.api_base_url)
             esc.notified_via = channels
@@ -300,6 +303,7 @@ class EscalationManager:
             await self.storage.upsert_escalation(esc)
         except RuntimeError as exc:
             log.error(f"Escalation notification failed: {exc}")
+            raise
 
         return esc
 
@@ -414,9 +418,10 @@ class EscalationManager:
 
     async def get_pending(self) -> list[EscalationRecord]:
         """Return all pending escalations for this run."""
-        return await self.storage.list_escalations(
+        records = await self.storage.list_escalations(
             run_id=self.run_id, status=EscalationStatus.PENDING
         )
+        return [r for r in records if r.status == EscalationStatus.PENDING]
 
     async def has_blocking_escalations(self) -> bool:
         """True if any PENDING escalations exist for this run."""

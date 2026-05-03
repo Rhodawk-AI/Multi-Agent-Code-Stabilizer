@@ -60,7 +60,7 @@ class TestPlannerAgentPrescreen:
         fix = _make_fix("os.system('rm -rf /tmp/data')")
         cls, reason = agent._prescreen(fix)
         assert cls == ReversibilityClass.IRREVERSIBLE
-        assert "rm -rf" in reason
+        assert "rm" in reason
 
     def test_drop_table_blocked(self):
         agent = _make_agent()

@@ -84,7 +84,7 @@ class ReaderAgent(BaseAgent):
             for p in all_files
         ]
         results  = await asyncio.gather(*tasks, return_exceptions=True)
-        processed = [r for r in results if isinstance(r, FileRecord)]
+        processed = [r for r in results if not isinstance(r, Exception)]
         errors    = sum(1 for r in results if isinstance(r, Exception))
         if errors:
             self.log.warning(f"[reader] {errors} files failed to process")

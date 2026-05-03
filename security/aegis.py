@@ -102,6 +102,7 @@ _CREDENTIAL_PATTERNS: list[tuple[str, str, ThreatSeverity]] = [
 # Privilege escalation (hard deny)
 _PRIVILEGE_ESCALATION: list[tuple[str, str]] = [
     (r"\bsudo\s+",           "sudo"),
+    (r"['\"]sudo['\"]",     "sudo-quoted"),
     (r"\bsu\s+-",            "su-switch"),
     (r"\bdoas\s+",           "doas"),
     (r"\bpkexec\s+",         "pkexec"),

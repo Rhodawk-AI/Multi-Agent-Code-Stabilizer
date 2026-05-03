@@ -117,6 +117,7 @@ class PatchSynthesisAgent:
         self.router = model_router
         self._model_override = synthesis_model_override
 
+    @property
     def _synthesis_model(self) -> str:
         if self._model_override:
             return self._model_override
@@ -136,9 +137,12 @@ class PatchSynthesisAgent:
     async def synthesize(
         self,
         issue_text:         str,
-        localization_ctx:   str,
-        candidates:         list[Any],    # list[BoBNCandidate], sorted desc by composite
-        attack_reports:     list[Any],    # list[CriticAttackReport], parallel to candidates
+        localization_ctx:   str = "",
+        candidates:         list[Any] | None = None,    # list[BoBNCandidate], sorted desc by composite
+        attack_reports:     list[Any] | None = None,    # list[CriticAttackReport], parallel to candidates
+        # Aliases for backward-compat callers
+        ranked_candidates:  list[Any] | None = None,
+        localization_context: str | None = None,
     ) -> SynthesisDecision:
         """
         Pick the best candidate or produce a merged patch.
@@ -156,14 +160,26 @@ class PatchSynthesisAgent:
         If action == "merge", use merged_patch (validated).
         If fallback == True, use candidates[0] (argmax winner).
         """
+        # Resolve aliases
+        if ranked_candidates is not None and candidates is None:
+            candidates = ranked_candidates
+        if localization_context is not None:
+            localization_ctx = localization_context
+        if candidates is None:
+            candidates = []
+        if attack_reports is None:
+            attack_reports = []
+
         if not candidates:
             return SynthesisDecision(fallback=True, fallback_reason="no candidates")
 
         if len(candidates) == 1:
             return SynthesisDecision(
-                action     = "pick_best",
-                winner_id  = candidates[0].candidate_id,
-                confidence = candidates[0].composite_score,
+                action          = "pick_best",
+                winner_id       = candidates[0].candidate_id,
+                confidence      = candidates[0].composite_score,
+                fallback        = True,
+                fallback_reason = "single candidate — no synthesis needed",
             )
 
         # Only consider top-3 candidates to keep the prompt tractable
@@ -171,7 +187,7 @@ class PatchSynthesisAgent:
         reports  = attack_reports[:3]
 
         prompt = self._build_prompt(issue_text, localization_ctx, top_n, reports)
-        model  = self._synthesis_model()
+        model  = self._synthesis_model
 
         try:
             decision = await self._call_llm(prompt, model)
@@ -225,12 +241,24 @@ class PatchSynthesisAgent:
 
             attack_summary = _summarise_attack(report)
 
+            try:
+                ts_str = f"{cand.test_score:.2f}"
+            except (TypeError, ValueError):
+                ts_str = str(cand.test_score)
+            try:
+                cs_str = f"{cand.composite_score:.2f}"
+            except (TypeError, ValueError):
+                cs_str = str(cand.composite_score)
+            try:
+                model_short = cand.model.split('/')[-1]
+            except (TypeError, AttributeError):
+                model_short = str(cand.model)
             candidate_blocks.append(
                 f"### Candidate {cand.candidate_id} "
-                f"(model={cand.model.split('/')[-1]}, "
+                f"(model={model_short}, "
                 f"temp={cand.temperature}, "
-                f"test_score={cand.test_score:.2f}, "
-                f"composite={cand.composite_score:.2f})\n\n"
+                f"test_score={ts_str}, "
+                f"composite={cs_str})\n\n"
                 f"**Adversarial Critique:**\n{attack_summary}\n\n"
                 f"**Patch:**\n```diff\n{display_patch}\n```\n"
             )
@@ -309,7 +337,7 @@ class PatchSynthesisAgent:
             winner_id     = str(data.get("winner_id", "")),
             merged_patch  = str(data.get("merged_patch", "")),
             reasoning     = str(data.get("reasoning", "")),
-            confidence    = float(data.get("confidence", 0.8)),
+            confidence    = min(1.0, max(0.0, float(data.get("confidence", 0.8)))),
         )
 
 
@@ -332,8 +360,12 @@ def _summarise_attack(report: Any) -> str:
         if getattr(v, "severity", "medium") in {"high", "critical"}
     ]
 
+    try:
+        ac_str = f"{getattr(report, 'attack_confidence', 0.5):.2f}"
+    except (TypeError, ValueError):
+        ac_str = str(getattr(report, 'attack_confidence', 0.5))
     lines = [
-        f"attack_confidence={getattr(report, 'attack_confidence', 0.5):.2f}",
+        f"attack_confidence={ac_str}",
         f"flags=[{', '.join(flags) or 'none'}]",
         f"high_severity_vectors={len(high_sev)}",
     ]
@@ -359,8 +391,8 @@ def _validate_diff(patch: str) -> bool:
     if not re.search(r"^@@\s+-\d+", patch, re.MULTILINE):
         return False
 
-    # Reject if conflict markers are present
-    conflict_patterns = [r"^<{7}", r"^>{7}", r"^={7}"]
+    # Reject if conflict markers are present (with or without diff +/- prefix)
+    conflict_patterns = [r"<{7}", r">{7}", r"={7}"]
     for pat in conflict_patterns:
         if re.search(pat, patch, re.MULTILINE):
             return False
@@ -389,6 +421,13 @@ def apply_synthesis_decision(
         return candidates[0]
 
     if decision.action == "merge" and decision.merged_patch:
+        # Reject conflict-marker patches — fall back to best single candidate
+        if not _validate_diff(decision.merged_patch):
+            log.warning(
+                "[synthesis] apply_synthesis_decision: merge patch has conflict "
+                "markers or is invalid — falling back to argmax winner"
+            )
+            return candidates[0]
         # Clone the top candidate and replace its patch with the merge result
         import copy
         merged = copy.copy(candidates[0])

@@ -92,6 +92,7 @@ class FixerAgent(BaseAgent):
             issues = await self.storage.list_issues(run_id=self.run_id, status=IssueStatus.OPEN.value)
         groups = self._group_issues(issues)
         batches = await self._non_overlapping_batches(groups)
+        await self.check_cost_ceiling()
         created: list[FixAttempt] = []
         for batch in batches:
             batch_results = await asyncio.gather(*[self._fix_group(group_key, group_issues) for group_key, group_issues in batch.items()], return_exceptions=True)
@@ -520,7 +521,7 @@ class FixerAgent(BaseAgent):
         if any(x in m for x in ("32b", "coder-32", "qwen2", "gpt-4-32")):
             return 32_768
         # Conservative default for unknown models
-        return 32_768
+        return 32_000
 
     def _enforce_context_budget(
         self,
@@ -607,7 +608,7 @@ class FixerAgent(BaseAgent):
 
         sentinel = (
             "\n\n"
-            "⚠️  [FILE CONTEXT TRUNCATED — token budget exhausted]\n"
+            "⚠️  [CONTEXT TRUNCATED — token budget exhausted]\n"
             "The file contents above were cut to preserve the CPG causal slice\n"
             "and memory examples. Fix the issues using the available context.\n"
             "If the truncation point falls mid-function, prioritise the CPG slice.\n"

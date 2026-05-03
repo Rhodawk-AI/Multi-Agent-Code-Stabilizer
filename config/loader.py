@@ -99,7 +99,7 @@ def _flatten_toml(raw: dict) -> dict:
         "cost_ceiling_usd":  "cost_ceiling_usd",
         "concurrency":       "concurrency",
         "chunk_concurrency": "chunk_concurrency",
-    })
+    }, section_name="loop")
 
     brain = raw.get("brain", {})
     backend = brain.get("backend", "")
@@ -107,17 +107,17 @@ def _flatten_toml(raw: dict) -> dict:
         out["use_sqlite"] = True
     elif backend == "postgres":
         out["use_sqlite"] = False
-    _map(out, brain, {
+    _map(out, {k: v for k, v in brain.items() if k != "backend"}, {
         "vector_store_enabled": "vector_store_enabled",
         "vector_store_path":    "vector_store_path",
-    })
+    }, section_name="brain")
 
     _map(out, raw.get("static_analysis", {}), {
         "run_ruff":    "run_ruff",
         "run_mypy":    "run_mypy",
         "run_semgrep": "run_semgrep",
         "run_bandit":  "run_bandit",
-    })
+    }, section_name="static_analysis")
 
     graph = raw.get("graph", {})
     if graph.get("enabled") is not None:
@@ -136,7 +136,7 @@ def _flatten_toml(raw: dict) -> dict:
         "max_slice_nodes":        "cpg_max_slice_nodes",
         "max_files_in_slice":     "cpg_max_files_in_slice",
         "blast_radius_threshold": "cpg_blast_radius_threshold",
-    })
+    }, section_name="cpg")
 
     # Gap 2: [synthesis] section
     _map(out, raw.get("synthesis", {}), {
@@ -145,7 +145,7 @@ def _flatten_toml(raw: dict) -> dict:
         "compound_enabled":      "synthesis_compound_enabled",
         "synthesis_model":       "synthesis_model",
         "max_compound_findings": "synthesis_max_compound",
-    })
+    }, section_name="synthesis")
 
     # Gap 5: [gap5] section — adversarial BoBN ensemble
     _map(out, raw.get("gap5", {}), {
@@ -154,15 +154,12 @@ def _flatten_toml(raw: dict) -> dict:
         "vllm_secondary_model":     "gap5_vllm_secondary_model",
         "vllm_critic_base_url":     "gap5_vllm_critic_base_url",
         "vllm_critic_model":        "gap5_vllm_critic_model",
-        # Synthesis model (Mistral/Devstral) — fourth independent family.
-        # Must be set to a different family from both fixers AND the critic.
-        # Leave vllm_synthesis_base_url blank to route through OpenRouter.
         "vllm_synthesis_base_url":  "gap5_vllm_synthesis_base_url",
         "vllm_synthesis_model":     "gap5_vllm_synthesis_model",
         "bobn_n_candidates":        "gap5_bobn_n_candidates",
         "bobn_fixer_a_count":       "gap5_bobn_fixer_a_count",
         "bobn_fixer_b_count":       "gap5_bobn_fixer_b_count",
-    })
+    }, section_name="gap5")
 
     # Gap 6: [gap6] section — federated anonymized pattern store
     _map(out, raw.get("gap6", {}), {
@@ -173,20 +170,26 @@ def _flatten_toml(raw: dict) -> dict:
         "extra_peer_urls":     "gap6_extra_peer_urls",
         "instance_id":         "gap6_instance_id",
         "min_complexity":      "gap6_min_complexity",
-    })
+    }, section_name="gap6")
 
     _map(out, raw.get("github", {}), {
         "base_branch":   "base_branch",
         "branch_prefix": "branch_prefix",
-    })
+    }, section_name="github")
     _map(out, raw.get("auditing", {}), {
         "validate_findings": "validate_findings",
-    })
+    }, section_name="auditing")
 
     return out
 
 
-def _map(out: dict, section: dict, mapping: dict[str, str]) -> None:
+def _map(out: dict, section: dict, mapping: dict[str, str], section_name: str = "") -> None:
+    unknown = {k for k in section if k not in mapping}
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) in TOML section [{section_name}]: {sorted(unknown)}. "
+            f"Valid keys are: {sorted(mapping)}"
+        )
     for src, dst in mapping.items():
         val = section.get(src)
         if val is not None:
@@ -203,6 +206,7 @@ _ENV_MAP: dict[str, tuple[str, str]] = {
     "RHODAWK_SOFTWARE_LEVEL":     ("software_level",              "software_level"),
     "RHODAWK_MAX_CYCLES":         ("max_cycles",                  "int"),
     "RHODAWK_COST_CEILING":       ("cost_ceiling_usd",            "float"),
+    "RHODAWK_COST_CEILING_USD":   ("cost_ceiling_usd",            "float"),
     "RHODAWK_PG_DSN":             ("postgres_dsn",                "str"),
     "RHODAWK_API_BASE_URL":       ("api_base_url",                "str"),
     "RHODAWK_AUTO_COMMIT":        ("auto_commit",                 "bool"),

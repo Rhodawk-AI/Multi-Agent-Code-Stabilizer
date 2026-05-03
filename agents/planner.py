@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 RISK_BLOCK_THRESHOLD = 0.85
 RISK_ESCALATE_THRESHOLD = 0.95
 BLAST_RADIUS_HUMAN_THRESHOLD = 50
-IRREVERSIBLE_INDICATORS: frozenset[str] = frozenset({'drop table', 'drop database', 'truncate table', 'delete from', 'rm -rf', 'format ', 'mkfs', 'shred ', 'dd if=/dev/zero', 'os.remove(', 'os.unlink(', 'shutil.rmtree(', 'subprocess.run(["rm"', "subprocess.run(['rm'", 'os.system("rm', "os.system('rm", 'unlink(', 'remove(', 'rmdir(', 'DROP TABLE', 'DROP DATABASE', 'TRUNCATE TABLE', 'DELETE FROM', 'alter table', 'ALTER TABLE', 'private_key', 'privatekey', 'secret_key', 'sudo ', 'chmod 777', 'chmod +s', 'setuid(', 'curl ', 'wget ', 'nc -e', 'ncat '})
+IRREVERSIBLE_INDICATORS: frozenset[str] = frozenset({'drop table', 'drop database', 'truncate table', 'delete from', 'rm -rf', 'format ', 'mkfs', 'shred ', 'dd if=/dev/zero', 'os.remove(', 'os.unlink(', 'shutil.rmtree(', 'subprocess.run(["rm"', "subprocess.run(['rm'", 'os.system("rm', "os.system('rm", 'unlink(', 'remove(', 'rmdir(', 'DROP TABLE', 'DROP DATABASE', 'TRUNCATE TABLE', 'DELETE FROM', 'alter table', 'ALTER TABLE', 'private_key', 'privatekey', 'secret_key', 'sudo ', "'sudo'", '"sudo"', 'chmod 777', 'chmod +s', 'setuid(', 'curl ', 'wget ', 'nc -e', 'ncat '})
 
 class PlannerHardBlock(RuntimeError):
     pass

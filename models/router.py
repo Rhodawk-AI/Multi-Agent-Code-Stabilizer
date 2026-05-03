@@ -300,12 +300,8 @@ class TieredModelRouter:
         self._local_failure_counts: dict[ModelTier, int] = {}
         self._max_local_fails = int(os.environ.get("RHODAWK_MAX_LOCAL_FAIL", "3"))
         self._force_cloud     = os.environ.get("RHODAWK_FORCE_CLOUD", "0") == "1"
-        self._vllm_base_url   = os.environ.get(
-            "VLLM_BASE_URL", "http://localhost:8000/v1"
-        )
-        self._vllm_secondary_url = os.environ.get(
-            "VLLM_SECONDARY_BASE_URL", "http://localhost:8001/v1"
-        )
+        self._vllm_base_url   = os.environ.get("VLLM_BASE_URL", "")
+        self._vllm_secondary_url = os.environ.get("VLLM_SECONDARY_BASE_URL", "")
         self._vllm_critic_url     = os.environ.get("VLLM_CRITIC_BASE_URL", "")
         self._vllm_synthesis_url  = os.environ.get("VLLM_SYNTHESIS_BASE_URL", "")
 
@@ -380,6 +376,12 @@ class TieredModelRouter:
         critic_family    = extract_model_family(critic_name)
         synthesis_family = extract_model_family(synthesis_name)
 
+        if primary_family == secondary_family:
+            raise RuntimeError(
+                f"GAP 5 independence violation: primary fixer family '{primary_family}' "
+                f"matches secondary fixer '{secondary_family}'. "
+                "Set VLLM_PRIMARY_MODEL and VLLM_SECONDARY_MODEL to different model families."
+            )
         if critic_family == primary_family:
             raise RuntimeError(
                 f"GAP 5 independence violation: critic family '{critic_family}' "
@@ -666,7 +668,7 @@ class TieredModelRouter:
                 chosen_family = extract_model_family(chosen)
                 if chosen_family == self._critic_family:
                     raise RuntimeError(
-                        f"Family independence violated at inference time — "
+                        f"family independence violated at inference time — "
                         f"tier '{tier.value}' selected '{chosen}' "
                         f"(family '{chosen_family}') matches critic family "
                         f"'{self._critic_family}'."

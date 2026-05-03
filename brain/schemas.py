@@ -28,6 +28,7 @@ SEVERITY_TO_MIL882E: dict[Severity, MilStd882eCategory] = {Severity.CRITICAL: Mi
 
 class IssueStatus(str, Enum):
     OPEN = 'OPEN'
+    FIXED = 'FIXED'
     FIX_QUEUED = 'FIX_QUEUED'
     FIX_GENERATED = 'FIX_GENERATED'
     REVIEWING = 'REVIEWING'
@@ -89,6 +90,7 @@ class ChunkStrategy(str, Enum):
 
 class RunStatus(str, Enum):
     RUNNING = 'RUNNING'
+    COMPLETED = 'COMPLETED'
     STABILIZED = 'STABILIZED'
     HALTED = 'HALTED'
     ESCALATED = 'ESCALATED'

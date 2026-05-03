@@ -101,18 +101,18 @@ def _make_approve_coro(
                 "DATABASE_URL or RHODAWK_PG_DSN must be set for "
                 "escalation approval in production."
             )
-        esc = await mock_controller.storage.get_escalation(escalation_id)
-        if esc is None:
-            raise ValueError(f"escalation {escalation_id} not found")
-        esc.status = "APPROVED"
-        esc.approved_by = approved_by
-        esc.approved_at = datetime.now(tz=timezone.utc)
-        esc.approval_rationale = rationale
         try:
+            esc = await mock_controller.storage.get_escalation(escalation_id)
+            if esc is None:
+                raise ValueError(f"escalation {escalation_id} not found")
+            esc.status = "APPROVED"
+            esc.approved_by = approved_by
+            esc.approved_at = datetime.now(tz=timezone.utc)
+            esc.approval_rationale = rationale
             await mock_controller.storage.upsert_escalation(esc)
+            return {"status": "approved", "escalation_id": escalation_id}
         finally:
             await mock_controller.storage.close()
-        return {"status": "approved", "escalation_id": escalation_id}
 
     return _approve, mock_controller
 

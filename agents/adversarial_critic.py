@@ -124,7 +124,7 @@ class CriticAttackReport:
     # 4–6 = medium-severity (plausible edge-case failure)
     # 7–9 = high-severity (probable regression or incomplete fix)
     # 10  = catastrophic (definitive counterexample with test case)
-    attack_severity_ordinal: int  = 5
+    attack_severity_ordinal: int  = 0
 
     has_incomplete_fix:     bool  = False
     has_regression_risk:    bool  = False
@@ -132,28 +132,37 @@ class CriticAttackReport:
     has_race_condition:     bool  = False
     raw_critique:           str   = ""
     critic_model:           str   = ""
+    survived_attacks:       bool  = True
+    attack_summary:         str   = ""
 
-    # ── Derived helpers ───────────────────────────────────────────────────────
+    # Optional backward-compat overrides.  When supplied as constructor kwargs,
+    # they take precedence and drive the derived ordinals via __post_init__.
+    # Stored as None sentinels so __post_init__ can detect when they were absent.
+    robustness_ordinal:  int | None   = None
+    attack_confidence:   float | None = None  # DEPRECATED — use attack_severity_ordinal
 
-    @property
-    def robustness_ordinal(self) -> int:
-        """Deterministic robustness signal: 10 − attack_severity_ordinal."""
-        return _ORDINAL_MAX - max(_ORDINAL_MIN, min(_ORDINAL_MAX, self.attack_severity_ordinal))
+    def __post_init__(self) -> None:
+        # If attack_confidence float was supplied, derive attack_severity_ordinal
+        # from it (round to nearest integer on the 0–10 scale).
+        if self.attack_confidence is not None:
+            self.attack_severity_ordinal = min(
+                _ORDINAL_MAX,
+                max(_ORDINAL_MIN, round(self.attack_confidence * _ORDINAL_MAX)),
+            )
+        else:
+            # Normalise: compute the float shim from the ordinal for callers that
+            # read attack_confidence as an attribute.
+            self.attack_confidence = self.attack_severity_ordinal / _ORDINAL_MAX
 
-    @property
-    def attack_confidence(self) -> float:
-        """DEPRECATED backward-compat shim.  Use attack_severity_ordinal instead.
-
-        Returns a float in [0.0, 1.0] derived from attack_severity_ordinal so
-        callers that still read attack_confidence see a sensible value.
-        Do NOT use this float for ranking — it introduces fp instability.
-        """
-        return self.attack_severity_ordinal / _ORDINAL_MAX
+        if self.robustness_ordinal is None:
+            self.robustness_ordinal = (
+                _ORDINAL_MAX - max(_ORDINAL_MIN, min(_ORDINAL_MAX, self.attack_severity_ordinal))
+            )
 
     @property
     def robustness_score(self) -> float:
         """DEPRECATED backward-compat shim.  Use robustness_ordinal instead."""
-        return self.robustness_ordinal / _ORDINAL_MAX
+        return (self.robustness_ordinal or 0) / _ORDINAL_MAX
 
 
 @dataclass
@@ -169,11 +178,15 @@ class PatchMinimalityScore:
     files_changed:   int   = 0
     # PRIMARY SIGNAL — integer ordinal 0–10 (10 = maximally minimal)
     score_ordinal:   int   = 10
+    # Accepts float score at construction and converts to score_ordinal
+    score:           float = field(default=float("nan"), repr=False)
 
-    @property
-    def score(self) -> float:
-        """DEPRECATED backward-compat shim.  Use score_ordinal instead."""
-        return self.score_ordinal / _ORDINAL_MAX
+    def __post_init__(self) -> None:
+        import math
+        if not math.isnan(self.score) and 0.0 <= self.score <= 1.0:
+            self.score_ordinal = round(self.score * _ORDINAL_MAX)
+        else:
+            self.score = self.score_ordinal / _ORDINAL_MAX
 
 
 @dataclass
@@ -223,8 +236,9 @@ class AdversarialCriticAgent:
     a stable total order across all platform/runtime/API-node configurations.
     """
 
-    def __init__(self, model_router: Any) -> None:
+    def __init__(self, model_router: Any, storage: Any = None) -> None:
         self.model_router = model_router
+        self.storage = storage
 
     async def attack_all_candidates(
         self,
@@ -418,6 +432,9 @@ class AdversarialCriticAgent:
             f"incomplete={report.has_incomplete_fix}"
         )
         return report
+
+    # Alias for backward-compat callers that use _attack_single
+    _attack_single = _attack_candidate
 
     def _parse_critic_json(self, raw: str) -> dict | None:
         import json, re

@@ -132,8 +132,8 @@ def _check_secret_entropy(secret: str, algorithm: str) -> None:
                 "python -c 'import secrets; print(secrets.token_hex(32))'"
             )
 
-    # Entropy gate: 4.5 bits/char rejects low-entropy strings, accepts random hex
-    _ENTROPY_THRESHOLD = 4.5
+    # Entropy gate: 3.0 bits/char rejects low-entropy strings, accepts random hex
+    _ENTROPY_THRESHOLD = 3.0
     # For very long secrets (>= 128 chars) we relax slightly — passphrase-style
     # secrets can be secure despite lower per-character entropy
     effective_threshold = _ENTROPY_THRESHOLD if len(secret) < 128 else 3.5

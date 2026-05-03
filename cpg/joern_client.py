@@ -155,7 +155,12 @@ class JoernClient:
 
     async def close(self) -> None:
         if self._session:
-            await self._session.close()
+            try:
+                result = self._session.close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
             self._session = None
         self._ready = False
 

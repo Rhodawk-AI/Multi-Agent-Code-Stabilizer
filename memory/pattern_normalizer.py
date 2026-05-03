@@ -342,8 +342,8 @@ class PatternNormalizer:
         )
 
     def fingerprint_only(self, text: str) -> str:
-        result = self.normalize(fix_approach=text)
-        return result.fingerprint
+        import hashlib
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     # ── Normalizer dispatch ───────────────────────────────────────────────────
 
@@ -636,8 +636,12 @@ def _regex_normalize(code: str) -> tuple[str, int, int]:
     text = re.sub(r"'(?:[^'\\]|\\.)*'", _str, text)
 
     # Scrub numeric literals
-    text = re.sub(r"\b0x[0-9A-Fa-f]+\b", "<num>", text)
-    text = re.sub(r"\b\d+(?:\.\d+)?\b",  "<num>", text)
+    def _num(m):
+        nonlocal lit_count
+        lit_count += 1
+        return "<num>"
+    text = re.sub(r"\b0x[0-9A-Fa-f]+\b", _num, text)
+    text = re.sub(r"\b\d+(?:\.\d+)?\b",  _num, text)
 
     # Replace all identifiers (word tokens) with consistent slots.
     # We preserve only pure punctuation/operator characters as structural.

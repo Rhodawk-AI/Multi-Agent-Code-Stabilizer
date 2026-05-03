@@ -93,10 +93,20 @@ def _make_controller(
     ctrl._convergence.halt_if_ceiling_hit = MagicMock(return_value=None)
 
     ctrl._patrol = MagicMock()
+    ctrl._consensus_engine = MagicMock()
+    ctrl._consensus_engine.evaluate_issues = MagicMock(return_value=[])
+    ctrl._consensus_engine.filter_approved  = MagicMock(return_value=[])
     ctrl._escalation_mgr = AsyncMock()
     ctrl._escalation_mgr.has_blocking_escalations = AsyncMock(return_value=False)
     ctrl._audit_trail_signer = MagicMock()
     ctrl._audit_trail_signer.sign = MagicMock(return_value="sig-fake")
+    ctrl.log = MagicMock()
+    ctrl._localization_agent = None
+    ctrl._auditors = []
+    ctrl._trail_signer = MagicMock()
+    ctrl._trail_signer.sign = MagicMock(return_value="sig-fake")
+    ctrl._patrol = None
+    ctrl._run.baseline_id = ""
 
     return ctrl
 
